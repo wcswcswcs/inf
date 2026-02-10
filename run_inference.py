@@ -43,7 +43,7 @@ def run_inference(args: argparse.Namespace):
     if args.frame_cache_dir:
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
-    model = StreamVGGT(total_budget=1200000)
+    model = StreamVGGT(total_budget=1000000) # total_budget=1200000
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
     model.load_state_dict(ckpt, strict=True)
@@ -53,7 +53,12 @@ def run_inference(args: argparse.Namespace):
     print("Model loaded successfully onto the GPU.")
 
     print(f"Loading images from input directory: {args.input_dir}")
-    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
+    # image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
+    image_names = sorted(
+        p for p in glob.glob(os.path.join(args.input_dir, "*"))
+        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
+    )
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")

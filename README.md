@@ -119,6 +119,11 @@ The **Long3D Dataset** is a benchmark designed for long-sequence 3D scene recons
 | **`image.7z`** | Continuous image stream data captured at a frequency of 10 Hz. |
 | **`dense_cloud_map.pcd`** | Global ground truth point clouds, acquired via a 3D spatial scanner. |
 
+
+
+python run_inference.py     --input_dir "Long3D/Classroom/images/scan_images"     --checkpoint_path ./ckpt/checkpoints.pth     --output_path ./inference_results_classroom.pth
+
+
 ---
 ### 📥 Download Instructions
 

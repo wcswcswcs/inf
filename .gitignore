@@ -1,1 +1,11 @@
 **/__pycache__
+/Long3D/
+/ckpt
+/lib
+*.pth
+*.csv
+*.mp4
+*.so
+*.o
+*.ninja*
+*.pyc
