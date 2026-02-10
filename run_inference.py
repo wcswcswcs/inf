@@ -83,7 +83,17 @@ def run_inference(args: argparse.Namespace):
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            output = model.inference(frames,frame_writer=frame_writer,cache_results=cache_results)
+            output = model.inference(
+                frames,
+                frame_writer=frame_writer,
+                cache_results=cache_results,
+                use_geo_kv_prune=args.use_geo_kv_prune,
+                geo_voxel_size=args.geo_voxel_size,
+                geo_topk_per_voxel=args.geo_topk_per_voxel,
+                geo_recent_frames=args.geo_recent_frames,
+                geo_near=args.geo_near,
+                geo_far=args.geo_far,
+            )
 
     torch.cuda.synchronize()
     end_time_model = time.time()
@@ -172,6 +182,41 @@ if __name__ == "__main__":
         type=str,
         default="./inference_results",
         help="Path to the directory containing the complete results"
+    )
+    parser.add_argument(
+        "--use_geo_kv_prune",
+        action="store_true",
+        help="Enable geometry-guided KV cache pruning.",
+    )
+    parser.add_argument(
+        "--geo_voxel_size",
+        type=float,
+        default=0.2,
+        help="Voxel size (in world units) for geometry-guided KV pruning.",
+    )
+    parser.add_argument(
+        "--geo_topk_per_voxel",
+        type=int,
+        default=4,
+        help="Maximum number of representative tokens retained per voxel.",
+    )
+    parser.add_argument(
+        "--geo_recent_frames",
+        type=int,
+        default=2,
+        help="Always keep tokens from the most recent N frames.",
+    )
+    parser.add_argument(
+        "--geo_near",
+        type=float,
+        default=0.05,
+        help="Near plane distance for frustum activation.",
+    )
+    parser.add_argument(
+        "--geo_far",
+        type=float,
+        default=200.0,
+        help="Far plane distance for frustum activation.",
     )
     
     args = parser.parse_args()
