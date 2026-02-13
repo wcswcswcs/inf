@@ -444,11 +444,18 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         if use_cache:
-            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
-            camera_token = camera_token_full[-1:, :, :]
-            
-            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
-            register_token = register_token_full[-1:, :, :]
+            # Avoid allocating O(S_true) temporary tensors for long sequences.
+            token_slot = 0 if past_frame_idx == 0 else 1
+            camera_token = (
+                self.camera_token[:, token_slot:token_slot + 1]
+                .expand(B, S, *self.camera_token.shape[2:])
+                .reshape(B * S, self.camera_token.shape[2], self.camera_token.shape[3])
+            )
+            register_token = (
+                self.register_token[:, token_slot:token_slot + 1]
+                .expand(B, S, *self.register_token.shape[2:])
+                .reshape(B * S, self.register_token.shape[2], self.register_token.shape[3])
+            )
         else:
             camera_token = slice_expand_and_flatten(self.camera_token, B, S)
             register_token = slice_expand_and_flatten(self.register_token, B, S)
@@ -484,7 +491,9 @@ class Aggregator(nn.Module):
                 elif attn_type == "global":
                     if use_cache:
                         layer_idx = global_idx
-                        layer_budget = int(current_budgets[layer_idx].item())
+                        raw_layer_budget = int(current_budgets[layer_idx].item())
+                        # Keep at least special tokens to avoid zero-budget unbounded behavior.
+                        layer_budget = max(raw_layer_budget, self.patch_start_idx)
                         past_kv_block = past_key_values[layer_idx] if past_key_values[layer_idx] is not None else None
                         past_meta = self.geo_token_meta[layer_idx]
 
@@ -505,6 +514,20 @@ class Aggregator(nn.Module):
                                 )
                                 past_meta = self._index_meta(past_meta, keep_idx)
 
+                            # Hard pre-attention cap so this layer cannot exceed budget in current forward.
+                            max_past_tokens = max(0, layer_budget - P)
+                            if max_past_tokens == 0:
+                                past_kv_block = (past_kv_block[0][:, :, :0], past_kv_block[1][:, :, :0])
+                                past_meta = self._index_meta(past_meta, torch.empty(0, dtype=torch.long))
+                            elif past_kv_block[0].shape[2] > max_past_tokens:
+                                start = past_kv_block[0].shape[2] - max_past_tokens
+                                pre_keep = torch.arange(start, past_kv_block[0].shape[2], dtype=torch.long, device=past_kv_block[0].device)
+                                past_kv_block = (
+                                    torch.index_select(past_kv_block[0], 2, pre_keep),
+                                    torch.index_select(past_kv_block[1], 2, pre_keep),
+                                )
+                                past_meta = self._index_meta(past_meta, pre_keep.cpu())
+
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_kv_block,
@@ -516,7 +539,9 @@ class Aggregator(nn.Module):
                         if use_geo_kv_prune:
                             current_meta = self._build_current_frame_meta(past_frame_idx, P)
                             merged_meta = self._concat_meta(past_meta, current_meta)
-                            if layer_budget > 0 and new_kv[0].shape[2] > layer_budget:
+
+                            # Keep explicit hard cap in geo mode (post-attention safety net).
+                            if new_kv[0].shape[2] > layer_budget:
                                 start = new_kv[0].shape[2] - layer_budget
                                 cap_keep = torch.arange(start, new_kv[0].shape[2], dtype=torch.long, device=new_kv[0].device)
                                 new_kv = (
