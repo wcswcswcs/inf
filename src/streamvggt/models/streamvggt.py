@@ -6,6 +6,7 @@ from streamvggt.models.aggregator import Aggregator
 from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from streamvggt.heads.track_head import TrackHead
+from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any, Callable
 from dataclasses import dataclass
@@ -110,11 +111,20 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values=None, 
         frame_writer: Optional[Callable[[int, dict, dict], None]] = None,
         cache_results: bool = True,
-        total_budget=None
+        total_budget=None,
+        use_geo_kv_prune: bool = False,
+        geo_voxel_size: float = 0.2,
+        geo_topk_per_voxel: int = 4,
+        geo_recent_frames: int = 2,
+        geo_near: float = 0.05,
+        geo_far: float = 200.0,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         total_budget = self.total_budget
+        if use_geo_kv_prune:
+            self.aggregator.reset_geo_cache_state()
+        current_view = None
         
         all_ress = []
         processed_frames = [] 
@@ -127,7 +137,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 past_key_values=past_key_values,
                 use_cache=True, 
                 past_frame_idx=i,
-                total_budget=total_budget
+                total_budget=total_budget,
+                use_geo_kv_prune=use_geo_kv_prune,
+                geo_topk_per_voxel=geo_topk_per_voxel,
+                geo_recent_frames=geo_recent_frames,
+                geo_near=geo_near,
+                geo_far=geo_far,
+                current_view=current_view,
             )
 
             
@@ -155,6 +171,27 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                     pts3d = pts3d[:, 0] 
                     pts3d_conf = pts3d_conf[:, 0]
+
+                if use_geo_kv_prune and self.point_head is not None and self.camera_head is not None:
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+                        pose_enc.unsqueeze(1),
+                        images.shape[-2:]
+                    )
+                    world_to_cam = torch.eye(4, device=extrinsic.device, dtype=extrinsic.dtype).unsqueeze(0).repeat(extrinsic.shape[0], 1, 1)
+                    world_to_cam[:, :3, :4] = extrinsic[:, 0]
+                    intrinsic_cur = intrinsic[:, 0] if intrinsic is not None else None
+                    current_view = {
+                        "world_to_cam": world_to_cam.detach(),
+                        "intrinsic": intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                    }
+                    self.aggregator.update_geo_frame_metadata(
+                        frame_idx=i,
+                        pts3d=pts3d.detach(),
+                        conf=pts3d_conf.detach(),
+                        world_to_cam=world_to_cam.detach(),
+                        intrinsic=intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        voxel_size=geo_voxel_size,
+                    )
 
                 if self.track_head is not None and query_points is not None:
                     track_list, vis, conf = self.track_head(
