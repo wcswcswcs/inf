@@ -121,17 +121,19 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
-        total_budget = self.total_budget
+        if total_budget is None:
+            total_budget = self.total_budget
         if use_geo_kv_prune:
             self.aggregator.reset_geo_cache_state()
         current_view = None
-        
+        model_device = next(self.parameters()).device
+
         all_ress = []
         processed_frames = [] 
 
         for i, frame in enumerate(frames):
 
-            images = frame["img"].unsqueeze(0) 
+            images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,

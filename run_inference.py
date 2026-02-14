@@ -65,7 +65,7 @@ def run_inference(args: argparse.Namespace):
         return
         
     print(f"Found {len(image_names)} images to process.")
-    images = load_and_preprocess_images(image_names).to(device)
+    images = load_and_preprocess_images(image_names)
     print(f"Preprocessed images tensor shape: {images.shape}")
 
     frames: List[Dict[str, torch.Tensor]] = []
