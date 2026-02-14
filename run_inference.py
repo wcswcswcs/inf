@@ -66,6 +66,8 @@ def run_inference(args: argparse.Namespace):
         
     print(f"Found {len(image_names)} images to process.")
     images = load_and_preprocess_images(image_names)
+    if device == "cuda" and images.device.type == "cpu":
+        images = images.pin_memory()
     print(f"Preprocessed images tensor shape: {images.shape}")
 
     frames: List[Dict[str, torch.Tensor]] = []
@@ -93,6 +95,9 @@ def run_inference(args: argparse.Namespace):
                 geo_recent_frames=args.geo_recent_frames,
                 geo_near=args.geo_near,
                 geo_far=args.geo_far,
+                show_progress=not args.no_progress,
+                memory_diagnostics=args.memory_diagnostics,
+                memory_log_interval=args.memory_log_interval,
             )
 
     torch.cuda.synchronize()
@@ -223,6 +228,22 @@ if __name__ == "__main__":
         type=int,
         default=600000,
         help="Global token budget used to initialize StreamVGGT.",
+    )
+    parser.add_argument(
+        "--no_progress",
+        action="store_true",
+        help="Disable per-frame progress bar during inference.",
+    )
+    parser.add_argument(
+        "--memory_diagnostics",
+        action="store_true",
+        help="Print per-frame CUDA memory diagnostics logs.",
+    )
+    parser.add_argument(
+        "--memory_log_interval",
+        type=int,
+        default=1,
+        help="Log CUDA memory diagnostics every N frames when enabled.",
     )
     
     args = parser.parse_args()

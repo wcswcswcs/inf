@@ -7,6 +7,7 @@ from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from streamvggt.heads.track_head import TrackHead
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+from tqdm.auto import tqdm
 from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any, Callable
 from dataclasses import dataclass
@@ -118,6 +119,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         geo_recent_frames: int = 2,
         geo_near: float = 0.05,
         geo_far: float = 200.0,
+        show_progress: bool = True,
+        memory_diagnostics: bool = False,
+        memory_log_interval: int = 1,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
@@ -129,9 +133,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         model_device = next(self.parameters()).device
 
         all_ress = []
-        processed_frames = [] 
+        processed_frames = []
 
-        for i, frame in enumerate(frames):
+        frame_iter = frames
+        if show_progress:
+            frame_iter = tqdm(frames, total=len(frames), desc="Inference", unit="frame")
+
+        log_interval = max(1, int(memory_log_interval))
+
+        for i, frame in enumerate(frame_iter):
 
             images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
             aggregator_output = self.aggregator(
@@ -228,6 +238,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 all_ress.append(res_cpu)
                 processed_frames.append(
                     {nk: nv.detach().cpu() if isinstance(nv, torch.Tensor) else nv for nk, nv in frame.items()}
+                )
+
+            if memory_diagnostics and model_device.type == "cuda" and ((i + 1) % log_interval == 0 or (i + 1) == len(frames)):
+                allocated_gb = torch.cuda.memory_allocated(model_device) / (1024 ** 3)
+                reserved_gb = torch.cuda.memory_reserved(model_device) / (1024 ** 3)
+                max_allocated_gb = torch.cuda.max_memory_allocated(model_device) / (1024 ** 3)
+                print(
+                    f"[MEM][frame {i + 1}/{len(frames)}] "
+                    f"allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB, max_allocated={max_allocated_gb:.2f} GB"
                 )
 
             del res_gpu
