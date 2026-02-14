@@ -102,6 +102,16 @@ python run_inference.py \
 We provide demo code based on the [NRGBD](https://github.com/dazinovic/neural-rgbd-surface-reconstruction) dataset. You can run it using the following command:
 
 ```bash
+python run_inference.py  \
+--input_dir "Long3D/Badminton Court/images/scan_images"  \
+--checkpoint_path ./ckpt/checkpoints.pth  \
+--output_path ./inference_results_badminton.pth \
+--use_geo_kv_prune \
+--geo_voxel_size 0.2 \
+--geo_topk_per_voxel 2 \
+--total_budget 600000
+
+
 python demo_viser.py  \
     --seq_path path/to/nrgbd/image_sequence \
     --frame_interval 10 \
