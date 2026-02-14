@@ -43,7 +43,7 @@ def run_inference(args: argparse.Namespace):
     if args.frame_cache_dir:
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
-    model = StreamVGGT(total_budget=1000000) # total_budget=1200000
+    model = StreamVGGT(total_budget=args.total_budget)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
     model.load_state_dict(ckpt, strict=True)
@@ -217,6 +217,12 @@ if __name__ == "__main__":
         type=float,
         default=200.0,
         help="Far plane distance for frustum activation.",
+    )
+    parser.add_argument(
+        "--total_budget",
+        type=int,
+        default=600000,
+        help="Global token budget used to initialize StreamVGGT.",
     )
     
     args = parser.parse_args()
