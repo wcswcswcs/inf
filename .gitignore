@@ -1,7 +1,11 @@
 **/__pycache__
 /Long3D/
 /ckpt
+/results
+/outs
 /lib
+/log*
+/logs_long3d
 *.pth
 *.csv
 *.mp4
