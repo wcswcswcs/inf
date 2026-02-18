@@ -135,6 +135,24 @@ python run_inference.py     --input_dir "Long3D/Classroom/images/scan_images"   
 
 
 ---
+
+
+### Post-hoc visualization / evaluation from `.pth`
+`run_inference.py` now stores relative `image_paths` in the `.pth` file instead of raw image tensors to reduce file size.
+
+```bash
+# Visualize and run pose/depth metrics
+python visualize_eval_from_pth.py \
+    --pred_pth ./inference_results_badminton.pth \
+    --output_dir ./pth_post_results \
+    --run_viser
+
+# Evaluate predicted point cloud against GT .pcd
+python eval_from_pth.py \
+    --pred_pth ./inference_results_badminton.pth \
+    --gt_pcd Long3D/Badminton\ Court/dense_cloud_map.pcd \
+    --output_dir ./pth_eval_results
+```
 ### 📥 Download Instructions
 
 #### Option1: Hugging Face CLI:

@@ -134,7 +134,7 @@ def run_inference(args: argparse.Namespace):
         "depth": torch.stack(all_depth, dim=0),
         "depth_conf": torch.stack(all_depth_conf, dim=0),
         "pose_enc": torch.stack(all_camera_pose, dim=0),
-        "images": images
+        "image_paths": [os.path.relpath(p, PROJECT_ROOT) for p in image_names],
     }
 
     # Convert pose encoding to extrinsic and intrinsic matrices

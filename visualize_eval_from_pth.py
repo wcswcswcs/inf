@@ -3,7 +3,7 @@ import glob
 import json
 import os
 import sys
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -12,9 +12,11 @@ from scipy.spatial.transform import Rotation
 sys.path.append("src/")
 
 from eval.pose_evaluation.evo_utils import eval_metrics, load_traj
+from streamvggt.utils.load_fn import load_and_preprocess_images
 
 
 SINTEL_TAG_FLOAT = 202021.25
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _to_numpy(x):
@@ -46,8 +48,14 @@ def _depth_evaluation_local(predicted_depth_original: np.ndarray, ground_truth_d
     gt = gt[mask]
     if pr.size == 0:
         return {
-            "Abs Rel": 0.0, "Sq Rel": 0.0, "RMSE": 0.0, "Log RMSE": 0.0,
-            "δ < 1.": 0.0, "δ < 1.25": 0.0, "δ < 1.25^2": 0.0, "δ < 1.25^3": 0.0,
+            "Abs Rel": 0.0,
+            "Sq Rel": 0.0,
+            "RMSE": 0.0,
+            "Log RMSE": 0.0,
+            "δ < 1.": 0.0,
+            "δ < 1.25": 0.0,
+            "δ < 1.25^2": 0.0,
+            "δ < 1.25^3": 0.0,
             "valid_pixels": 0,
         }
 
@@ -74,8 +82,8 @@ def _depth_evaluation_local(predicted_depth_original: np.ndarray, ground_truth_d
     ratio = np.maximum(pr_aligned / gt_clip, gt_clip / pr_aligned)
     th0 = float(np.mean((ratio < 1.0).astype(np.float64)))
     th1 = float(np.mean((ratio < 1.25).astype(np.float64)))
-    th2 = float(np.mean((ratio < 1.25 ** 2).astype(np.float64)))
-    th3 = float(np.mean((ratio < 1.25 ** 3).astype(np.float64)))
+    th2 = float(np.mean((ratio < 1.25**2).astype(np.float64)))
+    th3 = float(np.mean((ratio < 1.25**3).astype(np.float64)))
 
     return {
         "Abs Rel": abs_rel,
@@ -94,32 +102,52 @@ def _load_predictions(path: str) -> dict:
     data = torch.load(path, map_location="cpu")
     if not isinstance(data, dict):
         raise ValueError(f"Expected dict in {path}, got {type(data)}")
-    required = ["world_points", "world_points_conf", "depth", "images", "extrinsic"]
+
+    required = ["world_points", "world_points_conf", "depth", "extrinsic"]
     missing = [k for k in required if k not in data]
     if missing:
         raise KeyError(f"Missing keys in prediction pth: {missing}")
 
-    preds = {k: _to_numpy(v) for k, v in data.items()}
-    return preds
+    if "image_paths" not in data and "images" not in data:
+        raise KeyError("Missing image info in prediction pth: requires 'image_paths' (new) or 'images' (legacy)")
+
+    return {k: _to_numpy(v) for k, v in data.items()}
 
 
 def _normalize_images(images: np.ndarray) -> np.ndarray:
-    # input from run_inference.py is (S,3,H,W)
     if images.ndim != 4:
         raise ValueError(f"Expected images ndim=4, got {images.shape}")
-
     if images.shape[1] == 3:
         images = np.transpose(images, (0, 2, 3, 1))
-
     images = images.astype(np.float32)
     if images.max() > 1.0:
         images = images / 255.0
-    images = np.clip(images, 0.0, 1.0)
-    return images
+    return np.clip(images, 0.0, 1.0)
+
+
+def _resolve_image_paths(image_paths, project_root: str) -> list[str]:
+    resolved = []
+    for p in image_paths:
+        if isinstance(p, bytes):
+            p = p.decode("utf-8")
+        p = str(p)
+        resolved.append(p if os.path.isabs(p) else os.path.join(project_root, p))
+    return resolved
+
+
+def _load_images_for_visualization(preds: dict, project_root: str) -> np.ndarray:
+    if "image_paths" in preds:
+        image_paths = _resolve_image_paths(preds["image_paths"], project_root)
+        if not image_paths:
+            raise ValueError("image_paths is empty in prediction pth")
+        images = load_and_preprocess_images(image_paths).detach().cpu().numpy()
+        return _normalize_images(images)
+
+    # backward compatibility for old pth files
+    return _normalize_images(preds["images"])
 
 
 def _camera_from_extrinsic_intrinsic(extrinsic: np.ndarray, intrinsic: Optional[np.ndarray], h: int, w: int):
-    # extrinsic is world->cam (S,3,4)
     s = extrinsic.shape[0]
     w2c = np.tile(np.eye(4, dtype=np.float32)[None], (s, 1, 1))
     w2c[:, :3, :] = extrinsic
@@ -147,6 +175,7 @@ def _save_basic_artifacts(preds: dict, output_dir: str):
         depth=preds["depth"],
         extrinsic=preds["extrinsic"],
         intrinsic=preds.get("intrinsic", None),
+        image_paths=np.asarray(preds.get("image_paths", []), dtype=object),
     )
 
 
@@ -205,17 +234,13 @@ def _run_depth_metrics(pred_depth: np.ndarray, gt_depth_glob: str, align: str, o
         if pr.ndim == 3:
             pr = pr.squeeze(-1)
         if pr.shape != gt.shape:
-            pr = np.array(
-                Image.fromarray(pr).resize((gt.shape[1], gt.shape[0]), resample=Image.BICUBIC),
-                dtype=np.float32,
-            )
+            pr = np.array(Image.fromarray(pr).resize((gt.shape[1], gt.shape[0]), resample=Image.BICUBIC), dtype=np.float32)
+        per_frame.append(_depth_evaluation_local(pr, gt, align=align))
 
-        result = _depth_evaluation_local(pr, gt, align=align)
-        per_frame.append(result)
-
-    keys = [k for k in per_frame[0].keys() if k != "valid_pixels"]
+    keys = ["Abs Rel", "Sq Rel", "RMSE", "Log RMSE", "δ < 1.", "δ < 1.25", "δ < 1.25^2", "δ < 1.25^3"]
     weights = np.array([r["valid_pixels"] for r in per_frame], dtype=np.float64)
-    weights = np.maximum(weights, 1.0)
+    if np.sum(weights) <= 0:
+        weights = np.ones_like(weights)
 
     avg = {}
     for k in keys:
@@ -225,8 +250,6 @@ def _run_depth_metrics(pred_depth: np.ndarray, gt_depth_glob: str, align: str, o
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(avg, f, indent=2)
     return avg
-
-
 
 
 def _parse_frame_range(frame_range: Optional[str], total_frames: int) -> tuple[int, int]:
@@ -241,9 +264,7 @@ def _parse_frame_range(frame_range: Optional[str], total_frames: int) -> tuple[i
         start = int(left.strip())
         end = int(right.strip())
     except Exception as exc:
-        raise ValueError(
-            f"Invalid --frame_range '{frame_range}', expected format like '100-200'"
-        ) from exc
+        raise ValueError(f"Invalid --frame_range '{frame_range}', expected format like '100-200'") from exc
 
     if start > end:
         raise ValueError(f"Invalid --frame_range '{frame_range}': start > end")
@@ -251,9 +272,7 @@ def _parse_frame_range(frame_range: Optional[str], total_frames: int) -> tuple[i
     start = max(0, start)
     end = min(total_frames - 1, end)
     if start > end:
-        raise ValueError(
-            f"Frame range '{frame_range}' is outside available frames [0, {total_frames - 1}]"
-        )
+        raise ValueError(f"Frame range '{frame_range}' is outside available frames [0, {total_frames - 1}]")
     return start, end
 
 
@@ -274,6 +293,7 @@ def _select_frame_indices(total_frames: int, frame_stride: int, max_frames: int,
         indices = indices[sample_pos]
 
     return np.unique(indices)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize and evaluate StreamVGGT predictions from output .pth")
@@ -309,7 +329,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     preds = _load_predictions(args.pred_pth)
-    images = _normalize_images(preds["images"])
+    images = _load_images_for_visualization(preds, PROJECT_ROOT)
     pts = preds["world_points"]
     conf = preds["world_points_conf"]
     depth = preds["depth"]
@@ -327,6 +347,7 @@ def main():
     summary = {
         "num_frames": int(images.shape[0]),
         "pred_pth": args.pred_pth,
+        "image_source": "image_paths" if "image_paths" in preds else "images_legacy",
     }
 
     if args.gt_pose_path:
