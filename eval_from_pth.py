@@ -108,6 +108,69 @@ def _load_gt_pcd(path: str, max_points: int, rng_seed: int) -> np.ndarray:
     return pts
 
 
+def _umeyama_alignment(src_pts: np.ndarray, dst_pts: np.ndarray, estimate_scale: bool) -> tuple[float, np.ndarray, np.ndarray]:
+    src_mean = src_pts.mean(axis=0)
+    dst_mean = dst_pts.mean(axis=0)
+    src_centered = src_pts - src_mean
+    dst_centered = dst_pts - dst_mean
+
+    cov = (dst_centered.T @ src_centered) / max(1, src_pts.shape[0])
+    u, d, vt = np.linalg.svd(cov)
+    s_mat = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        s_mat[-1, -1] = -1
+
+    r = u @ s_mat @ vt
+
+    if estimate_scale:
+        var_src = np.mean(np.sum(src_centered**2, axis=1))
+        if var_src <= 1e-12:
+            scale = 1.0
+        else:
+            scale = float(np.trace(np.diag(d) @ s_mat) / var_src)
+    else:
+        scale = 1.0
+
+    t = dst_mean - scale * (r @ src_mean)
+    return scale, r, t
+
+
+def _apply_similarity(pts: np.ndarray, scale: float, r: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (scale * (pts @ r.T)) + t[None, :]
+
+
+def _align_pred_to_gt(pred_pts: np.ndarray, gt_pts: np.ndarray, align_mode: str, icp_iters: int) -> tuple[np.ndarray, dict]:
+    if align_mode == "none":
+        return pred_pts, {"align_mode": align_mode, "scale": 1.0, "rotation": np.eye(3).tolist(), "translation": [0.0, 0.0, 0.0]}
+
+    estimate_scale = align_mode == "sim3"
+    aligned = pred_pts.astype(np.float64)
+    gt_tree = cKDTree(gt_pts)
+
+    total_scale = 1.0
+    total_r = np.eye(3, dtype=np.float64)
+    total_t = np.zeros(3, dtype=np.float64)
+
+    for _ in range(max(1, icp_iters)):
+        _, nn_idx = gt_tree.query(aligned, k=1, workers=-1)
+        matched_gt = gt_pts[nn_idx].astype(np.float64)
+        s, r, t = _umeyama_alignment(aligned, matched_gt, estimate_scale=estimate_scale)
+        aligned = _apply_similarity(aligned, s, r, t)
+
+        total_t = s * (r @ total_t) + t
+        total_r = r @ total_r
+        total_scale = s * total_scale
+
+    info = {
+        "align_mode": align_mode,
+        "scale": float(total_scale),
+        "rotation": total_r.tolist(),
+        "translation": total_t.tolist(),
+        "icp_iters": int(max(1, icp_iters)),
+    }
+    return aligned.astype(np.float32), info
+
+
 def _compute_pointcloud_metrics(pred_pts: np.ndarray, gt_pts: np.ndarray, threshold: float) -> dict:
     pred_tree = cKDTree(pred_pts)
     gt_tree = cKDTree(gt_pts)
@@ -148,6 +211,14 @@ def main():
     parser.add_argument("--distance_threshold", type=float, default=0.05, help="Distance threshold used by precision/recall/fscore")
     parser.add_argument("--max_points", type=int, default=2000000, help="Max points per cloud for metric computation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for downsampling")
+    parser.add_argument(
+        "--align_mode",
+        type=str,
+        default="sim3",
+        choices=["none", "rigid", "sim3"],
+        help="Point cloud alignment mode before evaluation: none, rigid(SE3), or sim3(scale+rotation+translation).",
+    )
+    parser.add_argument("--icp_iters", type=int, default=10, help="ICP refinement iterations for rigid/sim3 alignment")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -173,7 +244,10 @@ def main():
     )
     gt_pts = _load_gt_pcd(args.gt_pcd, max_points=args.max_points, rng_seed=args.seed)
 
-    metrics = _compute_pointcloud_metrics(pred_pts, gt_pts, threshold=args.distance_threshold)
+    pred_pts_aligned, align_info = _align_pred_to_gt(pred_pts, gt_pts, align_mode=args.align_mode, icp_iters=args.icp_iters)
+
+    metrics = _compute_pointcloud_metrics(pred_pts_aligned, gt_pts, threshold=args.distance_threshold)
+    metrics.update(align_info)
     metrics["pred_pth"] = args.pred_pth
     metrics["gt_pcd"] = args.gt_pcd
     metrics["num_frames_used"] = int(len(selected_indices))
@@ -185,8 +259,10 @@ def main():
 
     pred_pcd_path = os.path.join(args.output_dir, "pred_points_sampled.ply")
     gt_pcd_path = os.path.join(args.output_dir, "gt_points_sampled.ply")
+    pred_aligned_pcd_path = os.path.join(args.output_dir, "pred_points_aligned_sampled.ply")
     trimesh.points.PointCloud(pred_pts.astype(np.float64)).export(pred_pcd_path)
     trimesh.points.PointCloud(gt_pts.astype(np.float64)).export(gt_pcd_path)
+    trimesh.points.PointCloud(pred_pts_aligned.astype(np.float64)).export(pred_aligned_pcd_path)
 
     print(json.dumps(metrics, indent=2))
 
