@@ -96,16 +96,16 @@ def _pcd_numpy_dtype(type_char: str, size: int):
 
 
 
-def _lzf_decompress(data: bytes, expected_length: int) -> bytes:
+def _lzf_decompress_variant(data: bytes, expected_length: int, literal_add: int, backref_add: int, ref_minus_one: bool) -> bytes:
     i = 0
     out = bytearray()
     data_len = len(data)
-    while i < data_len:
+    while i < data_len and len(out) < expected_length:
         ctrl = data[i]
         i += 1
         if ctrl < 32:
-            run = ctrl + 1
-            if i + run > data_len:
+            run = ctrl + literal_add
+            if run < 0 or i + run > data_len:
                 raise ValueError("Invalid LZF stream: literal run exceeds input size")
             out.extend(data[i:i + run])
             i += run
@@ -121,8 +121,8 @@ def _lzf_decompress(data: bytes, expected_length: int) -> bytes:
                     raise ValueError("Invalid LZF stream: missing extended length byte")
                 length += data[i]
                 i += 1
-            length += 2
-            ref_pos = len(out) - ref_offset - 1
+            length += backref_add
+            ref_pos = len(out) - ref_offset - (1 if ref_minus_one else 0)
             if ref_pos < 0:
                 raise ValueError("Invalid LZF stream: back-reference before output start")
             for _ in range(length):
@@ -133,6 +133,23 @@ def _lzf_decompress(data: bytes, expected_length: int) -> bytes:
     if len(out) != expected_length:
         raise ValueError(f"LZF decompression size mismatch: got {len(out)}, expected {expected_length}")
     return bytes(out)
+
+
+def _lzf_decompress(data: bytes, expected_length: int) -> bytes:
+    variants = [
+        (1, 2, True),   # standard LZF
+        (1, 3, True),
+        (0, 2, True),
+        (1, 2, False),
+    ]
+    last_err = None
+    for literal_add, backref_add, ref_minus_one in variants:
+        try:
+            return _lzf_decompress_variant(data, expected_length, literal_add, backref_add, ref_minus_one)
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            continue
+    raise ValueError(f"Failed to decompress LZF payload with supported variants: {last_err}")
 
 
 def _extract_xyz_from_pcd_bytes(raw: bytes, fields, sizes, types, counts, points: int) -> np.ndarray:
@@ -231,8 +248,22 @@ def _read_pcd_points(path: str) -> np.ndarray:
             compressed = f.read(compressed_size)
             if len(compressed) != compressed_size:
                 raise ValueError(f"Invalid PCD binary_compressed payload size in {path}")
-            raw = _lzf_decompress(compressed, uncompressed_size)
-            return _extract_xyz_from_pcd_bytes(raw, fields, sizes, types, counts, points)
+            try:
+                raw = _lzf_decompress(compressed, uncompressed_size)
+                return _extract_xyz_from_pcd_bytes(raw, fields, sizes, types, counts, points)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    import open3d as o3d
+
+                    pcd = o3d.io.read_point_cloud(path)
+                    pts = np.asarray(pcd.points, dtype=np.float32)
+                    if pts.size == 0:
+                        raise ValueError("Open3D returned empty point cloud")
+                    return pts
+                except Exception as o3d_exc:  # noqa: BLE001
+                    raise ValueError(
+                        f"Failed to parse binary_compressed PCD via internal decoder ({exc}) and Open3D fallback ({o3d_exc})"
+                    )
 
         raise ValueError(f"Unsupported PCD DATA mode '{data_type}' in {path}")
 
