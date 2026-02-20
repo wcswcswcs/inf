@@ -83,20 +83,101 @@ def _build_pred_pointcloud(
     return pred.astype(np.float32)
 
 
+def _pcd_numpy_dtype(type_char: str, size: int):
+    type_char = type_char.upper()
+    if type_char == "F":
+        return {4: np.float32, 8: np.float64}[size]
+    if type_char == "I":
+        return {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}[size]
+    if type_char == "U":
+        return {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}[size]
+    raise ValueError(f"Unsupported PCD TYPE/SIZE combination: TYPE={type_char}, SIZE={size}")
+
+
+def _read_pcd_points(path: str) -> np.ndarray:
+    header = {}
+    with open(path, "rb") as f:
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"Invalid PCD file (missing DATA line): {path}")
+            line_str = line.decode("utf-8", errors="ignore").strip()
+            if not line_str or line_str.startswith("#"):
+                continue
+            parts = line_str.split()
+            key = parts[0].lower()
+            values = parts[1:]
+            header[key] = values
+            if key == "data":
+                break
+
+        fields = header.get("fields")
+        sizes = [int(v) for v in header.get("size", [])]
+        types = header.get("type", [])
+        counts = [int(v) for v in header.get("count", ["1"] * len(fields))]
+        points = int(header.get("points", ["0"])[0])
+        data_type = header["data"][0].lower()
+
+        if not fields or not sizes or not types:
+            raise ValueError(f"Invalid PCD header in {path}: missing FIELDS/SIZE/TYPE")
+        if not (len(fields) == len(sizes) == len(types) == len(counts)):
+            raise ValueError(f"Invalid PCD header in {path}: inconsistent FIELDS/SIZE/TYPE/COUNT lengths")
+
+        if data_type == "ascii":
+            raw = np.loadtxt(f, dtype=np.float64)
+            if raw.ndim == 1:
+                raw = raw[None, :]
+            offsets = []
+            csum = 0
+            for c in counts:
+                offsets.append(csum)
+                csum += c
+            idx_x = offsets[fields.index("x")]
+            idx_y = offsets[fields.index("y")]
+            idx_z = offsets[fields.index("z")]
+            pts = np.stack([raw[:, idx_x], raw[:, idx_y], raw[:, idx_z]], axis=1)
+            return pts.astype(np.float32)
+
+        if data_type == "binary":
+            dtype_descr = []
+            for name, size, tchar, count in zip(fields, sizes, types, counts):
+                base_dtype = _pcd_numpy_dtype(tchar, size)
+                if count == 1:
+                    dtype_descr.append((name, base_dtype))
+                else:
+                    dtype_descr.append((name, base_dtype, (count,)))
+
+            packed = np.fromfile(f, dtype=np.dtype(dtype_descr), count=points)
+            if not all(k in packed.dtype.names for k in ("x", "y", "z")):
+                raise ValueError(f"PCD file missing x/y/z fields: {path}")
+            pts = np.stack([packed["x"], packed["y"], packed["z"]], axis=1)
+            return pts.astype(np.float32)
+
+        if data_type == "binary_compressed":
+            raise ValueError("PCD DATA binary_compressed is not supported in eval_from_pth.py")
+
+        raise ValueError(f"Unsupported PCD DATA mode '{data_type}' in {path}")
+
+
 def _load_gt_pcd(path: str, max_points: int, rng_seed: int) -> np.ndarray:
-    mesh_or_pc = trimesh.load(path, process=False)
-    if hasattr(mesh_or_pc, "vertices"):
-        pts = np.asarray(mesh_or_pc.vertices, dtype=np.float32)
-    elif isinstance(mesh_or_pc, trimesh.Scene):
-        pts_list = []
-        for geom in mesh_or_pc.geometry.values():
-            if hasattr(geom, "vertices"):
-                pts_list.append(np.asarray(geom.vertices, dtype=np.float32))
-        if not pts_list:
-            raise ValueError(f"Loaded scene without vertices from {path}")
-        pts = np.concatenate(pts_list, axis=0)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pcd":
+        pts = _read_pcd_points(path)
     else:
-        raise ValueError(f"Unsupported GT geometry type: {type(mesh_or_pc)}")
+        mesh_or_pc = trimesh.load(path, process=False)
+        if hasattr(mesh_or_pc, "vertices"):
+            pts = np.asarray(mesh_or_pc.vertices, dtype=np.float32)
+        elif isinstance(mesh_or_pc, trimesh.Scene):
+            pts_list = []
+            for geom in mesh_or_pc.geometry.values():
+                if hasattr(geom, "vertices"):
+                    pts_list.append(np.asarray(geom.vertices, dtype=np.float32))
+            if not pts_list:
+                raise ValueError(f"Loaded scene without vertices from {path}")
+            pts = np.concatenate(pts_list, axis=0)
+        else:
+            raise ValueError(f"Unsupported GT geometry type: {type(mesh_or_pc)}")
+
     valid = np.isfinite(pts).all(axis=1)
     pts = pts[valid]
     if len(pts) == 0:
