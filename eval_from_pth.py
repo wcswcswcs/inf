@@ -94,6 +94,76 @@ def _pcd_numpy_dtype(type_char: str, size: int):
     raise ValueError(f"Unsupported PCD TYPE/SIZE combination: TYPE={type_char}, SIZE={size}")
 
 
+
+
+def _lzf_decompress(data: bytes, expected_length: int) -> bytes:
+    i = 0
+    out = bytearray()
+    data_len = len(data)
+    while i < data_len:
+        ctrl = data[i]
+        i += 1
+        if ctrl < 32:
+            run = ctrl + 1
+            if i + run > data_len:
+                raise ValueError("Invalid LZF stream: literal run exceeds input size")
+            out.extend(data[i:i + run])
+            i += run
+        else:
+            length = (ctrl >> 5)
+            ref_offset = (ctrl & 0x1F) << 8
+            if i >= data_len:
+                raise ValueError("Invalid LZF stream: missing back-reference offset byte")
+            ref_offset += data[i]
+            i += 1
+            if length == 7:
+                if i >= data_len:
+                    raise ValueError("Invalid LZF stream: missing extended length byte")
+                length += data[i]
+                i += 1
+            length += 2
+            ref_pos = len(out) - ref_offset - 1
+            if ref_pos < 0:
+                raise ValueError("Invalid LZF stream: back-reference before output start")
+            for _ in range(length):
+                if ref_pos >= len(out):
+                    raise ValueError("Invalid LZF stream: back-reference out of range")
+                out.append(out[ref_pos])
+                ref_pos += 1
+    if len(out) != expected_length:
+        raise ValueError(f"LZF decompression size mismatch: got {len(out)}, expected {expected_length}")
+    return bytes(out)
+
+
+def _extract_xyz_from_pcd_bytes(raw: bytes, fields, sizes, types, counts, points: int) -> np.ndarray:
+    x_vals = y_vals = z_vals = None
+    offset = 0
+    for name, size, tchar, count in zip(fields, sizes, types, counts):
+        elem_bytes = size * count
+        field_bytes = elem_bytes * points
+        chunk = raw[offset:offset + field_bytes]
+        if len(chunk) != field_bytes:
+            raise ValueError(f"Invalid PCD payload: insufficient bytes for field '{name}'")
+
+        dtype = _pcd_numpy_dtype(tchar, size)
+        arr = np.frombuffer(chunk, dtype=dtype)
+        if count > 1:
+            arr = arr.reshape(points, count)
+            arr = arr[:, 0]
+        if name == "x":
+            x_vals = arr
+        elif name == "y":
+            y_vals = arr
+        elif name == "z":
+            z_vals = arr
+        offset += field_bytes
+
+    if x_vals is None or y_vals is None or z_vals is None:
+        raise ValueError("PCD file missing x/y/z fields")
+
+    pts = np.stack([x_vals, y_vals, z_vals], axis=1)
+    return pts.astype(np.float32)
+
 def _read_pcd_points(path: str) -> np.ndarray:
     header = {}
     with open(path, "rb") as f:
@@ -154,7 +224,15 @@ def _read_pcd_points(path: str) -> np.ndarray:
             return pts.astype(np.float32)
 
         if data_type == "binary_compressed":
-            raise ValueError("PCD DATA binary_compressed is not supported in eval_from_pth.py")
+            sizes_u32 = np.fromfile(f, dtype=np.uint32, count=2)
+            if len(sizes_u32) != 2:
+                raise ValueError(f"Invalid PCD binary_compressed header in {path}")
+            compressed_size, uncompressed_size = int(sizes_u32[0]), int(sizes_u32[1])
+            compressed = f.read(compressed_size)
+            if len(compressed) != compressed_size:
+                raise ValueError(f"Invalid PCD binary_compressed payload size in {path}")
+            raw = _lzf_decompress(compressed, uncompressed_size)
+            return _extract_xyz_from_pcd_bytes(raw, fields, sizes, types, counts, points)
 
         raise ValueError(f"Unsupported PCD DATA mode '{data_type}' in {path}")
 
