@@ -387,6 +387,36 @@ def _compute_pointcloud_metrics(pred_pts: np.ndarray, gt_pts: np.ndarray, thresh
     }
 
 
+
+
+def _compute_cut3r_style_metrics(pred_pts: np.ndarray, gt_pts: np.ndarray) -> dict:
+    """Match CUT3R mv_recon metric naming: accuracy/completion (+ median)."""
+    gt_tree = cKDTree(gt_pts)
+    pred_tree = cKDTree(pred_pts)
+
+    d_pred_to_gt, _ = gt_tree.query(pred_pts, k=1, workers=-1)
+    d_gt_to_pred, _ = pred_tree.query(gt_pts, k=1, workers=-1)
+
+    return {
+        "accuracy_mean": float(np.mean(d_pred_to_gt)),
+        "accuracy_median": float(np.median(d_pred_to_gt)),
+        "completion_mean": float(np.mean(d_gt_to_pred)),
+        "completion_median": float(np.median(d_gt_to_pred)),
+    }
+
+
+def _parse_threshold_list(text: str) -> list[float]:
+    vals = []
+    for part in str(text).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    if not vals:
+        raise ValueError("At least one threshold must be provided")
+    return vals
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate predicted point cloud from inference .pth against GT .pcd")
     parser.add_argument("--pred_pth", type=str, required=True, help="Path to run_inference output .pth")
@@ -409,6 +439,19 @@ def main():
         help="Point cloud alignment mode before evaluation: none, rigid(SE3), or sim3(scale+rotation+translation).",
     )
     parser.add_argument("--icp_iters", type=int, default=10, help="ICP refinement iterations for rigid/sim3 alignment")
+    parser.add_argument(
+        "--eval_protocol",
+        type=str,
+        default="cut3r",
+        choices=["cut3r", "legacy"],
+        help="Metric reporting protocol. cut3r reports accuracy/completion style metrics.",
+    )
+    parser.add_argument(
+        "--fscore_thresholds",
+        type=str,
+        default="0.05",
+        help="Comma separated thresholds used for F-score reporting (e.g. '0.05,0.1').",
+    )
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -437,6 +480,15 @@ def main():
     pred_pts_aligned, align_info = _align_pred_to_gt(pred_pts, gt_pts, align_mode=args.align_mode, icp_iters=args.icp_iters)
 
     metrics = _compute_pointcloud_metrics(pred_pts_aligned, gt_pts, threshold=args.distance_threshold)
+    if args.eval_protocol == "cut3r":
+        metrics.update(_compute_cut3r_style_metrics(pred_pts_aligned, gt_pts))
+
+    for th in _parse_threshold_list(args.fscore_thresholds):
+        th_metrics = _compute_pointcloud_metrics(pred_pts_aligned, gt_pts, threshold=th)
+        metrics[f"fscore@{th:g}"] = th_metrics["fscore"]
+        metrics[f"precision@{th:g}"] = th_metrics["precision"]
+        metrics[f"recall@{th:g}"] = th_metrics["recall"]
+
     metrics.update(align_info)
     metrics["pred_pth"] = args.pred_pth
     metrics["gt_pcd"] = args.gt_pcd
