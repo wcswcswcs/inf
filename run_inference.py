@@ -68,12 +68,9 @@ def run_inference(args: argparse.Namespace):
         return
         
     print(f"Found {len(image_names)} images to process.")
-    if args.use_geo_kv_prune:
-        images = load_and_preprocess_images(image_names)
-        if device == "cuda" and images.device.type == "cpu":
-            images = images.pin_memory()
-    else:
-        images = load_and_preprocess_images(image_names).to(device)
+    images = load_and_preprocess_images(image_names)
+    if device == "cuda" and images.device.type == "cpu":
+        images = images.pin_memory()
     print(f"Preprocessed images tensor shape: {images.shape}")
 
     frames: List[Dict[str, torch.Tensor]] = []
