@@ -43,7 +43,8 @@ def run_inference(args: argparse.Namespace):
     if args.frame_cache_dir:
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
-    model = StreamVGGT(total_budget=args.total_budget)
+    model_total_budget = args.total_budget if args.use_geo_kv_prune else 1200000
+    model = StreamVGGT(total_budget=model_total_budget)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
     model.load_state_dict(ckpt, strict=True)
@@ -53,21 +54,26 @@ def run_inference(args: argparse.Namespace):
     print("Model loaded successfully onto the GPU.")
 
     print(f"Loading images from input directory: {args.input_dir}")
-    # image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
-    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
-    image_names = sorted(
-        p for p in glob.glob(os.path.join(args.input_dir, "*"))
-        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
-    )
+    if args.use_geo_kv_prune:
+        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
+        image_names = sorted(
+            p for p in glob.glob(os.path.join(args.input_dir, "*"))
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
+        )
+    else:
+        image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
         return
         
     print(f"Found {len(image_names)} images to process.")
-    images = load_and_preprocess_images(image_names)
-    if device == "cuda" and images.device.type == "cpu":
-        images = images.pin_memory()
+    if args.use_geo_kv_prune:
+        images = load_and_preprocess_images(image_names)
+        if device == "cuda" and images.device.type == "cpu":
+            images = images.pin_memory()
+    else:
+        images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images tensor shape: {images.shape}")
 
     frames: List[Dict[str, torch.Tensor]] = []
@@ -85,20 +91,27 @@ def run_inference(args: argparse.Namespace):
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            output = model.inference(
-                frames,
-                frame_writer=frame_writer,
-                cache_results=cache_results,
-                use_geo_kv_prune=args.use_geo_kv_prune,
-                geo_voxel_size=args.geo_voxel_size,
-                geo_topk_per_voxel=args.geo_topk_per_voxel,
-                geo_recent_frames=args.geo_recent_frames,
-                geo_near=args.geo_near,
-                geo_far=args.geo_far,
-                show_progress=not args.no_progress,
-                memory_diagnostics=args.memory_diagnostics,
-                memory_log_interval=args.memory_log_interval,
-            )
+            if args.use_geo_kv_prune:
+                output = model.inference(
+                    frames,
+                    frame_writer=frame_writer,
+                    cache_results=cache_results,
+                    use_geo_kv_prune=True,
+                    geo_voxel_size=args.geo_voxel_size,
+                    geo_topk_per_voxel=args.geo_topk_per_voxel,
+                    geo_recent_frames=args.geo_recent_frames,
+                    geo_near=args.geo_near,
+                    geo_far=args.geo_far,
+                    show_progress=not args.no_progress,
+                    memory_diagnostics=args.memory_diagnostics,
+                    memory_log_interval=args.memory_log_interval,
+                )
+            else:
+                output = model.inference(
+                    frames,
+                    frame_writer=frame_writer,
+                    cache_results=cache_results,
+                )
 
     torch.cuda.synchronize()
     end_time_model = time.time()
@@ -134,8 +147,11 @@ def run_inference(args: argparse.Namespace):
         "depth": torch.stack(all_depth, dim=0),
         "depth_conf": torch.stack(all_depth_conf, dim=0),
         "pose_enc": torch.stack(all_camera_pose, dim=0),
-        "image_paths": [os.path.relpath(p, PROJECT_ROOT) for p in image_names],
     }
+    if args.use_geo_kv_prune:
+        predictions["image_paths"] = [os.path.relpath(p, PROJECT_ROOT) for p in image_names]
+    else:
+        predictions["images"] = images
 
     # Convert pose encoding to extrinsic and intrinsic matrices
     extrinsic, intrinsic = pose_encoding_to_extri_intri(
@@ -226,7 +242,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--total_budget",
         type=int,
-        default=600000,
+        default=1200000,
         help="Global token budget used to initialize StreamVGGT.",
     )
     parser.add_argument(

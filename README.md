@@ -118,6 +118,13 @@ python demo_viser.py  \
     --gt_path path/to/nrgbd/gt_camera (Optional)
 ```
 
+Tip: in the Viser UI, enable **Scene Tree Manual Visibility** to stop automatic frame hiding and manually control `/frames/*` visibility from the scene tree.
+
+### Notes: upstream parity for non-geo mode
+For the basic command (without `--use_geo_kv_prune`), this repo follows upstream `AutoLab-SAI-SJTU/InfiniteVGGT` processing logic.
+
+Use geo-guided mode only when you intentionally enable `--use_geo_kv_prune` (plus optional `--geo_*` flags).
+
 ## 🧊 Long3D Dataset
 
 The **Long3D Dataset** is a benchmark designed for long-sequence 3D scene reconstruction. It provides 10Hz image streams paired with dense ground truth point clouds.
