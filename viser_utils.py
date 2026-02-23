@@ -332,6 +332,7 @@ class PointCloudViewer:
         conf_list,
         cam_dict,
         gt_poses=None,
+        gt_pointcloud=None,
         image_mask=None,
         edge_color_list=None,
         device="cpu",
@@ -354,8 +355,10 @@ class PointCloudViewer:
             pc_list, color_list, conf_list, edge_color_list
         )
         self.cam_dict = cam_dict
-        self.gt_poses = gt_poses  
-        self.gt_cam_handles = [] 
+        self.gt_poses = gt_poses
+        self.gt_pointcloud = gt_pointcloud
+        self.gt_cam_handles = []
+        self.gt_pc_handle = None
         self.num_frames = len(self.all_steps)
         self.image_mask = image_mask
         self.show_camera = show_camera
@@ -365,7 +368,11 @@ class PointCloudViewer:
         self.orig_img_list = [x[0] for x in color_list]
         self.via_points = []
         self.show_gt_checkbox = self.server.add_gui_checkbox(
-            "Show GT Camera", 
+            "Show GT Camera",
+            initial_value=True
+        )
+        self.show_gt_pc_checkbox = self.server.add_gui_checkbox(
+            "Show GT PointCloud",
             initial_value=True
         )
 
@@ -374,6 +381,11 @@ class PointCloudViewer:
             visible = self.show_gt_checkbox.value
             for handle in self.gt_cam_handles:
                 handle.visible = visible
+
+        @self.show_gt_pc_checkbox.on_update
+        def _(_) -> None:
+            if self.gt_pc_handle is not None:
+                self.gt_pc_handle.visible = self.show_gt_pc_checkbox.value
 
         gui_reset_up = self.server.gui.add_button(
             "Reset up direction",
@@ -839,6 +851,24 @@ class PointCloudViewer:
             
         self.gt_cam_handles.append(handle)
 
+
+    def add_gt_pointcloud(self):
+        if self.gt_pointcloud is None:
+            return
+        pts = np.asarray(self.gt_pointcloud, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+            return
+
+        colors = np.tile(np.array([[255, 64, 64]], dtype=np.uint8), (pts.shape[0], 1))
+        self.gt_pc_handle = self.server.add_point_cloud(
+            name="/gt/pointcloud",
+            points=pts,
+            colors=colors,
+            point_size=self.psize_slider.value,
+        )
+        if hasattr(self, "show_gt_pc_checkbox"):
+            self.gt_pc_handle.visible = self.show_gt_pc_checkbox.value
+
     def animate(self):
         with self.server.add_gui_folder("Playback"):
             gui_timestep = self.server.add_gui_slider(
@@ -893,6 +923,7 @@ class PointCloudViewer:
             "/frames",
             show_axes=False,
         )
+        self.add_gt_pointcloud()
         self.frame_nodes = []
         for i in range(self.num_frames):
             step = self.all_steps[i]

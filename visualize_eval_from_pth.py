@@ -13,6 +13,7 @@ sys.path.append("src/")
 
 from eval.pose_evaluation.evo_utils import eval_metrics, load_traj
 from streamvggt.utils.load_fn import load_and_preprocess_images
+from eval_from_pth import _load_gt_pcd, _align_pred_to_gt
 
 
 SINTEL_TAG_FLOAT = 202021.25
@@ -295,6 +296,31 @@ def _select_frame_indices(total_frames: int, frame_stride: int, max_frames: int,
     return np.unique(indices)
 
 
+
+
+def _build_pred_points_for_alignment(world_points: np.ndarray, conf: np.ndarray, conf_threshold: float, max_points: int, seed: int) -> np.ndarray:
+    if conf.ndim == 4 and conf.shape[-1] == 1:
+        conf = conf.squeeze(-1)
+    flat_pts = world_points.reshape(-1, 3)
+    flat_conf = conf.reshape(-1)
+    valid = np.isfinite(flat_pts).all(axis=1) & np.isfinite(flat_conf) & (flat_conf >= conf_threshold)
+    pts = flat_pts[valid].astype(np.float32)
+    if len(pts) == 0:
+        raise ValueError("No valid predicted points for GT alignment")
+    if len(pts) > max_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(pts), size=max_points, replace=False)
+        pts = pts[idx]
+    return pts
+
+
+def _prepare_aligned_gt_pointcloud(gt_pcd: str, world_points: np.ndarray, conf: np.ndarray, conf_threshold: float, max_points: int, seed: int):
+    pred_pts = _build_pred_points_for_alignment(world_points, conf, conf_threshold, max_points, seed)
+    gt_pts = _load_gt_pcd(gt_pcd, max_points=max_points, rng_seed=seed)
+    gt_aligned, align_info = _align_pred_to_gt(gt_pts, pred_pts, align_mode="sim3", icp_iters=10)
+    return gt_aligned, align_info
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize and evaluate StreamVGGT predictions from output .pth")
     parser.add_argument("--pred_pth", type=str, required=True, help="Path to run_inference output .pth")
@@ -324,6 +350,10 @@ def main():
         choices=["scale&shift", "scale", "metric"],
         help="Depth alignment mode",
     )
+    parser.add_argument("--gt_pcd", type=str, default=None, help="Optional GT point cloud (.pcd/.ply) for visualization comparison")
+    parser.add_argument("--gt_align_conf_threshold", type=float, default=0.0, help="Confidence threshold when building predicted points for GT alignment")
+    parser.add_argument("--gt_align_max_points", type=int, default=1000000, help="Maximum points used in GT/pred SIM3 alignment")
+    parser.add_argument("--gt_align_seed", type=int, default=42, help="Random seed for GT alignment point sampling")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -357,6 +387,24 @@ def main():
     if args.gt_depth_glob:
         depth_json = os.path.join(args.output_dir, "depth_metrics.json")
         summary["depth_metrics"] = _run_depth_metrics(depth, args.gt_depth_glob, args.depth_align, depth_json)
+
+    gt_pointcloud_aligned = None
+    if args.gt_pcd:
+        gt_pointcloud_aligned, gt_align_info = _prepare_aligned_gt_pointcloud(
+            gt_pcd=args.gt_pcd,
+            world_points=pts,
+            conf=conf,
+            conf_threshold=args.gt_align_conf_threshold,
+            max_points=args.gt_align_max_points,
+            seed=args.gt_align_seed,
+        )
+        summary["gt_pointcloud"] = {
+            "path": args.gt_pcd,
+            "aligned_with": "sim3",
+            "scale": float(gt_align_info.get("scale", 1.0)),
+            "icp_iters": int(gt_align_info.get("icp_iters", 10)),
+            "num_points": int(len(gt_pointcloud_aligned)),
+        }
 
     with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -403,6 +451,7 @@ def main():
             conf_list=conf_vis,
             cam_dict=cam_vis,
             gt_poses=None,
+            gt_pointcloud=gt_pointcloud_aligned,
             device="cpu",
             vis_threshold=args.vis_threshold,
             size=max(h, w),
