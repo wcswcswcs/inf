@@ -444,18 +444,11 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         if use_cache:
-            # Avoid allocating O(S_true) temporary tensors for long sequences.
-            token_slot = 0 if past_frame_idx == 0 else 1
-            camera_token = (
-                self.camera_token[:, token_slot:token_slot + 1]
-                .expand(B, S, *self.camera_token.shape[2:])
-                .reshape(B * S, self.camera_token.shape[2], self.camera_token.shape[3])
-            )
-            register_token = (
-                self.register_token[:, token_slot:token_slot + 1]
-                .expand(B, S, *self.register_token.shape[2:])
-                .reshape(B * S, self.register_token.shape[2], self.register_token.shape[3])
-            )
+            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
+            camera_token = camera_token_full[-1:, :, :]
+
+            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
+            register_token = register_token_full[-1:, :, :]
         else:
             camera_token = slice_expand_and_flatten(self.camera_token, B, S)
             register_token = slice_expand_and_flatten(self.register_token, B, S)
@@ -491,9 +484,7 @@ class Aggregator(nn.Module):
                 elif attn_type == "global":
                     if use_cache:
                         layer_idx = global_idx
-                        raw_layer_budget = int(current_budgets[layer_idx].item())
-                        # Keep at least special tokens to avoid zero-budget unbounded behavior.
-                        layer_budget = max(raw_layer_budget, self.patch_start_idx)
+                        layer_budget = int(current_budgets[layer_idx].item())
                         past_kv_block = past_key_values[layer_idx] if past_key_values[layer_idx] is not None else None
                         past_meta = self.geo_token_meta[layer_idx]
 
