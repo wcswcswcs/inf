@@ -195,7 +195,14 @@ class Aggregator(nn.Module):
         self.geo_max_frame_idx = max(self.geo_max_frame_idx, frame_idx)
 
     @staticmethod
-    def _frustum_mask(pts: torch.Tensor, world_to_cam: torch.Tensor, intrinsic: torch.Tensor, near: float, far: float):
+    def _frustum_mask(
+        pts: torch.Tensor,
+        world_to_cam: torch.Tensor,
+        intrinsic: torch.Tensor,
+        near: float,
+        far: float,
+        img_hw: Optional[Tuple[int, int]] = None,
+    ):
         if pts.numel() == 0:
             return torch.zeros((0,), dtype=torch.bool, device=pts.device)
 
@@ -213,9 +220,14 @@ class Aggregator(nn.Module):
         uv_h = cam @ intrinsic.t()         # [N, 3]
         u = uv_h[:, 0] / (uv_h[:, 2].clamp_min(1e-6))
         v = uv_h[:, 1] / (uv_h[:, 2].clamp_min(1e-6))
-        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
-        W = max((cx * 2.0).item(), 1.0)
-        H = max((cy * 2.0).item(), 1.0)
+        if img_hw is not None:
+            H, W = img_hw
+            H = max(float(H), 1.0)
+            W = max(float(W), 1.0)
+        else:
+            cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+            W = max((cx * 2.0).item(), 1.0)
+            H = max((cy * 2.0).item(), 1.0)
         inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
         return valid_z & inside
 
@@ -292,6 +304,8 @@ class Aggregator(nn.Module):
         if intrinsic.ndim == 3:
             intrinsic = intrinsic[0]
 
+        img_hw = current_view.get("img_hw") if current_view is not None else None
+
         # Candidates for geometry-based pruning: non-special and non-recent tokens
         candidate_mask = (~is_special) & (~recent_mask) & (local_idx >= 0)
         candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
@@ -329,6 +343,7 @@ class Aggregator(nn.Module):
                 intrinsic.to(torch.float32),
                 near=near,
                 far=far,
+                img_hw=img_hw,
             )
             if visible.sum().item() == 0:
                 continue

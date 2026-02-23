@@ -186,7 +186,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if use_geo_kv_prune and self.point_head is not None and self.camera_head is not None:
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(
-                        pose_enc.unsqueeze(1),
+                        pose_enc,
                         images.shape[-2:]
                     )
                     world_to_cam = torch.eye(4, device=extrinsic.device, dtype=extrinsic.dtype).unsqueeze(0).repeat(extrinsic.shape[0], 1, 1)
@@ -195,6 +195,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     current_view = {
                         "world_to_cam": world_to_cam.detach(),
                         "intrinsic": intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
                     }
                     self.aggregator.update_geo_frame_metadata(
                         frame_idx=i,
