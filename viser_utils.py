@@ -888,6 +888,11 @@ class PointCloudViewer:
             gui_framerate_options = self.server.add_gui_button_group(
                 "FPS options", ("10", "20", "30", "60")
             )
+            gui_scene_tree_mode = self.server.add_gui_checkbox(
+                "Scene Tree Manual Visibility",
+                False,
+                hint="Enable to stop auto-hiding frames so you can toggle /frames/* in scene tree.",
+            )
 
         @gui_next_frame.on_click
         def _(_) -> None:
@@ -912,6 +917,9 @@ class PointCloudViewer:
         @gui_timestep.on_update
         def _(_) -> None:
             nonlocal prev_timestep
+            if gui_scene_tree_mode.value:
+                prev_timestep = gui_timestep.value
+                return
             current_timestep = gui_timestep.value
             with self.server.atomic():
                 self.frame_nodes[current_timestep].visible = True
@@ -942,19 +950,30 @@ class PointCloudViewer:
                     self.add_gt_camera(step)
 
         prev_timestep = gui_timestep.value
+
+        @gui_scene_tree_mode.on_update
+        def _(_) -> None:
+            if gui_scene_tree_mode.value:
+                for frame_node in self.frame_nodes:
+                    frame_node.visible = True
+            else:
+                for i, frame_node in enumerate(self.frame_nodes):
+                    frame_node.visible = (i <= gui_timestep.value if not self.fourd else i == gui_timestep.value)
+
         while True:
             if self.on_replay:
                 pass
             else:
-                if gui_playing.value:
+                if gui_playing.value and (not gui_scene_tree_mode.value):
                     gui_timestep.value = (gui_timestep.value + 1) % self.num_frames
 
-                for i, frame_node in enumerate(self.frame_nodes):
-                    frame_node.visible = (
-                        i <= gui_timestep.value
-                        if not self.fourd
-                        else i == gui_timestep.value
-                    )
+                if not gui_scene_tree_mode.value:
+                    for i, frame_node in enumerate(self.frame_nodes):
+                        frame_node.visible = (
+                            i <= gui_timestep.value
+                            if not self.fourd
+                            else i == gui_timestep.value
+                        )
 
             time.sleep(1.0 / gui_framerate.value)
 
