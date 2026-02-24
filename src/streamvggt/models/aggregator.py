@@ -149,20 +149,87 @@ class Aggregator(nn.Module):
         self.geo_invisible_read_weight = 0.05
         self.geo_min_conf_for_anchor = 1.1
         self.geo_max_voxels = 200000
+        self.geo_anchor_voxel_budget = 4096
+        self.geo_anchor_read_quota = 2048
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
         self.geo_frame_meta: Dict[int, Dict[str, Any]] = {}
         self.geo_max_frame_idx = -1
         self.geo_voxel_bank: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+        self.geo_anchor_voxels: set[Tuple[int, int, int]] = set()
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
                 "frame_idx": torch.empty(0, dtype=torch.long),
                 "is_special": torch.empty(0, dtype=torch.bool),
                 "local_patch_idx": torch.empty(0, dtype=torch.long),
+                "is_anchor": torch.empty(0, dtype=torch.bool),
             }
             for i in range(self.depth)
         }
+
+    def _voxel_importance(self, item: Dict[str, float], now_frame_idx: int) -> float:
+        age = max(0.0, float(now_frame_idx) - float(item["last_seen"]))
+        return (
+            float(item["conf_ema"])
+            * torch.log1p(torch.tensor(float(item["support"]))).item()
+            * (1.0 / (1.0 + float(item["pos_var"])))
+            * (1.0 / (1.0 + 0.05 * age))
+        )
+
+    def _refresh_geo_anchor_voxels(self, now_frame_idx: int):
+        if not self.geo_voxel_bank:
+            self.geo_anchor_voxels = set()
+            return
+
+        ranked = [
+            (self._voxel_importance(item, now_frame_idx), key)
+            for key, item in self.geo_voxel_bank.items()
+            if float(item["conf_ema"]) >= self.geo_min_conf_for_anchor
+        ]
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        self.geo_anchor_voxels = set(k for _, k in ranked[: self.geo_anchor_voxel_budget])
+
+    def _derive_anchor_mask_from_meta(self, meta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        n = int(meta["frame_idx"].numel())
+        if n == 0:
+            return torch.empty(0, dtype=torch.bool)
+
+        out = torch.zeros((n,), dtype=torch.bool)
+        if not self.geo_anchor_voxels:
+            return out
+
+        frame_idx = meta["frame_idx"]
+        local_idx = meta["local_patch_idx"]
+        valid = local_idx >= 0
+        if valid.sum().item() == 0:
+            return out
+
+        for fidx in torch.unique(frame_idx[valid]).tolist():
+            fidx = int(fidx)
+            frame_meta = self.geo_frame_meta.get(fidx)
+            if frame_meta is None:
+                continue
+
+            mask_f = valid & (frame_idx == fidx)
+            idx_global = torch.nonzero(mask_f, as_tuple=False).flatten()
+            local_f = local_idx.index_select(0, idx_global).long()
+            in_range = (local_f >= 0) & (local_f < frame_meta["voxel_ids"].shape[0])
+            if in_range.sum().item() == 0:
+                continue
+
+            idx_global = idx_global[in_range]
+            local_f = local_f[in_range]
+            vox = frame_meta["voxel_ids"].index_select(0, local_f)
+
+            anchor_mask = torch.tensor(
+                [tuple(int(v) for v in row.tolist()) in self.geo_anchor_voxels for row in vox],
+                dtype=torch.bool,
+            )
+            if anchor_mask.numel() > 0:
+                out.index_put_((idx_global,), anchor_mask)
+
+        return out
 
     def update_geo_frame_metadata(
         self,
@@ -251,21 +318,16 @@ class Aggregator(nn.Module):
 
         # Keep global bank bounded.
         if len(self.geo_voxel_bank) > self.geo_max_voxels:
-            now = float(frame_idx)
             items = []
             for key, val in self.geo_voxel_bank.items():
-                age = max(0.0, now - float(val["last_seen"]))
-                importance = (
-                    float(val["conf_ema"])
-                    * torch.log1p(torch.tensor(float(val["support"]))).item()
-                    * (1.0 / (1.0 + float(val["pos_var"])))
-                    * (1.0 / (1.0 + 0.05 * age))
-                )
+                importance = self._voxel_importance(val, frame_idx)
                 items.append((importance, key))
 
             items.sort(key=lambda x: x[0], reverse=True)
             keep_keys = set(k for _, k in items[: self.geo_max_voxels])
             self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
+
+        self._refresh_geo_anchor_voxels(frame_idx)
 
     @staticmethod
     def _frustum_mask(
@@ -315,6 +377,9 @@ class Aggregator(nn.Module):
             "frame_idx": meta["frame_idx"].index_select(0, keep_cpu),
             "is_special": meta["is_special"].index_select(0, keep_cpu),
             "local_patch_idx": meta["local_patch_idx"].index_select(0, keep_cpu),
+            "is_anchor": meta["is_anchor"].index_select(0, keep_cpu)
+            if "is_anchor" in meta
+            else torch.zeros((keep_cpu.numel(),), dtype=torch.bool),
         }
 
     @staticmethod
@@ -323,17 +388,25 @@ class Aggregator(nn.Module):
             "frame_idx": torch.cat([meta_a["frame_idx"], meta_b["frame_idx"]], dim=0),
             "is_special": torch.cat([meta_a["is_special"], meta_b["is_special"]], dim=0),
             "local_patch_idx": torch.cat([meta_a["local_patch_idx"], meta_b["local_patch_idx"]], dim=0),
+            "is_anchor": torch.cat(
+                [
+                    meta_a.get("is_anchor", torch.zeros_like(meta_a["is_special"])),
+                    meta_b.get("is_anchor", torch.zeros_like(meta_b["is_special"])),
+                ],
+                dim=0,
+            ),
         }
 
     @staticmethod
     def _protected_mask(meta: Dict[str, torch.Tensor], recent_frames: int) -> torch.Tensor:
         frame_idx = meta["frame_idx"]
         is_special = meta["is_special"]
+        is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
         if frame_idx.numel() == 0:
             return torch.empty(0, dtype=torch.bool)
         current_frame_idx = int(frame_idx.max().item())
         recent_min = max(0, current_frame_idx - int(recent_frames))
-        return is_special | (frame_idx == 0) | (frame_idx >= recent_min)
+        return is_special | is_anchor | (frame_idx == 0) | (frame_idx >= recent_min)
 
     def _cap_keep_with_protection(
         self,
@@ -388,6 +461,7 @@ class Aggregator(nn.Module):
             "frame_idx": frame_idx_t,
             "is_special": is_special,
             "local_patch_idx": local_patch_idx,
+            "is_anchor": torch.zeros((tokens_per_frame,), dtype=torch.bool),
         }
 
     def _select_geo_active_indices(
@@ -440,7 +514,6 @@ class Aggregator(nn.Module):
 
         # Global per-voxel top-k across all old frames (avoid per-frame duplicates)
         bucket: Dict[Tuple[int, int, int], List[Tuple[float, int]]] = defaultdict(list)
-        global_scores: Dict[int, float] = {}
         candidate_count = int(candidate_indices.numel())
         visible_total = 0
 
@@ -498,7 +571,21 @@ class Aggregator(nn.Module):
 
                 if bank_conf >= self.geo_min_conf_for_anchor:
                     bucket[key].append((score, gidx))
-                    global_scores[gidx] = max(global_scores.get(gidx, -1e9), score)
+
+        # Global anchor quota: keep at least one token from top anchor voxels if available.
+        anchor_count = 0
+        if self.geo_anchor_voxels:
+            for vox in self.geo_anchor_voxels:
+                if vox not in bucket:
+                    continue
+                entries = bucket[vox]
+                if not entries:
+                    continue
+                entries.sort(key=lambda x: x[0], reverse=True)
+                selected.add(entries[0][1])
+                anchor_count += 1
+                if anchor_count >= self.geo_anchor_read_quota:
+                    break
 
         for _, entries in bucket.items():
             entries.sort(key=lambda x: x[0], reverse=True)
@@ -509,11 +596,12 @@ class Aggregator(nn.Module):
             return None
 
         logger.debug(
-            "[geo_prune] total=%d candidate=%d visible=%d selected=%d",
+            "[geo_prune] total=%d candidate=%d visible=%d selected=%d anchor_selected=%d",
             total_tokens,
             candidate_count,
             visible_total,
             len(selected),
+            anchor_count,
         )
 
         keep = torch.tensor(sorted(i for i in selected if 0 <= i < total_tokens), dtype=torch.long)
@@ -698,6 +786,7 @@ class Aggregator(nn.Module):
                         if use_geo_kv_prune:
                             current_meta = self._build_current_frame_meta(past_frame_idx, P)
                             merged_meta = self._concat_meta(past_meta, current_meta)
+                            merged_meta["is_anchor"] = self._derive_anchor_mask_from_meta(merged_meta)
 
                             # Keep explicit hard cap in geo mode with protection for anchor/special/recent tokens.
                             if new_kv[0].shape[2] > layer_budget:
