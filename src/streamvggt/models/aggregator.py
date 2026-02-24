@@ -144,11 +144,17 @@ class Aggregator(nn.Module):
                 persistent=False,
             )
         self.last_scores = torch.zeros(self.depth)
+        self.geo_conf_ema_alpha = 0.9
+        self.geo_var_ema_alpha = 0.9
+        self.geo_invisible_read_weight = 0.05
+        self.geo_min_conf_for_anchor = 1.1
+        self.geo_max_voxels = 200000
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
         self.geo_frame_meta: Dict[int, Dict[str, Any]] = {}
         self.geo_max_frame_idx = -1
+        self.geo_voxel_bank: Dict[Tuple[int, int, int], Dict[str, float]] = {}
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
                 "frame_idx": torch.empty(0, dtype=torch.long),
@@ -183,7 +189,7 @@ class Aggregator(nn.Module):
         pts_flat = pts_patch.reshape(-1, 3).detach().cpu()
         conf_flat = conf_patch.reshape(-1).detach().cpu()
 
-        voxel_ids = torch.round(pts_flat / max(voxel_size, 1e-6)).to(torch.int32)
+        voxel_ids = torch.floor(pts_flat / max(voxel_size, 1e-6)).to(torch.int32)
         meta = {
             "pts": pts_flat,
             "conf": conf_flat,
@@ -193,6 +199,73 @@ class Aggregator(nn.Module):
         }
         self.geo_frame_meta[frame_idx] = meta
         self.geo_max_frame_idx = max(self.geo_max_frame_idx, frame_idx)
+
+        # Update global voxel landmark bank (conf/support/stability/recency)
+        voxel_to_idx: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+        for i in range(voxel_ids.shape[0]):
+            key = tuple(int(v) for v in voxel_ids[i].tolist())
+            voxel_to_idx[key].append(i)
+
+        for key, idxs in voxel_to_idx.items():
+            pts_cur = pts_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
+            conf_cur = conf_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
+            conf_mean = float(conf_cur.mean().item())
+            pos_mean = pts_cur.mean(dim=0)
+
+            if key not in self.geo_voxel_bank:
+                self.geo_voxel_bank[key] = {
+                    "conf_ema": conf_mean,
+                    "support": 1.0,
+                    "last_seen": float(frame_idx),
+                    "pos_x": float(pos_mean[0].item()),
+                    "pos_y": float(pos_mean[1].item()),
+                    "pos_z": float(pos_mean[2].item()),
+                    "pos_var": 0.0,
+                }
+            else:
+                item = self.geo_voxel_bank[key]
+                prev_pos = torch.tensor([item["pos_x"], item["pos_y"], item["pos_z"]], dtype=pos_mean.dtype)
+                drift2 = float(((pos_mean - prev_pos) ** 2).mean().item())
+                item["conf_ema"] = (
+                    self.geo_conf_ema_alpha * item["conf_ema"]
+                    + (1.0 - self.geo_conf_ema_alpha) * conf_mean
+                )
+                item["support"] += 1.0
+                item["last_seen"] = float(frame_idx)
+                item["pos_x"] = float(
+                    self.geo_conf_ema_alpha * item["pos_x"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[0].item()
+                )
+                item["pos_y"] = float(
+                    self.geo_conf_ema_alpha * item["pos_y"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[1].item()
+                )
+                item["pos_z"] = float(
+                    self.geo_conf_ema_alpha * item["pos_z"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[2].item()
+                )
+                item["pos_var"] = (
+                    self.geo_var_ema_alpha * item["pos_var"]
+                    + (1.0 - self.geo_var_ema_alpha) * drift2
+                )
+
+        # Keep global bank bounded.
+        if len(self.geo_voxel_bank) > self.geo_max_voxels:
+            now = float(frame_idx)
+            items = []
+            for key, val in self.geo_voxel_bank.items():
+                age = max(0.0, now - float(val["last_seen"]))
+                importance = (
+                    float(val["conf_ema"])
+                    * torch.log1p(torch.tensor(float(val["support"]))).item()
+                    * (1.0 / (1.0 + float(val["pos_var"])))
+                    * (1.0 / (1.0 + 0.05 * age))
+                )
+                items.append((importance, key))
+
+            items.sort(key=lambda x: x[0], reverse=True)
+            keep_keys = set(k for _, k in items[: self.geo_max_voxels])
+            self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
 
     @staticmethod
     def _frustum_mask(
@@ -367,6 +440,7 @@ class Aggregator(nn.Module):
 
         # Global per-voxel top-k across all old frames (avoid per-frame duplicates)
         bucket: Dict[Tuple[int, int, int], List[Tuple[float, int]]] = defaultdict(list)
+        global_scores: Dict[int, float] = {}
         candidate_count = int(candidate_indices.numel())
         visible_total = 0
 
@@ -402,17 +476,29 @@ class Aggregator(nn.Module):
             )
             visible_count = int(visible.sum().item())
             visible_total += visible_count
-            if visible_count == 0:
-                continue
+            for j in range(in_frame.numel()):
+                gidx = int(in_frame[j].item())
+                key = tuple(int(v) for v in vox[j].tolist())
 
-            vis_global = in_frame[visible]
-            vis_conf = conf[visible]
-            vis_vox = vox[visible]
+                bank = self.geo_voxel_bank.get(key)
+                if bank is None:
+                    bank_conf = float(conf[j].item())
+                    bank_support = 1.0
+                    bank_var = 0.0
+                else:
+                    bank_conf = float(bank["conf_ema"])
+                    bank_support = float(bank["support"])
+                    bank_var = float(bank["pos_var"])
 
-            for j in range(vis_global.numel()):
-                gidx = int(vis_global[j].item())
-                key = tuple(int(v) for v in vis_vox[j].tolist())
-                bucket[key].append((float(vis_conf[j].item()), gidx))
+                stability = 1.0 / (1.0 + bank_var)
+                support_gain = torch.log1p(torch.tensor(bank_support)).item()
+                base_score = max(float(conf[j].item()), 1e-6) * max(bank_conf, 1e-6) * support_gain * stability
+                vis_weight = 1.0 if bool(visible[j].item()) else self.geo_invisible_read_weight
+                score = base_score * vis_weight
+
+                if bank_conf >= self.geo_min_conf_for_anchor:
+                    bucket[key].append((score, gidx))
+                    global_scores[gidx] = max(global_scores.get(gidx, -1e9), score)
 
         for _, entries in bucket.items():
             entries.sort(key=lambda x: x[0], reverse=True)
