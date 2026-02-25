@@ -158,8 +158,11 @@ class Aggregator(nn.Module):
         self.geo_anchor_voxel_budget = 4096
         self.geo_anchor_read_quota = 2048
         self.geo_local_budget_ratio = 0.35
+        self.geo_local_budget_cap_per_frame = 768
         self.geo_anchor_budget_ratio = 0.35
         self.geo_local_coverage_grid = 4
+        self.geo_frame0_patch_cap = 1536
+        self.geo_anchor_invisible_read_weight = 0.3
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -521,19 +524,52 @@ class Aggregator(nn.Module):
         frame_idx = meta["frame_idx"]
         is_special = meta["is_special"]
         local_idx = meta["local_patch_idx"]
+        is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
 
-        # Always keep special tokens and frame-0 anchors.
+        # Always keep special tokens.
         special_idx = torch.nonzero(is_special, as_tuple=False).flatten().tolist()
         selected.update(special_idx)
-        anchor_idx = torch.nonzero(frame_idx == 0, as_tuple=False).flatten().tolist()
-        selected.update(anchor_idx)
+
+        # Keep previously established anchor tokens (pinning within cached KV).
+        anchor_token_idx = torch.nonzero(is_anchor, as_tuple=False).flatten().tolist()
+        selected.update(anchor_token_idx)
+
+        # Frame0: keep special tokens always, patch tokens by a fixed cap.
+        frame0_mask = frame_idx == 0
+        frame0_special_idx = torch.nonzero(frame0_mask & is_special, as_tuple=False).flatten().tolist()
+        selected.update(frame0_special_idx)
+
+        frame0_patch_idx = torch.nonzero(frame0_mask & (~is_special) & (local_idx >= 0), as_tuple=False).flatten()
+        if frame0_patch_idx.numel() > 0:
+            frame0_local = local_idx[frame0_patch_idx].long()
+            # try conf-guided selection if metadata for frame0 exists
+            frame0_meta = self.geo_frame_meta.get(0)
+            if frame0_meta is not None and frame0_meta["conf"].numel() > 0:
+                in_range = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
+                frame0_patch_idx = frame0_patch_idx[in_range]
+                frame0_local = frame0_local[in_range]
+                if frame0_patch_idx.numel() > 0:
+                    conf0 = frame0_meta["conf"].index_select(0, frame0_local).to(torch.float32)
+                    k0 = min(int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
+                    top_idx = torch.topk(conf0, k=k0, largest=True).indices
+                    selected.update(frame0_patch_idx.index_select(0, top_idx).tolist())
+            else:
+                k0 = min(int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
+                selected.update(frame0_patch_idx[:k0].tolist())
 
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         recent_min = max(0, current_frame_idx - int(recent_frames))
         recent_mask = frame_idx >= recent_min
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
-        local_budget = int(max_past_tokens * self.geo_local_budget_ratio) if max_past_tokens is not None else 0
+        if max_past_tokens is not None:
+            recent_frames_count = max(1, int(torch.unique(frame_idx[recent_mask]).numel()))
+            local_budget = min(
+                int(max_past_tokens * self.geo_local_budget_ratio),
+                int(self.geo_local_budget_cap_per_frame) * recent_frames_count,
+            )
+        else:
+            local_budget = 0
         local_selected: List[int] = []
         recent_special_idx = torch.nonzero(recent_mask & is_special, as_tuple=False).flatten().tolist()
         selected.update(recent_special_idx)
@@ -663,7 +699,14 @@ class Aggregator(nn.Module):
                 stability = 1.0 / (1.0 + bank_var)
                 support_gain = torch.log1p(torch.tensor(bank_support)).item()
                 base_score = max(float(conf[j].item()), 1e-6) * max(bank_conf, 1e-6) * support_gain * stability
-                vis_weight = 1.0 if bool(visible[j].item()) else self.geo_invisible_read_weight
+                if bool(visible[j].item()):
+                    vis_weight = 1.0
+                else:
+                    vis_weight = (
+                        self.geo_anchor_invisible_read_weight
+                        if key in self.geo_anchor_voxels
+                        else self.geo_invisible_read_weight
+                    )
                 score = base_score * vis_weight
 
                 # bucket threshold is adaptive to avoid empty/overcrowded bucket.
