@@ -163,6 +163,9 @@ class Aggregator(nn.Module):
         self.geo_local_coverage_grid = 4
         self.geo_frame0_patch_cap = 1536
         self.geo_anchor_invisible_read_weight = 0.3
+        # Speed guards for long sequences (keep compute bounded, reduce OOM risk).
+        self.geo_max_old_frames_to_score = 64
+        self.geo_max_candidate_tokens = 50000
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -653,6 +656,20 @@ class Aggregator(nn.Module):
         candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
         if candidate_indices.numel() == 0:
             return torch.tensor(sorted(selected), dtype=torch.long)
+
+        # Acceleration guard 1: restrict scoring to recent old frames only.
+        if self.geo_max_old_frames_to_score > 0:
+            uniq = torch.unique(frame_idx[candidate_indices])
+            if uniq.numel() > self.geo_max_old_frames_to_score:
+                keep_frames = uniq.sort().values[-self.geo_max_old_frames_to_score :]
+                keep_mask = (frame_idx[candidate_indices].unsqueeze(1) == keep_frames.unsqueeze(0)).any(dim=1)
+                candidate_indices = candidate_indices[keep_mask]
+
+        # Acceleration guard 2: cap candidate token count per layer.
+        if self.geo_max_candidate_tokens > 0 and candidate_indices.numel() > self.geo_max_candidate_tokens:
+            cf = frame_idx[candidate_indices]
+            order = torch.argsort(cf)
+            candidate_indices = candidate_indices.index_select(0, order)[-self.geo_max_candidate_tokens :]
 
         # Global per-voxel top-k across all old frames (avoid per-frame duplicates)
         bucket: Dict[Tuple[int, int, int], List[Tuple[float, int]]] = defaultdict(list)
