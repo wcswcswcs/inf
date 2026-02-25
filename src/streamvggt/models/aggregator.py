@@ -164,8 +164,10 @@ class Aggregator(nn.Module):
         self.geo_frame0_patch_cap = 1536
         self.geo_anchor_invisible_read_weight = 0.3
         # Speed guards for long sequences (keep compute bounded, reduce OOM risk).
-        self.geo_max_old_frames_to_score = 64
-        self.geo_max_candidate_tokens = 50000
+        self.geo_max_old_frames_to_score = 24
+        self.geo_max_candidate_tokens = 15000
+        self.geo_selection_interval = 2
+        self.geo_anchor_refresh_interval = 2
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -372,7 +374,8 @@ class Aggregator(nn.Module):
             keep_keys = set(k for _, k in items[: self.geo_max_voxels])
             self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
 
-        self._refresh_geo_anchor_voxels(frame_idx)
+        if frame_idx % self.geo_anchor_refresh_interval == 0:
+            self._refresh_geo_anchor_voxels(frame_idx)
 
     @staticmethod
     def _frustum_mask(
@@ -574,6 +577,13 @@ class Aggregator(nn.Module):
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         recent_min = max(0, current_frame_idx - int(recent_frames))
         recent_mask = frame_idx >= recent_min
+
+        # Fast-path: on non-refresh steps, keep protected tokens only.
+        if self.geo_selection_interval > 1 and (current_frame_idx % self.geo_selection_interval != 0):
+            recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
+            selected.update(recent_idx)
+            keep_fast = torch.tensor(sorted(selected), dtype=torch.long)
+            return keep_fast
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
         if max_past_tokens is not None:
