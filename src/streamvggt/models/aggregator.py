@@ -487,6 +487,17 @@ class Aggregator(nn.Module):
         final_keep = torch.unique(final_keep, sorted=True)
         return final_keep
 
+    @staticmethod
+    def _sanitize_keep_idx(keep_idx: torch.Tensor, meta_len: int, kv_len: int) -> torch.Tensor:
+        if keep_idx is None or keep_idx.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        upper = min(int(meta_len), int(kv_len))
+        if upper <= 0:
+            return torch.empty(0, dtype=torch.long)
+        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+        keep = keep[(keep >= 0) & (keep < upper)]
+        return keep
+
     def _build_current_frame_meta(self, frame_idx: int, tokens_per_frame: int) -> Dict[str, torch.Tensor]:
         special = self.patch_start_idx
         patch_tokens = max(tokens_per_frame - special, 0)
@@ -904,6 +915,12 @@ class Aggregator(nn.Module):
                                 max_past_tokens=max(0, layer_budget - P),
                             )
                             if keep_idx is not None and keep_idx.numel() > 0:
+                                keep_idx = self._sanitize_keep_idx(
+                                    keep_idx,
+                                    meta_len=past_meta["frame_idx"].numel(),
+                                    kv_len=past_kv_block[0].shape[2],
+                                )
+                            if keep_idx is not None and keep_idx.numel() > 0:
                                 keep_idx_dev = keep_idx.to(past_kv_block[0].device)
                                 past_kv_block = (
                                     torch.index_select(past_kv_block[0], 2, keep_idx_dev),
@@ -919,6 +936,11 @@ class Aggregator(nn.Module):
                                 pre_keep_all,
                                 budget=max_past_tokens,
                                 recent_frames=geo_recent_frames,
+                            )
+                            pre_keep = self._sanitize_keep_idx(
+                                pre_keep,
+                                meta_len=past_meta["frame_idx"].numel(),
+                                kv_len=past_kv_block[0].shape[2],
                             )
                             pre_keep_dev = pre_keep.to(past_kv_block[0].device)
                             past_kv_block = (
@@ -948,6 +970,11 @@ class Aggregator(nn.Module):
                                     cap_all,
                                     budget=layer_budget,
                                     recent_frames=geo_recent_frames,
+                                )
+                                cap_keep = self._sanitize_keep_idx(
+                                    cap_keep,
+                                    meta_len=merged_meta["frame_idx"].numel(),
+                                    kv_len=new_kv[0].shape[2],
                                 )
                                 cap_keep_dev = cap_keep.to(new_kv[0].device)
                                 new_kv = (
