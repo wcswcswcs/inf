@@ -67,6 +67,29 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        geo_conf_ema_alpha: float = 0.9,
+        geo_var_ema_alpha: float = 0.9,
+        geo_invisible_read_weight: float = 0.2,
+        geo_bucket_quantile_target: float = 0.6,
+        geo_bucket_quantile_min: float = 0.3,
+        geo_bucket_quantile_max: float = 0.9,
+        geo_anchor_conf_enter: float = 1.25,
+        geo_anchor_conf_exit: float = 1.05,
+        geo_anchor_min_support: float = 2.0,
+        geo_anchor_max_pos_var: float = 0.05,
+        geo_max_voxels: int = 200000,
+        geo_anchor_voxel_budget: int = 4096,
+        geo_anchor_read_quota: int = 2048,
+        geo_local_budget_ratio: float = 0.75,
+        geo_local_budget_cap_per_frame: int = 1369,
+        geo_anchor_budget_ratio: float = 0.35,
+        geo_local_coverage_grid: int = 4,
+        geo_frame0_patch_cap: int = 1000000,
+        geo_anchor_invisible_read_weight: float = 0.5,
+        geo_max_old_frames_to_score: int = 24,
+        geo_max_candidate_tokens: int = 15000,
+        geo_selection_interval: int = 1,
+        geo_anchor_refresh_interval: int = 1,
     ):
         super().__init__()
 
@@ -144,34 +167,29 @@ class Aggregator(nn.Module):
                 persistent=False,
             )
         self.last_scores = torch.zeros(self.depth)
-        self.geo_conf_ema_alpha = 0.9
-        self.geo_var_ema_alpha = 0.9
-        # Use softer visibility penalties to reduce pruning mistakes caused by pose lag/noise.
-        self.geo_invisible_read_weight = 0.2
-        self.geo_bucket_quantile_target = 0.6
-        self.geo_bucket_quantile_min = 0.3
-        self.geo_bucket_quantile_max = 0.9
-        self.geo_anchor_conf_enter = 1.25
-        self.geo_anchor_conf_exit = 1.05
-        self.geo_anchor_min_support = 2.0
-        self.geo_anchor_max_pos_var = 0.05
-        self.geo_max_voxels = 200000
-        self.geo_anchor_voxel_budget = 4096
-        self.geo_anchor_read_quota = 2048
-        # Keep stronger short-term constraints from recent frames.
-        self.geo_local_budget_ratio = 0.75
-        self.geo_local_budget_cap_per_frame = 1369
-        self.geo_anchor_budget_ratio = 0.35
-        self.geo_local_coverage_grid = 4
-        # Keep frame0 patches effectively untrimmed by default (upstream-style anchor safety).
-        self.geo_frame0_patch_cap = 1000000
-        self.geo_anchor_invisible_read_weight = 0.5
-        # Speed guards for long sequences (keep compute bounded, reduce OOM risk).
-        self.geo_max_old_frames_to_score = 24
-        self.geo_max_candidate_tokens = 15000
-        # Use full-precision geo selection every frame to avoid oscillation/drift from skip-steps.
-        self.geo_selection_interval = 1
-        self.geo_anchor_refresh_interval = 1
+        self.geo_conf_ema_alpha = geo_conf_ema_alpha
+        self.geo_var_ema_alpha = geo_var_ema_alpha
+        self.geo_invisible_read_weight = geo_invisible_read_weight
+        self.geo_bucket_quantile_target = geo_bucket_quantile_target
+        self.geo_bucket_quantile_min = geo_bucket_quantile_min
+        self.geo_bucket_quantile_max = geo_bucket_quantile_max
+        self.geo_anchor_conf_enter = geo_anchor_conf_enter
+        self.geo_anchor_conf_exit = geo_anchor_conf_exit
+        self.geo_anchor_min_support = geo_anchor_min_support
+        self.geo_anchor_max_pos_var = geo_anchor_max_pos_var
+        self.geo_max_voxels = geo_max_voxels
+        self.geo_anchor_voxel_budget = geo_anchor_voxel_budget
+        self.geo_anchor_read_quota = geo_anchor_read_quota
+        self.geo_local_budget_ratio = geo_local_budget_ratio
+        self.geo_local_budget_cap_per_frame = geo_local_budget_cap_per_frame
+        self.geo_anchor_budget_ratio = geo_anchor_budget_ratio
+        self.geo_local_coverage_grid = geo_local_coverage_grid
+        self.geo_frame0_patch_cap = geo_frame0_patch_cap
+        self.geo_anchor_invisible_read_weight = geo_anchor_invisible_read_weight
+        self.geo_max_old_frames_to_score = geo_max_old_frames_to_score
+        self.geo_max_candidate_tokens = geo_max_candidate_tokens
+        self.geo_selection_interval = geo_selection_interval
+        self.geo_anchor_refresh_interval = geo_anchor_refresh_interval
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
