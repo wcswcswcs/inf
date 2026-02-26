@@ -59,6 +59,9 @@ def run_inference(args: argparse.Namespace):
         p for p in glob.glob(os.path.join(args.input_dir, "*"))
         if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
     )
+
+    if args.max_views >= 0:
+        image_names = image_names[: args.max_views]
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
@@ -254,6 +257,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Log CUDA memory diagnostics every N frames when enabled.",
+    )
+    parser.add_argument(
+        "--max_views",
+        type=int,
+        default=-1,
+        help="Maximum number of views to infer. -1 means use all views.",
     )
     
     args = parser.parse_args()
