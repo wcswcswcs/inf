@@ -65,25 +65,30 @@ EXP_NAMES=(
   "E7_bucket_strict"
 )
 
-EXP_ARGS=(
-  ""
-  "--geo_invisible_read_weight 1.0 --geo_anchor_invisible_read_weight 1.0"
-  "--geo_local_budget_ratio 1.0 --geo_local_budget_cap_per_frame 2000"
-  "--geo_local_budget_ratio 0.25 --geo_local_budget_cap_per_frame 400"
-  "--geo_frame0_patch_cap 512"
-  "--geo_anchor_read_quota 0"
-  "--geo_bucket_quantile_target 0.35"
-  "--geo_bucket_quantile_target 0.8"
-)
-
 run_job() {
   local gpu="$1"
   local scene_path="$2"
   local scene_name="$3"
   local exp_name="$4"
-  local exp_args="$5"
 
   local scene_id input_dir out_path log_path prefix
+  local exp_args=()
+
+  case "$exp_name" in
+    E0_baseline) exp_args=() ;;
+    E1_no_vis_penalty) exp_args=(--geo_invisible_read_weight 1.0 --geo_anchor_invisible_read_weight 1.0) ;;
+    E2_strong_recent) exp_args=(--geo_local_budget_ratio 1.0 --geo_local_budget_cap_per_frame 2000) ;;
+    E3_weak_recent) exp_args=(--geo_local_budget_ratio 0.25 --geo_local_budget_cap_per_frame 400) ;;
+    E4_weak_frame0) exp_args=(--geo_frame0_patch_cap 512) ;;
+    E5_disable_anchor_read) exp_args=(--geo_anchor_read_quota 0) ;;
+    E6_bucket_loose) exp_args=(--geo_bucket_quantile_target 0.35) ;;
+    E7_bucket_strict) exp_args=(--geo_bucket_quantile_target 0.8) ;;
+    *)
+      echo "[GPU${gpu}|${scene_name}|${exp_name}] ERROR: unknown experiment"
+      return 3
+      ;;
+  esac
+
   scene_id="$(sanitize_name "$scene_name")"
   input_dir="${scene_path%/}/images/scan_images"
   out_path="${OUT_DIR}/${scene_id}_${exp_name}.pth"
@@ -104,7 +109,7 @@ run_job() {
   log_line "$prefix" "$log_path" "Time: $(date)"
   log_line "$prefix" "$log_path" "Input: $input_dir"
   log_line "$prefix" "$log_path" "Output: $out_path"
-  log_line "$prefix" "$log_path" "Args: ${exp_args}"
+  log_line "$prefix" "$log_path" "Args: ${exp_args[*]}"
 
   PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$gpu" python -u run_inference.py \
     --input_dir "$input_dir" \
@@ -112,7 +117,7 @@ run_job() {
     --output_path "$out_path" \
     --max_views "$MAX_VIEWS" \
     "${BASE_GEO_ARGS[@]}" \
-    ${exp_args} 2>&1 \
+    "${exp_args[@]}" 2>&1 \
   | while IFS= read -r line; do
       printf '%s%s\n' "$prefix" "$line"
     done \
@@ -137,7 +142,7 @@ if [[ ${#SCENE_DIRS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-declare -a JOB_SCENE_PATH JOB_SCENE_NAME JOB_EXP_NAME JOB_EXP_ARGS
+declare -a JOB_SCENE_PATH JOB_SCENE_NAME JOB_EXP_NAME
 for scene_path in "${SCENE_DIRS[@]}"; do
   [[ -d "$scene_path" ]] || continue
   scene_name="$(basename "${scene_path%/}")"
@@ -146,7 +151,6 @@ for scene_path in "${SCENE_DIRS[@]}"; do
     JOB_SCENE_PATH+=("$scene_path")
     JOB_SCENE_NAME+=("$scene_name")
     JOB_EXP_NAME+=("${EXP_NAMES[idx]}")
-    JOB_EXP_ARGS+=("${EXP_ARGS[idx]}")
   done
 done
 
@@ -217,9 +221,7 @@ while true; do
       s_path="${JOB_SCENE_PATH[job_idx]}"
       s_name="${JOB_SCENE_NAME[job_idx]}"
       e_name="${JOB_EXP_NAME[job_idx]}"
-      e_args="${JOB_EXP_ARGS[job_idx]}"
-
-      run_job "$gpu" "$s_path" "$s_name" "$e_name" "$e_args" &
+      run_job "$gpu" "$s_path" "$s_name" "$e_name" &
       GPU_PID[i]=$!
       GPU_JOBIDX[i]="$job_idx"
       echo "[SCHED] start idx=$job_idx gpu=$gpu scene=$s_name exp=$e_name pid=${GPU_PID[i]}"
