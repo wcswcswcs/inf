@@ -146,7 +146,8 @@ class Aggregator(nn.Module):
         self.last_scores = torch.zeros(self.depth)
         self.geo_conf_ema_alpha = 0.9
         self.geo_var_ema_alpha = 0.9
-        self.geo_invisible_read_weight = 0.05
+        # Use softer visibility penalties to reduce pruning mistakes caused by pose lag/noise.
+        self.geo_invisible_read_weight = 0.2
         self.geo_bucket_quantile_target = 0.6
         self.geo_bucket_quantile_min = 0.3
         self.geo_bucket_quantile_max = 0.9
@@ -157,17 +158,20 @@ class Aggregator(nn.Module):
         self.geo_max_voxels = 200000
         self.geo_anchor_voxel_budget = 4096
         self.geo_anchor_read_quota = 2048
-        self.geo_local_budget_ratio = 0.35
-        self.geo_local_budget_cap_per_frame = 768
+        # Keep stronger short-term constraints from recent frames.
+        self.geo_local_budget_ratio = 0.75
+        self.geo_local_budget_cap_per_frame = 1369
         self.geo_anchor_budget_ratio = 0.35
         self.geo_local_coverage_grid = 4
-        self.geo_frame0_patch_cap = 1536
-        self.geo_anchor_invisible_read_weight = 0.3
+        # Keep frame0 patches effectively untrimmed by default (upstream-style anchor safety).
+        self.geo_frame0_patch_cap = 1000000
+        self.geo_anchor_invisible_read_weight = 0.5
         # Speed guards for long sequences (keep compute bounded, reduce OOM risk).
         self.geo_max_old_frames_to_score = 24
         self.geo_max_candidate_tokens = 15000
-        self.geo_selection_interval = 2
-        self.geo_anchor_refresh_interval = 2
+        # Use full-precision geo selection every frame to avoid oscillation/drift from skip-steps.
+        self.geo_selection_interval = 1
+        self.geo_anchor_refresh_interval = 1
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -578,7 +582,7 @@ class Aggregator(nn.Module):
         recent_min = max(0, current_frame_idx - int(recent_frames))
         recent_mask = frame_idx >= recent_min
 
-        # Fast-path: on non-refresh steps, keep protected tokens only.
+        # Optional fast-path (disabled by default, can be enabled by setting geo_selection_interval>1).
         if self.geo_selection_interval > 1 and (current_frame_idx % self.geo_selection_interval != 0):
             recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
             selected.update(recent_idx)
