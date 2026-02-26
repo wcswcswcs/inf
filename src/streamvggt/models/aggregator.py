@@ -652,8 +652,16 @@ class Aggregator(nn.Module):
         if current_view is None or current_view.get("world_to_cam") is None or current_view.get("intrinsic") is None:
             return torch.tensor(sorted(selected), dtype=torch.long)
 
-        world_to_cam = current_view["world_to_cam"].detach().cpu()
-        intrinsic = current_view["intrinsic"].detach().cpu()
+        world_to_cam = current_view["world_to_cam"]
+        intrinsic = current_view["intrinsic"]
+        if isinstance(world_to_cam, torch.Tensor):
+            world_to_cam = world_to_cam.detach()
+            if world_to_cam.device.type != "cpu":
+                world_to_cam = world_to_cam.cpu()
+        if isinstance(intrinsic, torch.Tensor):
+            intrinsic = intrinsic.detach()
+            if intrinsic.device.type != "cpu":
+                intrinsic = intrinsic.cpu()
         if world_to_cam.ndim == 3:
             world_to_cam = world_to_cam[0]
         if intrinsic.ndim == 3:
