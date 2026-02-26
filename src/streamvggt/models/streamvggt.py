@@ -186,22 +186,27 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if use_geo_kv_prune and self.point_head is not None and self.camera_head is not None:
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(
-                        pose_enc.unsqueeze(1),
+                        pose_enc,
                         images.shape[-2:]
                     )
                     world_to_cam = torch.eye(4, device=extrinsic.device, dtype=extrinsic.dtype).unsqueeze(0).repeat(extrinsic.shape[0], 1, 1)
                     world_to_cam[:, :3, :4] = extrinsic[:, 0]
                     intrinsic_cur = intrinsic[:, 0] if intrinsic is not None else None
+
+                    # Keep pruning view metadata on CPU to avoid repeated per-layer GPU->CPU transfers.
+                    world_to_cam_cpu = world_to_cam.detach().cpu()
+                    intrinsic_cpu = intrinsic_cur.detach().cpu() if intrinsic_cur is not None else None
                     current_view = {
-                        "world_to_cam": world_to_cam.detach(),
-                        "intrinsic": intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        "world_to_cam": world_to_cam_cpu,
+                        "intrinsic": intrinsic_cpu,
+                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
                     }
                     self.aggregator.update_geo_frame_metadata(
                         frame_idx=i,
                         pts3d=pts3d.detach(),
                         conf=pts3d_conf.detach(),
-                        world_to_cam=world_to_cam.detach(),
-                        intrinsic=intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        world_to_cam=world_to_cam_cpu,
+                        intrinsic=intrinsic_cpu,
                         voxel_size=geo_voxel_size,
                     )
 
