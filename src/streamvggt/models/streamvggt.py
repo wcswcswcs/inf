@@ -18,10 +18,23 @@ class StreamVGGTOutput(ModelOutput):
     views: Optional[torch.Tensor] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, total_budget=1200000):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        total_budget=1200000,
+        aggregator_kwargs: Optional[dict] = None,
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        aggregator_kwargs = aggregator_kwargs or {}
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            **aggregator_kwargs,
+        )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
@@ -186,22 +199,27 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if use_geo_kv_prune and self.point_head is not None and self.camera_head is not None:
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(
-                        pose_enc.unsqueeze(1),
+                        pose_enc,
                         images.shape[-2:]
                     )
                     world_to_cam = torch.eye(4, device=extrinsic.device, dtype=extrinsic.dtype).unsqueeze(0).repeat(extrinsic.shape[0], 1, 1)
                     world_to_cam[:, :3, :4] = extrinsic[:, 0]
                     intrinsic_cur = intrinsic[:, 0] if intrinsic is not None else None
+
+                    # Keep pruning view metadata on CPU to avoid repeated per-layer GPU->CPU transfers.
+                    world_to_cam_cpu = world_to_cam.detach().cpu()
+                    intrinsic_cpu = intrinsic_cur.detach().cpu() if intrinsic_cur is not None else None
                     current_view = {
-                        "world_to_cam": world_to_cam.detach(),
-                        "intrinsic": intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        "world_to_cam": world_to_cam_cpu,
+                        "intrinsic": intrinsic_cpu,
+                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
                     }
                     self.aggregator.update_geo_frame_metadata(
                         frame_idx=i,
                         pts3d=pts3d.detach(),
                         conf=pts3d_conf.detach(),
-                        world_to_cam=world_to_cam.detach(),
-                        intrinsic=intrinsic_cur.detach() if intrinsic_cur is not None else None,
+                        world_to_cam=world_to_cam_cpu,
+                        intrinsic=intrinsic_cpu,
                         voxel_size=geo_voxel_size,
                     )
 
