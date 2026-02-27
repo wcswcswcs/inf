@@ -948,6 +948,29 @@ class Aggregator(nn.Module):
         current_budgets = self._calculate_dynamic_budgets(total_budget)
         scores = []
 
+        # In geo mode, build one shared keep plan per frame instead of re-running
+        # expensive Python/CPU geo selection for every global layer.
+        geo_shared_keep_idx: Optional[torch.Tensor] = None
+        if use_cache and use_geo_kv_prune and any(kv is not None for kv in past_key_values):
+            ref_layer_idx = None
+            for idx, kv in enumerate(past_key_values):
+                if kv is not None and self.geo_token_meta[idx]["frame_idx"].numel() > 0:
+                    ref_layer_idx = idx
+                    break
+
+            if ref_layer_idx is not None:
+                ref_meta = self.geo_token_meta[ref_layer_idx]
+                ref_budget = max(0, int(current_budgets.max().item()) - P)
+                geo_shared_keep_idx = self._select_geo_active_indices(
+                    meta=ref_meta,
+                    topk_per_voxel=geo_topk_per_voxel,
+                    recent_frames=geo_recent_frames,
+                    near=geo_near,
+                    far=geo_far,
+                    current_view=current_view,
+                    max_past_tokens=ref_budget,
+                )
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -962,15 +985,7 @@ class Aggregator(nn.Module):
                         past_meta = self.geo_token_meta[layer_idx]
 
                         if use_geo_kv_prune and past_kv_block is not None:
-                            keep_idx = self._select_geo_active_indices(
-                                meta=past_meta,
-                                topk_per_voxel=geo_topk_per_voxel,
-                                recent_frames=geo_recent_frames,
-                                near=geo_near,
-                                far=geo_far,
-                                current_view=current_view,
-                                max_past_tokens=max(0, layer_budget - P),
-                            )
+                            keep_idx = geo_shared_keep_idx
                             if keep_idx is not None and keep_idx.numel() > 0:
                                 keep_idx = self._sanitize_keep_idx(
                                     keep_idx,
