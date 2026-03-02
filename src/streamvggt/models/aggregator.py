@@ -196,10 +196,12 @@ class Aggregator(nn.Module):
 
     def reset_geo_cache_state(self):
         self.geo_frame_meta: Dict[int, Dict[str, Any]] = {}
+        self.geo_frame_anchor_mask: Dict[int, torch.Tensor] = {}
         self.geo_max_frame_idx = -1
         self.geo_voxel_bank: Dict[Tuple[int, int, int], Dict[str, float]] = {}
         self.geo_anchor_voxels: set[Tuple[int, int, int]] = set()
         self.geo_anchor_voxel_list: List[Tuple[int, int, int]] = []
+        self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
                 "frame_idx": torch.empty(0, dtype=torch.long),
@@ -225,6 +227,7 @@ class Aggregator(nn.Module):
         if not self.geo_voxel_bank:
             self.geo_anchor_voxels = set()
             self.geo_anchor_voxel_list = []
+            self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
             return
 
         prev_anchors = self.geo_anchor_voxels
@@ -243,6 +246,33 @@ class Aggregator(nn.Module):
         ranked.sort(key=lambda x: (-x[0], x[1]))
         self.geo_anchor_voxel_list = [k for _, k in ranked[: self.geo_anchor_voxel_budget]]
         self.geo_anchor_voxels = set(self.geo_anchor_voxel_list)
+        if self.geo_anchor_voxel_list:
+            vox = torch.tensor(self.geo_anchor_voxel_list, dtype=torch.long)
+            self.geo_anchor_hash_tensor = self._voxel_hash(vox)
+        else:
+            self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
+
+    @staticmethod
+    def _voxel_hash(voxel_ids: torch.Tensor) -> torch.Tensor:
+        if voxel_ids.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+        v = voxel_ids.to(torch.long)
+        return (v[:, 0] * 73856093) ^ (v[:, 1] * 19349663) ^ (v[:, 2] * 83492791)
+
+    def _update_frame_anchor_mask(self, frame_idx: int):
+        frame_meta = self.geo_frame_meta.get(int(frame_idx))
+        if frame_meta is None:
+            return
+        vox = frame_meta.get("voxel_ids")
+        if vox is None or vox.numel() == 0 or self.geo_anchor_hash_tensor.numel() == 0:
+            self.geo_frame_anchor_mask[int(frame_idx)] = torch.zeros((0 if vox is None else vox.shape[0],), dtype=torch.bool)
+            return
+        hashes = self._voxel_hash(vox)
+        self.geo_frame_anchor_mask[int(frame_idx)] = torch.isin(hashes, self.geo_anchor_hash_tensor)
+
+    def _refresh_all_frame_anchor_masks(self):
+        for fidx in self.geo_frame_meta.keys():
+            self._update_frame_anchor_mask(int(fidx))
 
     def _compute_dynamic_bucket_threshold(
         self,
@@ -280,25 +310,20 @@ class Aggregator(nn.Module):
 
         for fidx in torch.unique(frame_idx[valid]).tolist():
             fidx = int(fidx)
-            frame_meta = self.geo_frame_meta.get(fidx)
-            if frame_meta is None:
+            frame_anchor_mask = self.geo_frame_anchor_mask.get(fidx)
+            if frame_anchor_mask is None or frame_anchor_mask.numel() == 0:
                 continue
 
             mask_f = valid & (frame_idx == fidx)
             idx_global = torch.nonzero(mask_f, as_tuple=False).flatten()
             local_f = local_idx.index_select(0, idx_global).long()
-            in_range = (local_f >= 0) & (local_f < frame_meta["voxel_ids"].shape[0])
+            in_range = (local_f >= 0) & (local_f < frame_anchor_mask.shape[0])
             if in_range.sum().item() == 0:
                 continue
 
             idx_global = idx_global[in_range]
             local_f = local_f[in_range]
-            vox = frame_meta["voxel_ids"].index_select(0, local_f)
-
-            anchor_mask = torch.tensor(
-                [tuple(int(v) for v in row.tolist()) in self.geo_anchor_voxels for row in vox],
-                dtype=torch.bool,
-            )
+            anchor_mask = frame_anchor_mask.index_select(0, local_f)
             if anchor_mask.numel() > 0:
                 out.index_put_((idx_global,), anchor_mask)
 
@@ -338,6 +363,7 @@ class Aggregator(nn.Module):
             "intrinsic": intrinsic.detach().cpu() if intrinsic is not None else None,
         }
         self.geo_frame_meta[frame_idx] = meta
+        self.geo_frame_anchor_mask[frame_idx] = torch.zeros((voxel_ids.shape[0],), dtype=torch.bool)
         self.geo_max_frame_idx = max(self.geo_max_frame_idx, frame_idx)
 
         # Update global voxel landmark bank (conf/support/stability/recency)
@@ -402,6 +428,9 @@ class Aggregator(nn.Module):
 
         if frame_idx % self.geo_anchor_refresh_interval == 0:
             self._refresh_geo_anchor_voxels(frame_idx)
+            self._refresh_all_frame_anchor_masks()
+        else:
+            self._update_frame_anchor_mask(frame_idx)
 
     @staticmethod
     def _frustum_mask(
@@ -533,17 +562,13 @@ class Aggregator(nn.Module):
         protected = special_keep | anchor_keep | (frame_keep == 0) | (frame_keep >= recent_min)
         prot_idx = keep[protected]
         if prot_idx.numel() >= budget:
-            # Keep the most recent protected tokens under strict hard budget.
-            prot_frame = frame_idx_all.index_select(0, prot_idx)
-            order = torch.argsort(prot_frame, descending=True)
-            return torch.unique(prot_idx.index_select(0, order[:budget]), sorted=True)
+            # O(n) truncation from tail: keep most recent protected tokens without full sort.
+            return torch.unique(prot_idx[-budget:], sorted=True)
 
         remain = budget - int(prot_idx.numel())
         non_prot_idx = keep[~protected]
         if non_prot_idx.numel() > remain:
-            non_prot_frame = frame_idx_all.index_select(0, non_prot_idx)
-            order = torch.argsort(non_prot_frame, descending=True)
-            non_prot_idx = non_prot_idx.index_select(0, order[:remain])
+            non_prot_idx = non_prot_idx[-remain:]
 
         out = torch.cat([prot_idx, non_prot_idx], dim=0)
         return torch.unique(out, sorted=True)
