@@ -599,6 +599,33 @@ class Aggregator(nn.Module):
             out.append(key)
         return out
 
+    def _cap_identity_keep_with_protection(
+        self,
+        meta: Dict[str, torch.Tensor],
+        identity_keep: List[Tuple[int, int]],
+        budget: int,
+        recent_frames: int,
+    ) -> List[Tuple[int, int]]:
+        """
+        Apply strict hard-cap in identity space, then keep original identity order.
+
+        This keeps the shared keep-plan semantic in identity space instead of
+        implicitly relying on per-layer positional index alignment.
+        """
+        if budget <= 0 or not identity_keep:
+            return []
+
+        idx = self._identity_keep_to_index(meta, identity_keep)
+        if idx.numel() == 0:
+            return []
+
+        idx = self._cap_keep_with_protection(meta, idx, budget=budget, recent_frames=recent_frames)
+        if idx.numel() == 0:
+            return []
+
+        capped_identities = set(self._build_identity_keep_from_meta(meta, idx))
+        return [key for key in identity_keep if key in capped_identities]
+
     @staticmethod
     def _identity_keep_to_index(meta: Dict[str, torch.Tensor], identity_keep: List[Tuple[int, int]]) -> torch.Tensor:
         if not identity_keep:
@@ -675,6 +702,13 @@ class Aggregator(nn.Module):
             recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
             selected.update(recent_idx)
             keep_fast = torch.tensor(sorted(selected), dtype=torch.long)
+            if max_past_tokens is not None:
+                keep_fast = self._cap_keep_with_protection(
+                    meta,
+                    keep_fast,
+                    budget=max(0, int(max_past_tokens)),
+                    recent_frames=recent_frames,
+                )
             return keep_fast
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
@@ -1020,7 +1054,6 @@ class Aggregator(nn.Module):
 
         # In geo mode, build one shared keep plan per frame instead of re-running
         # expensive Python/CPU geo selection for every global layer.
-        geo_shared_keep_idx: Optional[torch.Tensor] = None
         geo_shared_identity_keep: Optional[List[Tuple[int, int]]] = None
         if use_cache and use_geo_kv_prune and any(kv is not None for kv in past_key_values):
             ref_layer_idx = None
@@ -1057,7 +1090,14 @@ class Aggregator(nn.Module):
                         past_meta = self.geo_token_meta[layer_idx]
 
                         if use_geo_kv_prune and past_kv_block is not None:
-                            keep_idx = self._identity_keep_to_index(past_meta, geo_shared_identity_keep or [])
+                            layer_identity_keep = self._cap_identity_keep_with_protection(
+                                past_meta,
+                                geo_shared_identity_keep or [],
+                                budget=max(0, layer_budget - P),
+                                recent_frames=geo_recent_frames,
+                            )
+
+                            keep_idx = self._identity_keep_to_index(past_meta, layer_identity_keep)
                             if keep_idx is not None and keep_idx.numel() > 0:
                                 keep_idx = self._sanitize_keep_idx(
                                     keep_idx,
