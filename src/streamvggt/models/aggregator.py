@@ -67,6 +67,29 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        geo_conf_ema_alpha: float = 0.9,
+        geo_var_ema_alpha: float = 0.9,
+        geo_invisible_read_weight: float = 0.2,
+        geo_bucket_quantile_target: float = 0.6,
+        geo_bucket_quantile_min: float = 0.3,
+        geo_bucket_quantile_max: float = 0.9,
+        geo_anchor_conf_enter: float = 1.25,
+        geo_anchor_conf_exit: float = 1.05,
+        geo_anchor_min_support: float = 2.0,
+        geo_anchor_max_pos_var: float = 0.05,
+        geo_max_voxels: int = 200000,
+        geo_anchor_voxel_budget: int = 4096,
+        geo_anchor_read_quota: int = 2048,
+        geo_local_budget_ratio: float = 0.75,
+        geo_local_budget_cap_per_frame: int = 1369,
+        geo_anchor_budget_ratio: float = 0.35,
+        geo_local_coverage_grid: int = 4,
+        geo_frame0_patch_cap: int = 1000000,
+        geo_anchor_invisible_read_weight: float = 0.5,
+        geo_max_old_frames_to_score: int = 24,
+        geo_max_candidate_tokens: int = 15000,
+        geo_selection_interval: int = 1,
+        geo_anchor_refresh_interval: int = 1,
     ):
         super().__init__()
 
@@ -144,19 +167,139 @@ class Aggregator(nn.Module):
                 persistent=False,
             )
         self.last_scores = torch.zeros(self.depth)
+        self.geo_conf_ema_alpha = geo_conf_ema_alpha
+        self.geo_var_ema_alpha = geo_var_ema_alpha
+        self.geo_invisible_read_weight = geo_invisible_read_weight
+        self.geo_bucket_quantile_target = geo_bucket_quantile_target
+        self.geo_bucket_quantile_min = geo_bucket_quantile_min
+        self.geo_bucket_quantile_max = geo_bucket_quantile_max
+        self.geo_anchor_conf_enter = geo_anchor_conf_enter
+        self.geo_anchor_conf_exit = geo_anchor_conf_exit
+        self.geo_anchor_min_support = geo_anchor_min_support
+        self.geo_anchor_max_pos_var = geo_anchor_max_pos_var
+        self.geo_max_voxels = geo_max_voxels
+        self.geo_anchor_voxel_budget = geo_anchor_voxel_budget
+        self.geo_anchor_read_quota = geo_anchor_read_quota
+        self.geo_local_budget_ratio = geo_local_budget_ratio
+        self.geo_local_budget_cap_per_frame = geo_local_budget_cap_per_frame
+        self.geo_anchor_budget_ratio = geo_anchor_budget_ratio
+        self.geo_local_coverage_grid = geo_local_coverage_grid
+        self.geo_frame0_patch_cap = geo_frame0_patch_cap
+        self.geo_anchor_invisible_read_weight = geo_anchor_invisible_read_weight
+        self.geo_max_old_frames_to_score = geo_max_old_frames_to_score
+        self.geo_max_candidate_tokens = geo_max_candidate_tokens
+        self.geo_selection_interval = geo_selection_interval
+        self.geo_anchor_refresh_interval = geo_anchor_refresh_interval
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
         self.geo_frame_meta: Dict[int, Dict[str, Any]] = {}
         self.geo_max_frame_idx = -1
+        self.geo_voxel_bank: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+        self.geo_anchor_voxels: set[Tuple[int, int, int]] = set()
+        self.geo_anchor_voxel_list: List[Tuple[int, int, int]] = []
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
                 "frame_idx": torch.empty(0, dtype=torch.long),
                 "is_special": torch.empty(0, dtype=torch.bool),
                 "local_patch_idx": torch.empty(0, dtype=torch.long),
+                "identity_local": torch.empty(0, dtype=torch.long),
+                "is_anchor": torch.empty(0, dtype=torch.bool),
             }
             for i in range(self.depth)
         }
+
+    def _voxel_importance(self, item: Dict[str, float], now_frame_idx: int) -> float:
+        age = max(0.0, float(now_frame_idx) - float(item["last_seen"]))
+        return (
+            float(item["conf_ema"])
+            * torch.log1p(torch.tensor(float(item["support"]))).item()
+            * (1.0 / (1.0 + float(item["pos_var"])))
+            * (1.0 / (1.0 + 0.05 * age))
+        )
+
+    def _refresh_geo_anchor_voxels(self, now_frame_idx: int):
+        if not self.geo_voxel_bank:
+            self.geo_anchor_voxels = set()
+            self.geo_anchor_voxel_list = []
+            return
+
+        prev_anchors = self.geo_anchor_voxels
+        ranked = []
+        for key, item in self.geo_voxel_bank.items():
+            conf_ema = float(item["conf_ema"])
+            support = float(item["support"])
+            pos_var = float(item["pos_var"])
+            in_prev = key in prev_anchors
+            conf_ok = conf_ema >= (self.geo_anchor_conf_exit if in_prev else self.geo_anchor_conf_enter)
+            support_ok = support >= self.geo_anchor_min_support
+            var_ok = pos_var <= self.geo_anchor_max_pos_var
+            if conf_ok and support_ok and var_ok:
+                ranked.append((self._voxel_importance(item, now_frame_idx), key))
+
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        self.geo_anchor_voxel_list = [k for _, k in ranked[: self.geo_anchor_voxel_budget]]
+        self.geo_anchor_voxels = set(self.geo_anchor_voxel_list)
+
+    def _compute_dynamic_bucket_threshold(
+        self,
+        values: List[float],
+        target_count: int,
+    ) -> float:
+        if not values:
+            return float("inf")
+        vals = torch.tensor(values, dtype=torch.float32)
+        q_target = float(self.geo_bucket_quantile_target)
+        q_target = min(max(q_target, self.geo_bucket_quantile_min), self.geo_bucket_quantile_max)
+
+        if target_count > 0:
+            n = vals.numel()
+            ratio = max(0.0, min(1.0, float(target_count) / max(1.0, float(n))))
+            q_target = 1.0 - ratio
+            q_target = min(max(q_target, self.geo_bucket_quantile_min), self.geo_bucket_quantile_max)
+
+        return float(torch.quantile(vals, q_target).item())
+
+    def _derive_anchor_mask_from_meta(self, meta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        n = int(meta["frame_idx"].numel())
+        if n == 0:
+            return torch.empty(0, dtype=torch.bool)
+
+        out = torch.zeros((n,), dtype=torch.bool)
+        if not self.geo_anchor_voxels:
+            return out
+
+        frame_idx = meta["frame_idx"]
+        local_idx = meta["local_patch_idx"]
+        valid = local_idx >= 0
+        if valid.sum().item() == 0:
+            return out
+
+        for fidx in torch.unique(frame_idx[valid]).tolist():
+            fidx = int(fidx)
+            frame_meta = self.geo_frame_meta.get(fidx)
+            if frame_meta is None:
+                continue
+
+            mask_f = valid & (frame_idx == fidx)
+            idx_global = torch.nonzero(mask_f, as_tuple=False).flatten()
+            local_f = local_idx.index_select(0, idx_global).long()
+            in_range = (local_f >= 0) & (local_f < frame_meta["voxel_ids"].shape[0])
+            if in_range.sum().item() == 0:
+                continue
+
+            idx_global = idx_global[in_range]
+            local_f = local_f[in_range]
+            vox = frame_meta["voxel_ids"].index_select(0, local_f)
+
+            anchor_mask = torch.tensor(
+                [tuple(int(v) for v in row.tolist()) in self.geo_anchor_voxels for row in vox],
+                dtype=torch.bool,
+            )
+            if anchor_mask.numel() > 0:
+                out.index_put_((idx_global,), anchor_mask)
+
+        return out
 
     def update_geo_frame_metadata(
         self,
@@ -183,7 +326,7 @@ class Aggregator(nn.Module):
         pts_flat = pts_patch.reshape(-1, 3).detach().cpu()
         conf_flat = conf_patch.reshape(-1).detach().cpu()
 
-        voxel_ids = torch.round(pts_flat / max(voxel_size, 1e-6)).to(torch.int32)
+        voxel_ids = torch.floor(pts_flat / max(voxel_size, 1e-6)).to(torch.int32)
         meta = {
             "pts": pts_flat,
             "conf": conf_flat,
@@ -194,8 +337,78 @@ class Aggregator(nn.Module):
         self.geo_frame_meta[frame_idx] = meta
         self.geo_max_frame_idx = max(self.geo_max_frame_idx, frame_idx)
 
+        # Update global voxel landmark bank (conf/support/stability/recency)
+        voxel_to_idx: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+        for i in range(voxel_ids.shape[0]):
+            key = tuple(int(v) for v in voxel_ids[i].tolist())
+            voxel_to_idx[key].append(i)
+
+        for key, idxs in voxel_to_idx.items():
+            pts_cur = pts_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
+            conf_cur = conf_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
+            conf_mean = float(conf_cur.mean().item())
+            pos_mean = pts_cur.mean(dim=0)
+
+            if key not in self.geo_voxel_bank:
+                self.geo_voxel_bank[key] = {
+                    "conf_ema": conf_mean,
+                    "support": 1.0,
+                    "last_seen": float(frame_idx),
+                    "pos_x": float(pos_mean[0].item()),
+                    "pos_y": float(pos_mean[1].item()),
+                    "pos_z": float(pos_mean[2].item()),
+                    "pos_var": 0.0,
+                }
+            else:
+                item = self.geo_voxel_bank[key]
+                prev_pos = torch.tensor([item["pos_x"], item["pos_y"], item["pos_z"]], dtype=pos_mean.dtype)
+                drift2 = float(((pos_mean - prev_pos) ** 2).mean().item())
+                item["conf_ema"] = (
+                    self.geo_conf_ema_alpha * item["conf_ema"]
+                    + (1.0 - self.geo_conf_ema_alpha) * conf_mean
+                )
+                item["support"] += 1.0
+                item["last_seen"] = float(frame_idx)
+                item["pos_x"] = float(
+                    self.geo_conf_ema_alpha * item["pos_x"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[0].item()
+                )
+                item["pos_y"] = float(
+                    self.geo_conf_ema_alpha * item["pos_y"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[1].item()
+                )
+                item["pos_z"] = float(
+                    self.geo_conf_ema_alpha * item["pos_z"]
+                    + (1.0 - self.geo_conf_ema_alpha) * pos_mean[2].item()
+                )
+                item["pos_var"] = (
+                    self.geo_var_ema_alpha * item["pos_var"]
+                    + (1.0 - self.geo_var_ema_alpha) * drift2
+                )
+
+        # Keep global bank bounded.
+        if len(self.geo_voxel_bank) > self.geo_max_voxels:
+            items = []
+            for key, val in self.geo_voxel_bank.items():
+                importance = self._voxel_importance(val, frame_idx)
+                items.append((importance, key))
+
+            items.sort(key=lambda x: x[0], reverse=True)
+            keep_keys = set(k for _, k in items[: self.geo_max_voxels])
+            self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
+
+        if frame_idx % self.geo_anchor_refresh_interval == 0:
+            self._refresh_geo_anchor_voxels(frame_idx)
+
     @staticmethod
-    def _frustum_mask(pts: torch.Tensor, world_to_cam: torch.Tensor, intrinsic: torch.Tensor, near: float, far: float):
+    def _frustum_mask(
+        pts: torch.Tensor,
+        world_to_cam: torch.Tensor,
+        intrinsic: torch.Tensor,
+        near: float,
+        far: float,
+        img_hw: Optional[Tuple[int, int]] = None,
+    ):
         if pts.numel() == 0:
             return torch.zeros((0,), dtype=torch.bool, device=pts.device)
 
@@ -207,15 +420,24 @@ class Aggregator(nn.Module):
         pts_h = torch.cat([pts, ones], dim=-1)
         cam_h = pts_h @ world_to_cam.t()   # [N, 4]
         cam = cam_h[:, :3]                 # [N, 3]
-        z = cam[:, 2]
-        valid_z = (z > near) & (z < far)
 
-        uv_h = cam @ intrinsic.t()         # [N, 3]
-        u = uv_h[:, 0] / (uv_h[:, 2].clamp_min(1e-6))
-        v = uv_h[:, 1] / (uv_h[:, 2].clamp_min(1e-6))
+        Xc, Yc, Zc = cam[:, 0], cam[:, 1], cam[:, 2]
+        valid_z = (Zc > near) & (Zc < far)
+
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
         cx, cy = intrinsic[0, 2], intrinsic[1, 2]
-        W = max((cx * 2.0).item(), 1.0)
-        H = max((cy * 2.0).item(), 1.0)
+        inv_z = Zc.clamp_min(1e-6).reciprocal()
+        u = fx * (Xc * inv_z) + cx
+        v = fy * (Yc * inv_z) + cy
+
+        if img_hw is not None:
+            H, W = img_hw
+            H = max(float(H), 1.0)
+            W = max(float(W), 1.0)
+        else:
+            W = max((cx * 2.0).item(), 1.0)
+            H = max((cy * 2.0).item(), 1.0)
+
         inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
         return valid_z & inside
 
@@ -226,6 +448,12 @@ class Aggregator(nn.Module):
             "frame_idx": meta["frame_idx"].index_select(0, keep_cpu),
             "is_special": meta["is_special"].index_select(0, keep_cpu),
             "local_patch_idx": meta["local_patch_idx"].index_select(0, keep_cpu),
+            "identity_local": meta["identity_local"].index_select(0, keep_cpu)
+            if "identity_local" in meta
+            else meta["local_patch_idx"].index_select(0, keep_cpu),
+            "is_anchor": meta["is_anchor"].index_select(0, keep_cpu)
+            if "is_anchor" in meta
+            else torch.zeros((keep_cpu.numel(),), dtype=torch.bool),
         }
 
     @staticmethod
@@ -234,7 +462,85 @@ class Aggregator(nn.Module):
             "frame_idx": torch.cat([meta_a["frame_idx"], meta_b["frame_idx"]], dim=0),
             "is_special": torch.cat([meta_a["is_special"], meta_b["is_special"]], dim=0),
             "local_patch_idx": torch.cat([meta_a["local_patch_idx"], meta_b["local_patch_idx"]], dim=0),
+            "identity_local": torch.cat(
+                [
+                    meta_a.get("identity_local", meta_a["local_patch_idx"]),
+                    meta_b.get("identity_local", meta_b["local_patch_idx"]),
+                ],
+                dim=0,
+            ),
+            "is_anchor": torch.cat(
+                [
+                    meta_a.get("is_anchor", torch.zeros_like(meta_a["is_special"])),
+                    meta_b.get("is_anchor", torch.zeros_like(meta_b["is_special"])),
+                ],
+                dim=0,
+            ),
         }
+
+    @staticmethod
+    def _protected_mask(meta: Dict[str, torch.Tensor], recent_frames: int) -> torch.Tensor:
+        frame_idx = meta["frame_idx"]
+        is_special = meta["is_special"]
+        is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
+        if frame_idx.numel() == 0:
+            return torch.empty(0, dtype=torch.bool)
+        current_frame_idx = int(frame_idx.max().item())
+        recent_min = max(0, current_frame_idx - int(recent_frames))
+        return is_special | is_anchor | (frame_idx == 0) | (frame_idx >= recent_min)
+
+    def _cap_keep_with_protection(
+        self,
+        meta: Dict[str, torch.Tensor],
+        keep_idx: torch.Tensor,
+        budget: int,
+        recent_frames: int,
+    ) -> torch.Tensor:
+        if keep_idx.numel() == 0:
+            return keep_idx
+
+        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+        keep = keep[(keep >= 0) & (keep < meta["frame_idx"].numel())]
+        if keep.numel() == 0:
+            return keep
+
+        if budget <= 0:
+            return torch.empty(0, dtype=torch.long)
+
+        frame_idx_all = meta["frame_idx"]
+        is_special_all = meta["is_special"]
+        is_anchor_all = meta.get("is_anchor", torch.zeros_like(is_special_all))
+        current_frame_idx = int(frame_idx_all.max().item()) if frame_idx_all.numel() > 0 else 0
+        recent_min = max(0, current_frame_idx - int(recent_frames))
+
+        frame_keep = frame_idx_all.index_select(0, keep)
+        special_keep = is_special_all.index_select(0, keep)
+        anchor_keep = is_anchor_all.index_select(0, keep)
+
+        # Strict hard-cap: all categories are high-priority, but still fall under budget.
+        pri = torch.zeros((keep.numel(),), dtype=torch.float32)
+        pri += special_keep.to(torch.float32) * 1000.0
+        pri += anchor_keep.to(torch.float32) * 100.0
+        pri += (frame_keep == 0).to(torch.float32) * 20.0
+        pri += (frame_keep >= recent_min).to(torch.float32) * 10.0
+        pri += torch.clamp(frame_keep.to(torch.float32), min=0.0) / 1000.0
+
+        if keep.numel() > budget:
+            order = torch.argsort(pri, descending=True)
+            keep = keep.index_select(0, order[:budget])
+
+        return torch.unique(keep, sorted=True)
+
+    @staticmethod
+    def _sanitize_keep_idx(keep_idx: torch.Tensor, meta_len: int, kv_len: int) -> torch.Tensor:
+        if keep_idx is None or keep_idx.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        upper = min(int(meta_len), int(kv_len))
+        if upper <= 0:
+            return torch.empty(0, dtype=torch.long)
+        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+        keep = keep[(keep >= 0) & (keep < upper)]
+        return keep
 
     def _build_current_frame_meta(self, frame_idx: int, tokens_per_frame: int) -> Dict[str, torch.Tensor]:
         special = self.patch_start_idx
@@ -245,14 +551,69 @@ class Aggregator(nn.Module):
         is_special[:special] = True
 
         local_patch_idx = torch.full((tokens_per_frame,), -1, dtype=torch.long)
+        identity_local = torch.full((tokens_per_frame,), -1, dtype=torch.long)
+        if special > 0:
+            identity_local[:special] = -(torch.arange(special, dtype=torch.long) + 1)
         if patch_tokens > 0:
             local_patch_idx[special:] = torch.arange(patch_tokens, dtype=torch.long)
+            identity_local[special:] = local_patch_idx[special:]
 
         return {
             "frame_idx": frame_idx_t,
             "is_special": is_special,
             "local_patch_idx": local_patch_idx,
+            "identity_local": identity_local,
+            "is_anchor": torch.zeros((tokens_per_frame,), dtype=torch.bool),
         }
+
+    @staticmethod
+    def _build_identity_keep_from_meta(meta: Dict[str, torch.Tensor], keep_idx: Optional[torch.Tensor]) -> List[Tuple[int, int]]:
+        if keep_idx is None or keep_idx.numel() == 0:
+            return []
+        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+        if keep.numel() == 0:
+            return []
+
+        frame = meta["frame_idx"].index_select(0, keep)
+        ident_local = meta.get("identity_local", meta["local_patch_idx"]).index_select(0, keep)
+        is_special = meta["is_special"].index_select(0, keep)
+        is_anchor = meta.get("is_anchor", torch.zeros_like(meta["is_special"])).index_select(0, keep)
+
+        def _rank(i: int):
+            f = int(frame[i].item())
+            return (
+                1 if bool(is_special[i].item()) else 0,
+                1 if bool(is_anchor[i].item()) else 0,
+                1 if f == 0 else 0,
+                f,
+            )
+
+        order = sorted(range(keep.numel()), key=_rank, reverse=True)
+        out: List[Tuple[int, int]] = []
+        seen = set()
+        for i in order:
+            key = (int(frame[i].item()), int(ident_local[i].item()))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    @staticmethod
+    def _identity_keep_to_index(meta: Dict[str, torch.Tensor], identity_keep: List[Tuple[int, int]]) -> torch.Tensor:
+        if not identity_keep:
+            return torch.empty(0, dtype=torch.long)
+        frame = meta["frame_idx"]
+        ident_local = meta.get("identity_local", meta["local_patch_idx"])
+        table: Dict[Tuple[int, int], int] = {}
+        for i in range(int(frame.numel())):
+            key = (int(frame[i].item()), int(ident_local[i].item()))
+            if key not in table:
+                table[key] = i
+        out = [table[k] for k in identity_keep if k in table]
+        if not out:
+            return torch.empty(0, dtype=torch.long)
+        return torch.tensor(out, dtype=torch.long)
 
     def _select_geo_active_indices(
         self,
@@ -262,6 +623,7 @@ class Aggregator(nn.Module):
         near: float,
         far: float,
         current_view: Optional[Dict[str, torch.Tensor]],
+        max_past_tokens: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         total_tokens = int(meta["frame_idx"].numel())
         if total_tokens == 0:
@@ -271,26 +633,133 @@ class Aggregator(nn.Module):
         frame_idx = meta["frame_idx"]
         is_special = meta["is_special"]
         local_idx = meta["local_patch_idx"]
+        is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
 
-        # Always keep special tokens
+        # Always keep special tokens.
         special_idx = torch.nonzero(is_special, as_tuple=False).flatten().tolist()
         selected.update(special_idx)
+
+        # Keep previously established anchor tokens (pinning within cached KV).
+        anchor_token_idx = torch.nonzero(is_anchor, as_tuple=False).flatten().tolist()
+        selected.update(anchor_token_idx)
+
+        # Frame0: keep special tokens always, patch tokens by a fixed cap.
+        frame0_mask = frame_idx == 0
+        frame0_special_idx = torch.nonzero(frame0_mask & is_special, as_tuple=False).flatten().tolist()
+        selected.update(frame0_special_idx)
+
+        frame0_patch_idx = torch.nonzero(frame0_mask & (~is_special) & (local_idx >= 0), as_tuple=False).flatten()
+        if frame0_patch_idx.numel() > 0:
+            frame0_local = local_idx[frame0_patch_idx].long()
+            # try conf-guided selection if metadata for frame0 exists
+            frame0_meta = self.geo_frame_meta.get(0)
+            if frame0_meta is not None and frame0_meta["conf"].numel() > 0:
+                in_range = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
+                frame0_patch_idx = frame0_patch_idx[in_range]
+                frame0_local = frame0_local[in_range]
+                if frame0_patch_idx.numel() > 0:
+                    conf0 = frame0_meta["conf"].index_select(0, frame0_local).to(torch.float32)
+                    k0 = min(int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
+                    top_idx = torch.topk(conf0, k=k0, largest=True).indices
+                    selected.update(frame0_patch_idx.index_select(0, top_idx).tolist())
+            else:
+                k0 = min(int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
+                selected.update(frame0_patch_idx[:k0].tolist())
 
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         recent_min = max(0, current_frame_idx - int(recent_frames))
         recent_mask = frame_idx >= recent_min
-        recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
-        selected.update(recent_idx)
+
+        # Optional fast-path (disabled by default, can be enabled by setting geo_selection_interval>1).
+        if self.geo_selection_interval > 1 and (current_frame_idx % self.geo_selection_interval != 0):
+            recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
+            selected.update(recent_idx)
+            keep_fast = torch.tensor(sorted(selected), dtype=torch.long)
+            return keep_fast
+
+        # Build a budgeted local-tracking pool for recent patches (not all recent patches).
+        if max_past_tokens is not None:
+            recent_frames_count = max(1, int(torch.unique(frame_idx[recent_mask]).numel()))
+            local_budget = min(
+                int(max_past_tokens * self.geo_local_budget_ratio),
+                int(self.geo_local_budget_cap_per_frame) * recent_frames_count,
+            )
+        else:
+            local_budget = 0
+        local_selected: List[int] = []
+        recent_special_idx = torch.nonzero(recent_mask & is_special, as_tuple=False).flatten().tolist()
+        selected.update(recent_special_idx)
+
+        recent_patch_indices = torch.nonzero(recent_mask & (~is_special) & (local_idx >= 0), as_tuple=False).flatten()
+        if recent_patch_indices.numel() > 0 and local_budget > 0:
+            per_frame_budget = max(1, local_budget // max(1, int(torch.unique(frame_idx[recent_patch_indices]).numel())))
+            grid_n = max(1, int(self.geo_local_coverage_grid))
+            for fidx in torch.unique(frame_idx[recent_patch_indices]).tolist():
+                fidx = int(fidx)
+                frame_meta = self.geo_frame_meta.get(fidx)
+                if frame_meta is None:
+                    continue
+                idx_f = recent_patch_indices[frame_idx[recent_patch_indices] == fidx]
+                if idx_f.numel() == 0:
+                    continue
+
+                local_f = local_idx[idx_f].long()
+                in_range = (local_f >= 0) & (local_f < frame_meta["conf"].shape[0])
+                if in_range.sum().item() == 0:
+                    continue
+                idx_f = idx_f[in_range]
+                local_f = local_f[in_range]
+                conf_f = frame_meta["conf"].index_select(0, local_f).to(torch.float32)
+
+                # High-confidence top-k
+                k_top = min(int(per_frame_budget), int(idx_f.numel()))
+                if k_top > 0:
+                    top_idx = torch.topk(conf_f, k=k_top, largest=True).indices
+                    local_selected.extend(idx_f.index_select(0, top_idx).tolist())
+
+                # Coverage fallback across local patch grid
+                patch_n = int(frame_meta["conf"].shape[0])
+                side = max(1, int(round(patch_n ** 0.5)))
+                bin_h = max(1, side // grid_n)
+                bin_w = max(1, side // grid_n)
+                best_per_cell: Dict[Tuple[int, int], Tuple[float, int]] = {}
+                for j in range(idx_f.numel()):
+                    lp = int(local_f[j].item())
+                    y, x = lp // side, lp % side
+                    cell = (min(grid_n - 1, y // bin_h), min(grid_n - 1, x // bin_w))
+                    sc = float(conf_f[j].item())
+                    gid = int(idx_f[j].item())
+                    prev = best_per_cell.get(cell)
+                    if prev is None or sc > prev[0]:
+                        best_per_cell[cell] = (sc, gid)
+                local_selected.extend(v[1] for v in best_per_cell.values())
+
+        if local_selected:
+            # keep deterministic order by (frame_idx, token_idx)
+            local_u = sorted(set(int(i) for i in local_selected), key=lambda i: (int(frame_idx[i].item()), i))
+            if local_budget > 0 and len(local_u) > local_budget:
+                local_u = local_u[:local_budget]
+            selected.update(local_u)
 
         if current_view is None or current_view.get("world_to_cam") is None or current_view.get("intrinsic") is None:
             return torch.tensor(sorted(selected), dtype=torch.long)
 
-        world_to_cam = current_view["world_to_cam"].detach().cpu()
-        intrinsic = current_view["intrinsic"].detach().cpu()
+        world_to_cam = current_view["world_to_cam"]
+        intrinsic = current_view["intrinsic"]
+        if isinstance(world_to_cam, torch.Tensor):
+            world_to_cam = world_to_cam.detach()
+            if world_to_cam.device.type != "cpu":
+                world_to_cam = world_to_cam.cpu()
+        if isinstance(intrinsic, torch.Tensor):
+            intrinsic = intrinsic.detach()
+            if intrinsic.device.type != "cpu":
+                intrinsic = intrinsic.cpu()
         if world_to_cam.ndim == 3:
             world_to_cam = world_to_cam[0]
         if intrinsic.ndim == 3:
             intrinsic = intrinsic[0]
+
+        img_hw = current_view.get("img_hw") if current_view is not None else None
 
         # Candidates for geometry-based pruning: non-special and non-recent tokens
         candidate_mask = (~is_special) & (~recent_mask) & (local_idx >= 0)
@@ -298,8 +767,25 @@ class Aggregator(nn.Module):
         if candidate_indices.numel() == 0:
             return torch.tensor(sorted(selected), dtype=torch.long)
 
+        # Acceleration guard 1: restrict scoring to recent old frames only.
+        if self.geo_max_old_frames_to_score > 0:
+            uniq = torch.unique(frame_idx[candidate_indices])
+            if uniq.numel() > self.geo_max_old_frames_to_score:
+                keep_frames = uniq.sort().values[-self.geo_max_old_frames_to_score :]
+                keep_mask = (frame_idx[candidate_indices].unsqueeze(1) == keep_frames.unsqueeze(0)).any(dim=1)
+                candidate_indices = candidate_indices[keep_mask]
+
+        # Acceleration guard 2: cap candidate token count per layer.
+        if self.geo_max_candidate_tokens > 0 and candidate_indices.numel() > self.geo_max_candidate_tokens:
+            cf = frame_idx[candidate_indices]
+            order = torch.argsort(cf)
+            candidate_indices = candidate_indices.index_select(0, order)[-self.geo_max_candidate_tokens :]
+
         # Global per-voxel top-k across all old frames (avoid per-frame duplicates)
         bucket: Dict[Tuple[int, int, int], List[Tuple[float, int]]] = defaultdict(list)
+        bucket_conf_proxy: List[float] = []
+        candidate_count = int(candidate_indices.numel())
+        visible_total = 0
 
         for fidx in torch.unique(frame_idx[candidate_indices]).tolist():
             fidx = int(fidx)
@@ -329,26 +815,83 @@ class Aggregator(nn.Module):
                 intrinsic.to(torch.float32),
                 near=near,
                 far=far,
+                img_hw=img_hw,
             )
-            if visible.sum().item() == 0:
-                continue
+            visible_count = int(visible.sum().item())
+            visible_total += visible_count
+            for j in range(in_frame.numel()):
+                gidx = int(in_frame[j].item())
+                key = tuple(int(v) for v in vox[j].tolist())
 
-            vis_global = in_frame[visible]
-            vis_conf = conf[visible]
-            vis_vox = vox[visible]
+                bank = self.geo_voxel_bank.get(key)
+                if bank is None:
+                    bank_conf = float(conf[j].item())
+                    bank_support = 1.0
+                    bank_var = 0.0
+                else:
+                    bank_conf = float(bank["conf_ema"])
+                    bank_support = float(bank["support"])
+                    bank_var = float(bank["pos_var"])
+                bucket_conf_proxy.append(bank_conf)
 
-            for j in range(vis_global.numel()):
-                gidx = int(vis_global[j].item())
-                key = tuple(int(v) for v in vis_vox[j].tolist())
-                bucket[key].append((float(vis_conf[j].item()), gidx))
+                stability = 1.0 / (1.0 + bank_var)
+                support_gain = torch.log1p(torch.tensor(bank_support)).item()
+                base_score = max(float(conf[j].item()), 1e-6) * max(bank_conf, 1e-6) * support_gain * stability
+                if bool(visible[j].item()):
+                    vis_weight = 1.0
+                else:
+                    vis_weight = (
+                        self.geo_anchor_invisible_read_weight
+                        if key in self.geo_anchor_voxels
+                        else self.geo_invisible_read_weight
+                    )
+                score = base_score * vis_weight
+
+                # bucket threshold is adaptive to avoid empty/overcrowded bucket.
+                bucket[key].append((score, gidx, bank_conf))
+
+        # Adaptive bucket threshold to control bucket size.
+        remaining_budget = None
+        if max_past_tokens is not None:
+            remaining_budget = max(0, int(max_past_tokens) - len(selected))
+        tau_bucket = self._compute_dynamic_bucket_threshold(bucket_conf_proxy, remaining_budget or 0)
+
+        # Global anchor quota from ordered anchor list (deterministic).
+        anchor_count = 0
+        if self.geo_anchor_voxel_list:
+            anchor_quota = int(self.geo_anchor_read_quota)
+            if max_past_tokens is not None:
+                anchor_quota = min(anchor_quota, max(0, int(max_past_tokens * self.geo_anchor_budget_ratio)))
+            for vox in self.geo_anchor_voxel_list:
+                if vox not in bucket:
+                    continue
+                entries = [e for e in bucket[vox] if e[2] >= self.geo_anchor_conf_exit]
+                if not entries:
+                    continue
+                entries.sort(key=lambda x: x[0], reverse=True)
+                selected.add(entries[0][1])
+                anchor_count += 1
+                if anchor_count >= anchor_quota:
+                    break
 
         for _, entries in bucket.items():
+            entries = [e for e in entries if e[2] >= tau_bucket]
             entries.sort(key=lambda x: x[0], reverse=True)
-            for _, gidx in entries[: max(1, int(topk_per_voxel))]:
+            for _, gidx, _ in entries[: max(1, int(topk_per_voxel))]:
                 selected.add(gidx)
 
         if not selected:
             return None
+
+        logger.debug(
+            "[geo_prune] total=%d candidate=%d visible=%d selected=%d anchor_selected=%d tau_bucket=%.4f",
+            total_tokens,
+            candidate_count,
+            visible_total,
+            len(selected),
+            anchor_count,
+            tau_bucket,
+        )
 
         keep = torch.tensor(sorted(i for i in selected if 0 <= i < total_tokens), dtype=torch.long)
         return keep
@@ -475,6 +1018,31 @@ class Aggregator(nn.Module):
         current_budgets = self._calculate_dynamic_budgets(total_budget)
         scores = []
 
+        # In geo mode, build one shared keep plan per frame instead of re-running
+        # expensive Python/CPU geo selection for every global layer.
+        geo_shared_keep_idx: Optional[torch.Tensor] = None
+        geo_shared_identity_keep: Optional[List[Tuple[int, int]]] = None
+        if use_cache and use_geo_kv_prune and any(kv is not None for kv in past_key_values):
+            ref_layer_idx = None
+            for idx, kv in enumerate(past_key_values):
+                if kv is not None and self.geo_token_meta[idx]["frame_idx"].numel() > 0:
+                    ref_layer_idx = idx
+                    break
+
+            if ref_layer_idx is not None:
+                ref_meta = self.geo_token_meta[ref_layer_idx]
+                ref_budget = max(0, int(current_budgets.max().item()) - P)
+                geo_shared_keep_idx = self._select_geo_active_indices(
+                    meta=ref_meta,
+                    topk_per_voxel=geo_topk_per_voxel,
+                    recent_frames=geo_recent_frames,
+                    near=geo_near,
+                    far=geo_far,
+                    current_view=current_view,
+                    max_past_tokens=ref_budget,
+                )
+                geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -489,14 +1057,13 @@ class Aggregator(nn.Module):
                         past_meta = self.geo_token_meta[layer_idx]
 
                         if use_geo_kv_prune and past_kv_block is not None:
-                            keep_idx = self._select_geo_active_indices(
-                                meta=past_meta,
-                                topk_per_voxel=geo_topk_per_voxel,
-                                recent_frames=geo_recent_frames,
-                                near=geo_near,
-                                far=geo_far,
-                                current_view=current_view,
-                            )
+                            keep_idx = self._identity_keep_to_index(past_meta, geo_shared_identity_keep or [])
+                            if keep_idx is not None and keep_idx.numel() > 0:
+                                keep_idx = self._sanitize_keep_idx(
+                                    keep_idx,
+                                    meta_len=past_meta["frame_idx"].numel(),
+                                    kv_len=past_kv_block[0].shape[2],
+                                )
                             if keep_idx is not None and keep_idx.numel() > 0:
                                 keep_idx_dev = keep_idx.to(past_kv_block[0].device)
                                 past_kv_block = (
@@ -505,41 +1072,60 @@ class Aggregator(nn.Module):
                                 )
                                 past_meta = self._index_meta(past_meta, keep_idx)
 
-                            # Hard pre-attention cap so this layer cannot exceed budget in current forward.
+                            # Hard pre-attention cap with protection for anchor/special/recent tokens.
                             max_past_tokens = max(0, layer_budget - P)
-                            if max_past_tokens == 0:
-                                past_kv_block = (past_kv_block[0][:, :, :0], past_kv_block[1][:, :, :0])
-                                past_meta = self._index_meta(past_meta, torch.empty(0, dtype=torch.long))
-                            elif past_kv_block[0].shape[2] > max_past_tokens:
-                                start = past_kv_block[0].shape[2] - max_past_tokens
-                                pre_keep = torch.arange(start, past_kv_block[0].shape[2], dtype=torch.long, device=past_kv_block[0].device)
-                                past_kv_block = (
-                                    torch.index_select(past_kv_block[0], 2, pre_keep),
-                                    torch.index_select(past_kv_block[1], 2, pre_keep),
-                                )
-                                past_meta = self._index_meta(past_meta, pre_keep.cpu())
+                            pre_keep_all = torch.arange(past_kv_block[0].shape[2], dtype=torch.long)
+                            pre_keep = self._cap_keep_with_protection(
+                                past_meta,
+                                pre_keep_all,
+                                budget=max_past_tokens,
+                                recent_frames=geo_recent_frames,
+                            )
+                            pre_keep = self._sanitize_keep_idx(
+                                pre_keep,
+                                meta_len=past_meta["frame_idx"].numel(),
+                                kv_len=past_kv_block[0].shape[2],
+                            )
+                            pre_keep_dev = pre_keep.to(past_kv_block[0].device)
+                            past_kv_block = (
+                                torch.index_select(past_kv_block[0], 2, pre_keep_dev),
+                                torch.index_select(past_kv_block[1], 2, pre_keep_dev),
+                            )
+                            past_meta = self._index_meta(past_meta, pre_keep)
 
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_kv_block,
                             use_cache=True,
                             past_frame_idx=past_frame_idx,
-                            cache_budget=None if use_geo_kv_prune else layer_budget
+                            cache_budget=layer_budget
                         )
 
                         if use_geo_kv_prune:
                             current_meta = self._build_current_frame_meta(past_frame_idx, P)
                             merged_meta = self._concat_meta(past_meta, current_meta)
+                            merged_meta["is_anchor"] = self._derive_anchor_mask_from_meta(merged_meta)
 
-                            # Keep explicit hard cap in geo mode (post-attention safety net).
+                            # Keep explicit hard cap in geo mode with protection for anchor/special/recent tokens.
                             if new_kv[0].shape[2] > layer_budget:
-                                start = new_kv[0].shape[2] - layer_budget
-                                cap_keep = torch.arange(start, new_kv[0].shape[2], dtype=torch.long, device=new_kv[0].device)
-                                new_kv = (
-                                    torch.index_select(new_kv[0], 2, cap_keep),
-                                    torch.index_select(new_kv[1], 2, cap_keep),
+                                cap_all = torch.arange(new_kv[0].shape[2], dtype=torch.long)
+                                cap_keep = self._cap_keep_with_protection(
+                                    merged_meta,
+                                    cap_all,
+                                    budget=layer_budget,
+                                    recent_frames=geo_recent_frames,
                                 )
-                                merged_meta = self._index_meta(merged_meta, cap_keep.cpu())
+                                cap_keep = self._sanitize_keep_idx(
+                                    cap_keep,
+                                    meta_len=merged_meta["frame_idx"].numel(),
+                                    kv_len=new_kv[0].shape[2],
+                                )
+                                cap_keep_dev = cap_keep.to(new_kv[0].device)
+                                new_kv = (
+                                    torch.index_select(new_kv[0], 2, cap_keep_dev),
+                                    torch.index_select(new_kv[1], 2, cap_keep_dev),
+                                )
+                                merged_meta = self._index_meta(merged_meta, cap_keep)
                             self.geo_token_meta[layer_idx] = merged_meta
 
                         past_key_values[global_idx - 1] = new_kv
