@@ -44,7 +44,32 @@ def run_inference(args: argparse.Namespace):
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
     model_total_budget = args.total_budget if args.use_geo_kv_prune else 1200000
-    model = StreamVGGT(total_budget=model_total_budget)
+    aggregator_kwargs = {
+        "geo_conf_ema_alpha": args.geo_conf_ema_alpha,
+        "geo_var_ema_alpha": args.geo_var_ema_alpha,
+        "geo_invisible_read_weight": args.geo_invisible_read_weight,
+        "geo_bucket_quantile_target": args.geo_bucket_quantile_target,
+        "geo_bucket_quantile_min": args.geo_bucket_quantile_min,
+        "geo_bucket_quantile_max": args.geo_bucket_quantile_max,
+        "geo_anchor_conf_enter": args.geo_anchor_conf_enter,
+        "geo_anchor_conf_exit": args.geo_anchor_conf_exit,
+        "geo_anchor_min_support": args.geo_anchor_min_support,
+        "geo_anchor_max_pos_var": args.geo_anchor_max_pos_var,
+        "geo_max_voxels": args.geo_max_voxels,
+        "geo_anchor_voxel_budget": args.geo_anchor_voxel_budget,
+        "geo_anchor_read_quota": args.geo_anchor_read_quota,
+        "geo_local_budget_ratio": args.geo_local_budget_ratio,
+        "geo_local_budget_cap_per_frame": args.geo_local_budget_cap_per_frame,
+        "geo_anchor_budget_ratio": args.geo_anchor_budget_ratio,
+        "geo_local_coverage_grid": args.geo_local_coverage_grid,
+        "geo_frame0_patch_cap": args.geo_frame0_patch_cap,
+        "geo_anchor_invisible_read_weight": args.geo_anchor_invisible_read_weight,
+        "geo_max_old_frames_to_score": args.geo_max_old_frames_to_score,
+        "geo_max_candidate_tokens": args.geo_max_candidate_tokens,
+        "geo_selection_interval": args.geo_selection_interval,
+        "geo_anchor_refresh_interval": args.geo_anchor_refresh_interval,
+    }
+    model = StreamVGGT(total_budget=model_total_budget, aggregator_kwargs=aggregator_kwargs)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
     model.load_state_dict(ckpt, strict=True)
@@ -59,6 +84,9 @@ def run_inference(args: argparse.Namespace):
         p for p in glob.glob(os.path.join(args.input_dir, "*"))
         if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
     )
+
+    if args.max_views >= 0:
+        image_names = image_names[: args.max_views]
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
@@ -255,6 +283,35 @@ if __name__ == "__main__":
         default=1,
         help="Log CUDA memory diagnostics every N frames when enabled.",
     )
+    parser.add_argument(
+        "--max_views",
+        type=int,
+        default=-1,
+        help="Maximum number of views to infer. -1 means use all views.",
+    )
+    parser.add_argument("--geo_conf_ema_alpha", type=float, default=0.9)
+    parser.add_argument("--geo_var_ema_alpha", type=float, default=0.9)
+    parser.add_argument("--geo_invisible_read_weight", type=float, default=0.2)
+    parser.add_argument("--geo_bucket_quantile_target", type=float, default=0.6)
+    parser.add_argument("--geo_bucket_quantile_min", type=float, default=0.3)
+    parser.add_argument("--geo_bucket_quantile_max", type=float, default=0.9)
+    parser.add_argument("--geo_anchor_conf_enter", type=float, default=1.25)
+    parser.add_argument("--geo_anchor_conf_exit", type=float, default=1.05)
+    parser.add_argument("--geo_anchor_min_support", type=float, default=2.0)
+    parser.add_argument("--geo_anchor_max_pos_var", type=float, default=0.05)
+    parser.add_argument("--geo_max_voxels", type=int, default=200000)
+    parser.add_argument("--geo_anchor_voxel_budget", type=int, default=4096)
+    parser.add_argument("--geo_anchor_read_quota", type=int, default=2048)
+    parser.add_argument("--geo_local_budget_ratio", type=float, default=0.75)
+    parser.add_argument("--geo_local_budget_cap_per_frame", type=int, default=1369)
+    parser.add_argument("--geo_anchor_budget_ratio", type=float, default=0.35)
+    parser.add_argument("--geo_local_coverage_grid", type=int, default=4)
+    parser.add_argument("--geo_frame0_patch_cap", type=int, default=1000000)
+    parser.add_argument("--geo_anchor_invisible_read_weight", type=float, default=0.5)
+    parser.add_argument("--geo_max_old_frames_to_score", type=int, default=24)
+    parser.add_argument("--geo_max_candidate_tokens", type=int, default=15000)
+    parser.add_argument("--geo_selection_interval", type=int, default=1)
+    parser.add_argument("--geo_anchor_refresh_interval", type=int, default=1)
     
     args = parser.parse_args()
     result = run_inference(args)
