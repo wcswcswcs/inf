@@ -555,6 +555,17 @@ class Aggregator(nn.Module):
         keep = keep[(keep >= 0) & (keep < upper)]
         return keep
 
+    @staticmethod
+    def _is_full_range_keep(keep_idx: torch.Tensor, length: int) -> bool:
+        if keep_idx is None:
+            return False
+        if int(keep_idx.numel()) != int(length):
+            return False
+        if length == 0:
+            return True
+        keep_cpu = keep_idx.detach().cpu().long()
+        return bool(torch.equal(keep_cpu, torch.arange(length, dtype=torch.long)))
+
     def _build_current_frame_meta(self, frame_idx: int, tokens_per_frame: int) -> Dict[str, torch.Tensor]:
         special = self.patch_start_idx
         patch_tokens = max(tokens_per_frame - special, 0)
@@ -1161,7 +1172,10 @@ class Aggregator(nn.Module):
                                 meta_len=past_meta["frame_idx"].numel(),
                                 kv_len=past_kv_block[0].shape[2],
                             )
-                            if pre_keep.numel() > 0:
+                            if pre_keep.numel() == 0:
+                                past_kv_block = None
+                                past_meta = self.geo_token_meta[layer_idx]
+                            elif not self._is_full_range_keep(pre_keep, past_kv_block[0].shape[2]):
                                 pre_keep_dev = pre_keep.to(past_kv_block[0].device)
                                 past_kv_block = (
                                     torch.index_select(past_kv_block[0], 2, pre_keep_dev),
