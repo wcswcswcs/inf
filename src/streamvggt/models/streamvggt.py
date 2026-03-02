@@ -245,18 +245,21 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     else {}
                 ),
             }
-            res_cpu = {
-                k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                for k, v in res_gpu.items()
-            }
-            if frame_writer is not None:
-                frame_writer(i, frame, res_cpu)
+            needs_cpu_export = (frame_writer is not None) or cache_results
+            if needs_cpu_export:
+                res_cpu = {
+                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in res_gpu.items()
+                }
 
-            if cache_results:
-                all_ress.append(res_cpu)
-                processed_frames.append(
-                    {nk: nv.detach().cpu() if isinstance(nv, torch.Tensor) else nv for nk, nv in frame.items()}
-                )
+                if frame_writer is not None:
+                    frame_writer(i, frame, res_cpu)
+
+                if cache_results:
+                    all_ress.append(res_cpu)
+                    processed_frames.append(
+                        {nk: nv.detach().cpu() if isinstance(nv, torch.Tensor) else nv for nk, nv in frame.items()}
+                    )
 
             if memory_diagnostics and model_device.type == "cuda" and ((i + 1) % log_interval == 0 or (i + 1) == len(frames)):
                 allocated_gb = torch.cuda.memory_allocated(model_device) / (1024 ** 3)

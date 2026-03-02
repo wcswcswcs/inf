@@ -1138,23 +1138,18 @@ class Aggregator(nn.Module):
                             )
 
                             keep_idx = self._identity_keep_to_index(past_meta, layer_identity_keep)
-                            if keep_idx is not None and keep_idx.numel() > 0:
-                                keep_idx = self._sanitize_keep_idx(
-                                    keep_idx,
-                                    meta_len=past_meta["frame_idx"].numel(),
-                                    kv_len=past_kv_block[0].shape[2],
-                                )
-                            if keep_idx is not None and keep_idx.numel() > 0:
-                                keep_idx_dev = keep_idx.to(past_kv_block[0].device)
-                                past_kv_block = (
-                                    torch.index_select(past_kv_block[0], 2, keep_idx_dev),
-                                    torch.index_select(past_kv_block[1], 2, keep_idx_dev),
-                                )
-                                past_meta = self._index_meta(past_meta, keep_idx)
+                            keep_idx = self._sanitize_keep_idx(
+                                keep_idx,
+                                meta_len=past_meta["frame_idx"].numel(),
+                                kv_len=past_kv_block[0].shape[2],
+                            )
 
                             # Hard pre-attention cap with protection for anchor/special/recent tokens.
                             max_past_tokens = max(0, layer_budget - P)
-                            pre_keep_all = torch.arange(past_kv_block[0].shape[2], dtype=torch.long)
+                            if keep_idx.numel() > 0:
+                                pre_keep_all = keep_idx
+                            else:
+                                pre_keep_all = torch.arange(past_kv_block[0].shape[2], dtype=torch.long)
                             pre_keep = self._cap_keep_with_protection(
                                 past_meta,
                                 pre_keep_all,
@@ -1166,12 +1161,13 @@ class Aggregator(nn.Module):
                                 meta_len=past_meta["frame_idx"].numel(),
                                 kv_len=past_kv_block[0].shape[2],
                             )
-                            pre_keep_dev = pre_keep.to(past_kv_block[0].device)
-                            past_kv_block = (
-                                torch.index_select(past_kv_block[0], 2, pre_keep_dev),
-                                torch.index_select(past_kv_block[1], 2, pre_keep_dev),
-                            )
-                            past_meta = self._index_meta(past_meta, pre_keep)
+                            if pre_keep.numel() > 0:
+                                pre_keep_dev = pre_keep.to(past_kv_block[0].device)
+                                past_kv_block = (
+                                    torch.index_select(past_kv_block[0], 2, pre_keep_dev),
+                                    torch.index_select(past_kv_block[1], 2, pre_keep_dev),
+                                )
+                                past_meta = self._index_meta(past_meta, pre_keep)
 
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
