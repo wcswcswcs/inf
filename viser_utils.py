@@ -890,7 +890,7 @@ class PointCloudViewer:
             )
             gui_scene_tree_mode = self.server.add_gui_checkbox(
                 "Scene Tree Manual Visibility",
-                False,
+                True,
                 hint="Enable to stop auto-hiding frames so you can toggle /frames/* in scene tree.",
             )
 
