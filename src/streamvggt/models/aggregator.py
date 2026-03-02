@@ -190,6 +190,8 @@ class Aggregator(nn.Module):
         self.geo_max_candidate_tokens = geo_max_candidate_tokens
         self.geo_selection_interval = geo_selection_interval
         self.geo_anchor_refresh_interval = geo_anchor_refresh_interval
+        self.geo_identity_stride = 1 << 21
+        self.geo_identity_offset = 1 << 18
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -204,6 +206,7 @@ class Aggregator(nn.Module):
                 "is_special": torch.empty(0, dtype=torch.bool),
                 "local_patch_idx": torch.empty(0, dtype=torch.long),
                 "identity_local": torch.empty(0, dtype=torch.long),
+                "global_id": torch.empty(0, dtype=torch.long),
                 "is_anchor": torch.empty(0, dtype=torch.bool),
             }
             for i in range(self.depth)
@@ -451,6 +454,9 @@ class Aggregator(nn.Module):
             "identity_local": meta["identity_local"].index_select(0, keep_cpu)
             if "identity_local" in meta
             else meta["local_patch_idx"].index_select(0, keep_cpu),
+            "global_id": meta["global_id"].index_select(0, keep_cpu)
+            if "global_id" in meta
+            else torch.empty((keep_cpu.numel(),), dtype=torch.long),
             "is_anchor": meta["is_anchor"].index_select(0, keep_cpu)
             if "is_anchor" in meta
             else torch.zeros((keep_cpu.numel(),), dtype=torch.bool),
@@ -466,6 +472,13 @@ class Aggregator(nn.Module):
                 [
                     meta_a.get("identity_local", meta_a["local_patch_idx"]),
                     meta_b.get("identity_local", meta_b["local_patch_idx"]),
+                ],
+                dim=0,
+            ),
+            "global_id": torch.cat(
+                [
+                    meta_a.get("global_id", torch.empty((0,), dtype=torch.long)),
+                    meta_b.get("global_id", torch.empty((0,), dtype=torch.long)),
                 ],
                 dim=0,
             ),
@@ -557,25 +570,27 @@ class Aggregator(nn.Module):
         if patch_tokens > 0:
             local_patch_idx[special:] = torch.arange(patch_tokens, dtype=torch.long)
             identity_local[special:] = local_patch_idx[special:]
+        global_id = frame_idx_t * int(self.geo_identity_stride) + (identity_local + int(self.geo_identity_offset))
 
         return {
             "frame_idx": frame_idx_t,
             "is_special": is_special,
             "local_patch_idx": local_patch_idx,
             "identity_local": identity_local,
+            "global_id": global_id,
             "is_anchor": torch.zeros((tokens_per_frame,), dtype=torch.bool),
         }
 
     @staticmethod
-    def _build_identity_keep_from_meta(meta: Dict[str, torch.Tensor], keep_idx: Optional[torch.Tensor]) -> List[Tuple[int, int]]:
+    def _build_identity_keep_from_meta(meta: Dict[str, torch.Tensor], keep_idx: Optional[torch.Tensor]) -> torch.Tensor:
         if keep_idx is None or keep_idx.numel() == 0:
-            return []
+            return torch.empty((0,), dtype=torch.long)
         keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
         if keep.numel() == 0:
-            return []
+            return torch.empty((0,), dtype=torch.long)
 
         frame = meta["frame_idx"].index_select(0, keep)
-        ident_local = meta.get("identity_local", meta["local_patch_idx"]).index_select(0, keep)
+        global_id = meta.get("global_id", torch.empty((0,), dtype=torch.long)).index_select(0, keep)
         is_special = meta["is_special"].index_select(0, keep)
         is_anchor = meta.get("is_anchor", torch.zeros_like(meta["is_special"])).index_select(0, keep)
 
@@ -589,58 +604,81 @@ class Aggregator(nn.Module):
             )
 
         order = sorted(range(keep.numel()), key=_rank, reverse=True)
-        out: List[Tuple[int, int]] = []
+        out: List[int] = []
         seen = set()
         for i in order:
-            key = (int(frame[i].item()), int(ident_local[i].item()))
+            key = int(global_id[i].item())
             if key in seen:
                 continue
             seen.add(key)
             out.append(key)
-        return out
+        if not out:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.tensor(out, dtype=torch.long)
 
     def _cap_identity_keep_with_protection(
         self,
         meta: Dict[str, torch.Tensor],
-        identity_keep: List[Tuple[int, int]],
+        identity_keep: torch.Tensor,
         budget: int,
         recent_frames: int,
-    ) -> List[Tuple[int, int]]:
+    ) -> torch.Tensor:
         """
         Apply strict hard-cap in identity space, then keep original identity order.
 
         This keeps the shared keep-plan semantic in identity space instead of
         implicitly relying on per-layer positional index alignment.
         """
-        if budget <= 0 or not identity_keep:
-            return []
+        if identity_keep is None or identity_keep.numel() == 0 or budget <= 0:
+            return torch.empty((0,), dtype=torch.long)
 
         idx = self._identity_keep_to_index(meta, identity_keep)
         if idx.numel() == 0:
-            return []
+            return torch.empty((0,), dtype=torch.long)
 
         idx = self._cap_keep_with_protection(meta, idx, budget=budget, recent_frames=recent_frames)
         if idx.numel() == 0:
-            return []
+            return torch.empty((0,), dtype=torch.long)
 
-        capped_identities = set(self._build_identity_keep_from_meta(meta, idx))
-        return [key for key in identity_keep if key in capped_identities]
+        capped_identities = set(self._build_identity_keep_from_meta(meta, idx).tolist())
+        out = [int(key) for key in identity_keep.detach().cpu().long().tolist() if int(key) in capped_identities]
+        if not out:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.tensor(out, dtype=torch.long)
 
     @staticmethod
-    def _identity_keep_to_index(meta: Dict[str, torch.Tensor], identity_keep: List[Tuple[int, int]]) -> torch.Tensor:
-        if not identity_keep:
+    def _ensure_identity_lookup(meta: Dict[str, torch.Tensor]):
+        gid = meta.get("global_id", torch.empty((0,), dtype=torch.long))
+        if gid.numel() == 0:
+            meta["_gid_sorted"] = torch.empty((0,), dtype=torch.long)
+            meta["_gid_pos"] = torch.empty((0,), dtype=torch.long)
+            return
+        if "_gid_sorted" in meta and "_gid_pos" in meta and meta["_gid_sorted"].numel() == gid.numel():
+            return
+        order = torch.argsort(gid)
+        meta["_gid_sorted"] = gid.index_select(0, order)
+        meta["_gid_pos"] = order
+
+    @staticmethod
+    def _identity_keep_to_index(meta: Dict[str, torch.Tensor], identity_keep: torch.Tensor) -> torch.Tensor:
+        if identity_keep is None or identity_keep.numel() == 0:
             return torch.empty(0, dtype=torch.long)
-        frame = meta["frame_idx"]
-        ident_local = meta.get("identity_local", meta["local_patch_idx"])
-        table: Dict[Tuple[int, int], int] = {}
-        for i in range(int(frame.numel())):
-            key = (int(frame[i].item()), int(ident_local[i].item()))
-            if key not in table:
-                table[key] = i
-        out = [table[k] for k in identity_keep if k in table]
-        if not out:
+        Aggregator._ensure_identity_lookup(meta)
+        gid_sorted = meta.get("_gid_sorted", torch.empty((0,), dtype=torch.long))
+        gid_pos = meta.get("_gid_pos", torch.empty((0,), dtype=torch.long))
+        if gid_sorted.numel() == 0:
             return torch.empty(0, dtype=torch.long)
-        return torch.tensor(out, dtype=torch.long)
+        keys = torch.unique(identity_keep.detach().cpu().long(), sorted=True)
+        where = torch.searchsorted(gid_sorted, keys)
+        valid = where < gid_sorted.numel()
+        if valid.sum().item() == 0:
+            return torch.empty((0,), dtype=torch.long)
+        where = where[valid]
+        keys_v = keys[valid]
+        matched = gid_sorted.index_select(0, where) == keys_v
+        if matched.sum().item() == 0:
+            return torch.empty((0,), dtype=torch.long)
+        return gid_pos.index_select(0, where[matched])
 
     def _select_geo_active_indices(
         self,
@@ -1054,7 +1092,7 @@ class Aggregator(nn.Module):
 
         # In geo mode, build one shared keep plan per frame instead of re-running
         # expensive Python/CPU geo selection for every global layer.
-        geo_shared_identity_keep: Optional[List[Tuple[int, int]]] = None
+        geo_shared_identity_keep: Optional[torch.Tensor] = None
         if use_cache and use_geo_kv_prune and any(kv is not None for kv in past_key_values):
             ref_layer_idx = None
             for idx, kv in enumerate(past_key_values):
@@ -1092,7 +1130,9 @@ class Aggregator(nn.Module):
                         if use_geo_kv_prune and past_kv_block is not None:
                             layer_identity_keep = self._cap_identity_keep_with_protection(
                                 past_meta,
-                                geo_shared_identity_keep or [],
+                                geo_shared_identity_keep
+                                if geo_shared_identity_keep is not None
+                                else torch.empty((0,), dtype=torch.long),
                                 budget=max(0, layer_budget - P),
                                 recent_frames=geo_recent_frames,
                             )
