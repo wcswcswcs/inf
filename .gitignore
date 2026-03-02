@@ -4,6 +4,8 @@
 /results
 /outs
 /lib
+/ablation*
+/pth*
 /log*
 /logs_long3d
 *.pth
