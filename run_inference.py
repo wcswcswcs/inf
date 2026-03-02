@@ -152,7 +152,6 @@ def run_inference(args: argparse.Namespace):
         summary = {"per_frame_only": True}
         if args.frame_cache_dir:
             summary["frame_cache_dir"] = args.frame_cache_dir
-        torch.cuda.empty_cache()
         return summary
 
     # Extract results from the output structure
@@ -182,9 +181,6 @@ def run_inference(args: argparse.Namespace):
     )
     predictions["extrinsic"] = extrinsic.squeeze(0)
     predictions["intrinsic"] = intrinsic.squeeze(0) if intrinsic is not None else None
-
-    # Clean up GPU cache
-    torch.cuda.empty_cache()
 
     for key, value in predictions.items():
         if isinstance(value, torch.Tensor):

@@ -530,19 +530,23 @@ class Aggregator(nn.Module):
         special_keep = is_special_all.index_select(0, keep)
         anchor_keep = is_anchor_all.index_select(0, keep)
 
-        # Strict hard-cap: all categories are high-priority, but still fall under budget.
-        pri = torch.zeros((keep.numel(),), dtype=torch.float32)
-        pri += special_keep.to(torch.float32) * 1000.0
-        pri += anchor_keep.to(torch.float32) * 100.0
-        pri += (frame_keep == 0).to(torch.float32) * 20.0
-        pri += (frame_keep >= recent_min).to(torch.float32) * 10.0
-        pri += torch.clamp(frame_keep.to(torch.float32), min=0.0) / 1000.0
+        protected = special_keep | anchor_keep | (frame_keep == 0) | (frame_keep >= recent_min)
+        prot_idx = keep[protected]
+        if prot_idx.numel() >= budget:
+            # Keep the most recent protected tokens under strict hard budget.
+            prot_frame = frame_idx_all.index_select(0, prot_idx)
+            order = torch.argsort(prot_frame, descending=True)
+            return torch.unique(prot_idx.index_select(0, order[:budget]), sorted=True)
 
-        if keep.numel() > budget:
-            order = torch.argsort(pri, descending=True)
-            keep = keep.index_select(0, order[:budget])
+        remain = budget - int(prot_idx.numel())
+        non_prot_idx = keep[~protected]
+        if non_prot_idx.numel() > remain:
+            non_prot_frame = frame_idx_all.index_select(0, non_prot_idx)
+            order = torch.argsort(non_prot_frame, descending=True)
+            non_prot_idx = non_prot_idx.index_select(0, order[:remain])
 
-        return torch.unique(keep, sorted=True)
+        out = torch.cat([prot_idx, non_prot_idx], dim=0)
+        return torch.unique(out, sorted=True)
 
     @staticmethod
     def _sanitize_keep_idx(keep_idx: torch.Tensor, meta_len: int, kv_len: int) -> torch.Tensor:
@@ -1070,11 +1074,12 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         if use_cache:
-            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
-            camera_token = camera_token_full[-1:, :, :]
-
-            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
-            register_token = register_token_full[-1:, :, :]
+            # Streaming fast-path: only materialize current-frame special tokens.
+            token_sel = 0 if past_frame_idx == 0 else 1
+            camera_token = self.camera_token[:, token_sel : token_sel + 1, ...].expand(B, 1, 1, C).reshape(B * S, 1, C)
+            register_token = self.register_token[:, token_sel : token_sel + 1, ...].expand(B, 1, self.register_token.shape[2], C).reshape(
+                B * S, self.register_token.shape[2], C
+            )
         else:
             camera_token = slice_expand_and_flatten(self.camera_token, B, S)
             register_token = slice_expand_and_flatten(self.register_token, B, S)
