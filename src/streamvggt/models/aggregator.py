@@ -90,6 +90,10 @@ class Aggregator(nn.Module):
         geo_max_candidate_tokens: int = 15000,
         geo_selection_interval: int = 1,
         geo_anchor_refresh_interval: int = 1,
+        geo_anchor_replace_ratio: float = 0.25,
+        geo_anchor_min_ttl: int = 12,
+        geo_bank_coarse_stride: int = 4,
+        geo_bank_bucket_reserve: int = 1,
     ):
         super().__init__()
 
@@ -190,6 +194,10 @@ class Aggregator(nn.Module):
         self.geo_max_candidate_tokens = geo_max_candidate_tokens
         self.geo_selection_interval = geo_selection_interval
         self.geo_anchor_refresh_interval = geo_anchor_refresh_interval
+        self.geo_anchor_replace_ratio = geo_anchor_replace_ratio
+        self.geo_anchor_min_ttl = geo_anchor_min_ttl
+        self.geo_bank_coarse_stride = max(1, int(geo_bank_coarse_stride))
+        self.geo_bank_bucket_reserve = max(0, int(geo_bank_bucket_reserve))
         self.geo_identity_stride = 1 << 21
         self.geo_identity_offset = 1 << 18
         self.reset_geo_cache_state()
@@ -201,6 +209,7 @@ class Aggregator(nn.Module):
         self.geo_voxel_bank: Dict[Tuple[int, int, int], Dict[str, float]] = {}
         self.geo_anchor_voxels: set[Tuple[int, int, int]] = set()
         self.geo_anchor_voxel_list: List[Tuple[int, int, int]] = []
+        self.geo_anchor_birth: Dict[Tuple[int, int, int], int] = {}
         self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
@@ -227,6 +236,7 @@ class Aggregator(nn.Module):
         if not self.geo_voxel_bank:
             self.geo_anchor_voxels = set()
             self.geo_anchor_voxel_list = []
+            self.geo_anchor_birth = {}
             self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
             return
 
@@ -244,8 +254,76 @@ class Aggregator(nn.Module):
                 ranked.append((self._voxel_importance(item, now_frame_idx), key))
 
         ranked.sort(key=lambda x: (-x[0], x[1]))
-        self.geo_anchor_voxel_list = [k for _, k in ranked[: self.geo_anchor_voxel_budget]]
-        self.geo_anchor_voxels = set(self.geo_anchor_voxel_list)
+        candidate = [k for _, k in ranked]
+        budget = int(self.geo_anchor_voxel_budget)
+
+        if budget <= 0:
+            self.geo_anchor_voxel_list = []
+            self.geo_anchor_voxels = set()
+            self.geo_anchor_birth = {}
+        else:
+            prev = list(self.geo_anchor_voxel_list)
+            prev_set = set(prev)
+            protected_prev = []
+            for k in prev:
+                birth = int(self.geo_anchor_birth.get(k, now_frame_idx))
+                age = max(0, int(now_frame_idx) - birth)
+                if age < int(self.geo_anchor_min_ttl):
+                    protected_prev.append(k)
+
+            max_replace = max(1, int(budget * float(self.geo_anchor_replace_ratio)))
+            max_replace = min(max_replace, budget)
+
+            selected: List[Tuple[int, int, int]] = []
+            selected_set: set[Tuple[int, int, int]] = set()
+
+            for k in protected_prev:
+                if len(selected) >= budget:
+                    break
+                if k in prev_set and k in self.geo_voxel_bank and k not in selected_set:
+                    selected.append(k)
+                    selected_set.add(k)
+
+            for k in prev:
+                if len(selected) >= budget:
+                    break
+                if k in self.geo_voxel_bank and k not in selected_set:
+                    selected.append(k)
+                    selected_set.add(k)
+
+            replace_used = 0
+            for k in candidate:
+                if len(selected) >= budget:
+                    break
+                if k in selected_set:
+                    continue
+                if k not in prev_set:
+                    if replace_used >= max_replace:
+                        continue
+                    replace_used += 1
+                selected.append(k)
+                selected_set.add(k)
+
+            if len(selected) < budget:
+                for k in candidate:
+                    if len(selected) >= budget:
+                        break
+                    if k in selected_set:
+                        continue
+                    selected.append(k)
+                    selected_set.add(k)
+
+            self.geo_anchor_voxel_list = selected[:budget]
+            self.geo_anchor_voxels = set(self.geo_anchor_voxel_list)
+
+            new_birth: Dict[Tuple[int, int, int], int] = {}
+            for k in self.geo_anchor_voxel_list:
+                if k in self.geo_anchor_birth:
+                    new_birth[k] = self.geo_anchor_birth[k]
+                else:
+                    new_birth[k] = int(now_frame_idx)
+            self.geo_anchor_birth = new_birth
+
         if self.geo_anchor_voxel_list:
             vox = torch.tensor(self.geo_anchor_voxel_list, dtype=torch.long)
             self.geo_anchor_hash_tensor = self._voxel_hash(vox)
@@ -423,7 +501,31 @@ class Aggregator(nn.Module):
                 items.append((importance, key))
 
             items.sort(key=lambda x: x[0], reverse=True)
-            keep_keys = set(k for _, k in items[: self.geo_max_voxels])
+            keep_budget = int(self.geo_max_voxels)
+            keep_keys: set[Tuple[int, int, int]] = set()
+
+            # Coverage-first reserve: keep at least N representatives per coarse bucket.
+            reserve_per_bucket = int(self.geo_bank_bucket_reserve)
+            if reserve_per_bucket > 0 and keep_budget > 0:
+                coarse_s = int(self.geo_bank_coarse_stride)
+                bucket_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
+                for _, key in items:
+                    coarse_key = (key[0] // coarse_s, key[1] // coarse_s, key[2] // coarse_s)
+                    if bucket_counts[coarse_key] >= reserve_per_bucket:
+                        continue
+                    keep_keys.add(key)
+                    bucket_counts[coarse_key] += 1
+                    if len(keep_keys) >= keep_budget:
+                        break
+
+            if len(keep_keys) < keep_budget:
+                for _, key in items:
+                    if key in keep_keys:
+                        continue
+                    keep_keys.add(key)
+                    if len(keep_keys) >= keep_budget:
+                        break
+
             self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
 
         if frame_idx % self.geo_anchor_refresh_interval == 0:
