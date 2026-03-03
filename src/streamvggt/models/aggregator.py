@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import heapq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -234,6 +235,23 @@ class Aggregator(nn.Module):
             * (1.0 / (1.0 + 0.05 * age))
         )
 
+    def _active_frames_for_anchor_refresh(self, current_frame_idx: int) -> set[int]:
+        active: set[int] = {0, int(current_frame_idx)}
+        for meta in self.geo_token_meta.values():
+            fi = meta.get("frame_idx")
+            if fi is None or fi.numel() == 0:
+                continue
+            vals = torch.unique(fi).detach().cpu().tolist()
+            active.update(int(v) for v in vals)
+
+        if self.geo_max_old_frames_to_score > 0 and len(active) > self.geo_max_old_frames_to_score + 2:
+            keep = sorted(active)
+            recent_keep = keep[-self.geo_max_old_frames_to_score :]
+            active = set(recent_keep)
+            active.add(0)
+            active.add(int(current_frame_idx))
+        return active
+
     def _refresh_geo_anchor_voxels(self, now_frame_idx: int):
         if not self.geo_voxel_bank:
             self.geo_anchor_voxels = set()
@@ -256,6 +274,9 @@ class Aggregator(nn.Module):
             if conf_ok and support_ok and var_ok:
                 ranked.append((self._voxel_importance(item, now_frame_idx), key))
 
+        # Avoid full sort on the whole bank: keep only a bounded top candidate set.
+        candidate_pool = max(int(self.geo_anchor_voxel_budget) * 8, int(self.geo_anchor_voxel_budget) + 1024)
+        ranked = heapq.nlargest(candidate_pool, ranked, key=lambda x: x[0])
         ranked.sort(key=lambda x: (-x[0], x[1]))
         candidate = [k for _, k in ranked]
         budget = int(self.geo_anchor_voxel_budget)
@@ -506,42 +527,48 @@ class Aggregator(nn.Module):
 
         # Keep global bank bounded.
         if len(self.geo_voxel_bank) > self.geo_max_voxels:
-            items = []
-            for key, val in self.geo_voxel_bank.items():
-                importance = self._voxel_importance(val, frame_idx)
-                items.append((importance, key))
-
-            items.sort(key=lambda x: x[0], reverse=True)
             keep_budget = int(self.geo_max_voxels)
             keep_keys: set[Tuple[int, int, int]] = set()
+            keyed_importance: Dict[Tuple[int, int, int], float] = {}
+            for key, val in self.geo_voxel_bank.items():
+                keyed_importance[key] = self._voxel_importance(val, frame_idx)
 
             # Coverage-first reserve: keep at least N representatives per coarse bucket.
             reserve_per_bucket = int(self.geo_bank_bucket_reserve)
             if reserve_per_bucket > 0 and keep_budget > 0:
                 coarse_s = int(self.geo_bank_coarse_stride)
-                bucket_counts: Dict[Tuple[int, int, int], int] = defaultdict(int)
-                for _, key in items:
+                bucket_heaps: Dict[Tuple[int, int, int], List[Tuple[float, Tuple[int, int, int]]]] = defaultdict(list)
+                for key, importance in keyed_importance.items():
                     coarse_key = (key[0] // coarse_s, key[1] // coarse_s, key[2] // coarse_s)
-                    if bucket_counts[coarse_key] >= reserve_per_bucket:
-                        continue
-                    keep_keys.add(key)
-                    bucket_counts[coarse_key] += 1
+                    heap = bucket_heaps[coarse_key]
+                    if len(heap) < reserve_per_bucket:
+                        heapq.heappush(heap, (importance, key))
+                    elif importance > heap[0][0]:
+                        heapq.heapreplace(heap, (importance, key))
+
+                for heap in bucket_heaps.values():
+                    for _, key in heap:
+                        keep_keys.add(key)
+                        if len(keep_keys) >= keep_budget:
+                            break
                     if len(keep_keys) >= keep_budget:
                         break
 
             if len(keep_keys) < keep_budget:
-                for _, key in items:
-                    if key in keep_keys:
-                        continue
+                remain = keep_budget - len(keep_keys)
+                rest = ((importance, key) for key, importance in keyed_importance.items() if key not in keep_keys)
+                for _, key in heapq.nlargest(remain, rest, key=lambda x: x[0]):
                     keep_keys.add(key)
-                    if len(keep_keys) >= keep_budget:
-                        break
 
             self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
 
         if frame_idx % self.geo_anchor_refresh_interval == 0:
             self._refresh_geo_anchor_voxels(frame_idx)
-        self._update_frame_anchor_mask(frame_idx)
+            active_frames = self._active_frames_for_anchor_refresh(frame_idx)
+            for fidx in active_frames:
+                self._update_frame_anchor_mask(fidx)
+        else:
+            self._update_frame_anchor_mask(frame_idx)
 
     @staticmethod
     def _frustum_mask(
