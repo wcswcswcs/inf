@@ -96,6 +96,8 @@ class Aggregator(nn.Module):
         geo_bank_coarse_stride: int = 4,
         geo_bank_bucket_reserve: int = 1,
         geo_bank_trim_interval: int = 8,
+        geo_trim_scan_ratio: float = 0.25,
+        geo_trim_drop_factor: float = 4.0,
         geo_keyframe_interval: int = 24,
         geo_keyframe_max_count: int = 96,
         geo_keyframe_token_quota: int = 1024,
@@ -212,6 +214,8 @@ class Aggregator(nn.Module):
         self.geo_bank_coarse_stride = max(1, int(geo_bank_coarse_stride))
         self.geo_bank_bucket_reserve = max(0, int(geo_bank_bucket_reserve))
         self.geo_bank_trim_interval = max(1, int(geo_bank_trim_interval))
+        self.geo_trim_scan_ratio = float(min(max(geo_trim_scan_ratio, 0.05), 1.0))
+        self.geo_trim_drop_factor = max(1.0, float(geo_trim_drop_factor))
         self.geo_keyframe_interval = max(1, int(geo_keyframe_interval))
         self.geo_keyframe_max_count = max(1, int(geo_keyframe_max_count))
         self.geo_keyframe_token_quota = max(0, int(geo_keyframe_token_quota))
@@ -236,6 +240,7 @@ class Aggregator(nn.Module):
         self.geo_anchor_voxel_list: List[Tuple[int, int, int]] = []
         self.geo_anchor_birth: Dict[Tuple[int, int, int], int] = {}
         self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
+        self.geo_trim_cursor = 0
         self.geo_anchor_version = 0
         self.geo_frame_anchor_version: Dict[int, int] = {}
         self.geo_keyframes: List[int] = []
@@ -637,39 +642,36 @@ class Aggregator(nn.Module):
         )
         if do_trim:
             keep_budget = int(self.geo_max_voxels)
-            keep_keys: set[Tuple[int, int, int]] = set()
-            keyed_importance: Dict[Tuple[int, int, int], float] = {}
-            for key, val in self.geo_voxel_bank.items():
-                keyed_importance[key] = self._voxel_importance(val, frame_idx)
+            excess = max(0, len(self.geo_voxel_bank) - keep_budget)
+            if excess > 0:
+                keys_all = list(self.geo_voxel_bank.keys())
+                n_all = len(keys_all)
+                scan_size = max(
+                    int(excess * self.geo_trim_drop_factor),
+                    int(n_all * self.geo_trim_scan_ratio),
+                    min(n_all, 1024),
+                )
+                scan_size = min(n_all, scan_size)
 
-            # Coverage-first reserve: keep at least N representatives per coarse bucket.
-            reserve_per_bucket = int(self.geo_bank_bucket_reserve)
-            if reserve_per_bucket > 0 and keep_budget > 0:
-                coarse_s = int(self.geo_bank_coarse_stride)
-                bucket_heaps: Dict[Tuple[int, int, int], List[Tuple[float, Tuple[int, int, int]]]] = defaultdict(list)
-                for key, importance in keyed_importance.items():
-                    coarse_key = (key[0] // coarse_s, key[1] // coarse_s, key[2] // coarse_s)
-                    heap = bucket_heaps[coarse_key]
-                    if len(heap) < reserve_per_bucket:
-                        heapq.heappush(heap, (importance, key))
-                    elif importance > heap[0][0]:
-                        heapq.heapreplace(heap, (importance, key))
+                start = int(self.geo_trim_cursor % max(1, n_all))
+                stop = start + scan_size
+                if stop <= n_all:
+                    sample_keys = keys_all[start:stop]
+                else:
+                    sample_keys = keys_all[start:] + keys_all[: stop - n_all]
+                self.geo_trim_cursor = (start + scan_size) % max(1, n_all)
 
-                for heap in bucket_heaps.values():
-                    for _, key in heap:
-                        keep_keys.add(key)
-                        if len(keep_keys) >= keep_budget:
-                            break
-                    if len(keep_keys) >= keep_budget:
-                        break
+                protected = set(self.geo_anchor_voxel_list)
+                scored: List[Tuple[float, Tuple[int, int, int]]] = []
+                for key in sample_keys:
+                    if key in protected:
+                        continue
+                    scored.append((self._voxel_importance(self.geo_voxel_bank[key], frame_idx), key))
 
-            if len(keep_keys) < keep_budget:
-                remain = keep_budget - len(keep_keys)
-                rest = ((importance, key) for key, importance in keyed_importance.items() if key not in keep_keys)
-                for _, key in heapq.nlargest(remain, rest, key=lambda x: x[0]):
-                    keep_keys.add(key)
-
-            self.geo_voxel_bank = {k: v for k, v in self.geo_voxel_bank.items() if k in keep_keys}
+                if scored:
+                    drop_n = min(excess, len(scored))
+                    for _, key in heapq.nsmallest(drop_n, scored, key=lambda x: x[0]):
+                        self.geo_voxel_bank.pop(key, None)
 
         if frame_idx % self.geo_anchor_refresh_interval == 0:
             self._refresh_geo_anchor_voxels(frame_idx)
@@ -945,11 +947,16 @@ class Aggregator(nn.Module):
         if idx.numel() == 0:
             return torch.empty((0,), dtype=torch.long)
 
-        capped_identities = set(self._build_identity_keep_from_meta(meta, idx).tolist())
-        out = [int(key) for key in identity_keep.detach().cpu().long().tolist() if int(key) in capped_identities]
-        if not out:
+        gid = meta.get("global_id", torch.empty((0,), dtype=torch.long))
+        if gid.numel() == 0:
             return torch.empty((0,), dtype=torch.long)
-        return torch.tensor(out, dtype=torch.long)
+        chosen_gid = torch.unique(gid.index_select(0, idx.detach().cpu().long()), sorted=False)
+        identity_keep_cpu = identity_keep.detach().cpu().long()
+        keep_mask = torch.isin(identity_keep_cpu, chosen_gid)
+        out = identity_keep_cpu[keep_mask]
+        if out.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+        return out
 
     @staticmethod
     def _ensure_identity_lookup(meta: Dict[str, torch.Tensor]):
@@ -1032,6 +1039,35 @@ class Aggregator(nn.Module):
             or conf_drop >= self.geo_full_select_conf_drop
             or new_voxel_ratio >= self.geo_full_select_new_voxel_ratio
         )
+
+    @staticmethod
+    def _multiscale_old_frame_sample(sorted_frames: torch.Tensor, max_count: int) -> torch.Tensor:
+        if sorted_frames.numel() <= max_count:
+            return sorted_frames
+        if max_count <= 1:
+            return sorted_frames[-1:]
+
+        max_count = int(max_count)
+        near = max(1, max_count // 2)
+        far = max_count - near
+        out = [int(v) for v in sorted_frames[-near:].tolist()]
+
+        older = sorted_frames[:-near]
+        if far > 0 and older.numel() > 0:
+            older_len = int(older.numel())
+            # Log-spaced picks from far history.
+            pos = torch.unique(
+                torch.clamp(
+                    torch.floor(torch.logspace(0, 1, steps=far, base=max(10.0, float(older_len + 1))) - 1).long(),
+                    min=0,
+                    max=max(0, older_len - 1),
+                ),
+                sorted=True,
+            )
+            for p in pos.tolist():
+                out.append(int(older[p].item()))
+
+        return torch.unique(torch.tensor(out, dtype=torch.long), sorted=True)
 
     def _select_keyframe_tokens_stratified(
         self,
@@ -1272,7 +1308,10 @@ class Aggregator(nn.Module):
         if self.geo_max_old_frames_to_score > 0:
             uniq = torch.unique(frame_idx[candidate_indices])
             if uniq.numel() > self.geo_max_old_frames_to_score:
-                keep_frames = uniq.sort().values[-self.geo_max_old_frames_to_score :]
+                keep_frames = self._multiscale_old_frame_sample(
+                    uniq.sort().values,
+                    int(self.geo_max_old_frames_to_score),
+                )
                 keep_mask = (frame_idx[candidate_indices].unsqueeze(1) == keep_frames.unsqueeze(0)).any(dim=1)
                 candidate_indices = candidate_indices[keep_mask]
 
