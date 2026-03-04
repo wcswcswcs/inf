@@ -263,21 +263,27 @@ class Aggregator(nn.Module):
         )
 
     def _active_frames_for_anchor_refresh(self, current_frame_idx: int) -> set[int]:
-        active: set[int] = {0, int(current_frame_idx)}
-        active.update(int(v) for v in self.geo_keyframes)
+        current_frame_idx = int(current_frame_idx)
+        must_keep: set[int] = {0, current_frame_idx}
+        must_keep.update(int(v) for v in self.geo_keyframes)
+
+        kv_frames: set[int] = set()
         for meta in self.geo_token_meta.values():
             fi = meta.get("frame_idx")
             if fi is None or fi.numel() == 0:
                 continue
             vals = torch.unique(fi).detach().cpu().tolist()
-            active.update(int(v) for v in vals)
+            kv_frames.update(int(v) for v in vals)
 
-        if self.geo_max_old_frames_to_score > 0 and len(active) > self.geo_max_old_frames_to_score + 2:
-            keep = sorted(active)
-            recent_keep = keep[-self.geo_max_old_frames_to_score :]
-            active = set(recent_keep)
-            active.add(0)
-            active.add(int(current_frame_idx))
+        must_keep.update(kv_frames)
+
+        # Optional extras: only keep a bounded recent tail of non-critical history.
+        optional = sorted(k for k in self.geo_frame_meta.keys() if int(k) not in must_keep)
+        if self.geo_max_old_frames_to_score > 0 and len(optional) > self.geo_max_old_frames_to_score:
+            optional = optional[-self.geo_max_old_frames_to_score :]
+
+        active = set(must_keep)
+        active.update(int(v) for v in optional)
         return active
 
     def _refresh_geo_anchor_voxels(self, now_frame_idx: int):
@@ -506,16 +512,22 @@ class Aggregator(nn.Module):
         self._update_geo_keyframes(frame_idx)
 
         # Update global voxel landmark bank (conf/support/stability/recency)
-        voxel_to_idx: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
-        for i in range(voxel_ids.shape[0]):
-            key = tuple(int(v) for v in voxel_ids[i].tolist())
-            voxel_to_idx[key].append(i)
+        uniq_vox, inverse, counts = torch.unique(
+            voxel_ids.to(torch.long), dim=0, return_inverse=True, return_counts=True
+        )
+        num_groups = int(uniq_vox.shape[0])
+        conf_sum = torch.zeros((num_groups,), dtype=torch.float32)
+        conf_sum.index_add_(0, inverse, conf_flat.to(torch.float32))
+        pts_sum = torch.zeros((num_groups, 3), dtype=torch.float32)
+        pts_sum.index_add_(0, inverse, pts_flat.to(torch.float32))
+        counts_f = counts.to(torch.float32).clamp_min(1.0)
+        conf_mean_all = conf_sum / counts_f
+        pos_mean_all = pts_sum / counts_f.unsqueeze(1)
 
-        for key, idxs in voxel_to_idx.items():
-            pts_cur = pts_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
-            conf_cur = conf_flat.index_select(0, torch.tensor(idxs, dtype=torch.long))
-            conf_mean = float(conf_cur.mean().item())
-            pos_mean = pts_cur.mean(dim=0)
+        for g in range(num_groups):
+            key = tuple(int(v) for v in uniq_vox[g].tolist())
+            conf_mean = float(conf_mean_all[g].item())
+            pos_mean = pos_mean_all[g]
 
             if key not in self.geo_voxel_bank:
                 self.geo_voxel_bank[key] = {
