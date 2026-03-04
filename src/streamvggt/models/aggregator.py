@@ -109,6 +109,9 @@ class Aggregator(nn.Module):
         geo_full_select_conf_drop: float = 0.15,
         geo_full_select_new_voxel_ratio: float = 0.25,
         geo_keyframe_protected_quota: int = 256,
+        geo_warmup_frames: int = 8,
+        geo_warmup_local_budget_ratio: float = 1.0,
+        geo_frame_meta_recent_keep: int = 64,
     ):
         super().__init__()
 
@@ -227,6 +230,9 @@ class Aggregator(nn.Module):
         self.geo_full_select_conf_drop = max(0.0, float(geo_full_select_conf_drop))
         self.geo_full_select_new_voxel_ratio = max(0.0, float(geo_full_select_new_voxel_ratio))
         self.geo_keyframe_protected_quota = max(0, int(geo_keyframe_protected_quota))
+        self.geo_warmup_frames = max(0, int(geo_warmup_frames))
+        self.geo_warmup_local_budget_ratio = float(min(max(geo_warmup_local_budget_ratio, 0.0), 1.0))
+        self.geo_frame_meta_recent_keep = max(8, int(geo_frame_meta_recent_keep))
         self.geo_identity_stride = 1 << 21
         self.geo_identity_offset = 1 << 18
         self.reset_geo_cache_state()
@@ -307,6 +313,27 @@ class Aggregator(nn.Module):
         active = set(must_keep)
         active.update(int(v) for v in optional)
         return active
+
+    def _prune_geo_frame_meta(self, current_frame_idx: int):
+        if not self.geo_frame_meta:
+            return
+
+        keep: set[int] = {0, int(current_frame_idx)}
+        recent_min = max(0, int(current_frame_idx) - int(self.geo_frame_meta_recent_keep))
+        keep.update(int(f) for f in self.geo_frame_meta.keys() if int(f) >= recent_min)
+        keep.update(int(f) for f in self.geo_keyframes)
+
+        for meta in self.geo_token_meta.values():
+            fi = meta.get("frame_idx")
+            if fi is None or fi.numel() == 0:
+                continue
+            keep.update(int(v) for v in torch.unique(fi).detach().cpu().tolist())
+
+        drop = [int(f) for f in self.geo_frame_meta.keys() if int(f) not in keep]
+        for f in drop:
+            self.geo_frame_meta.pop(f, None)
+            self.geo_frame_anchor_mask.pop(f, None)
+            self.geo_frame_anchor_version.pop(f, None)
 
     def _refresh_geo_anchor_voxels(self, now_frame_idx: int):
         if not self.geo_voxel_bank:
@@ -681,6 +708,8 @@ class Aggregator(nn.Module):
         else:
             self._update_frame_anchor_mask(frame_idx)
 
+        self._prune_geo_frame_meta(frame_idx)
+
         return {
             "new_voxel_ratio": float(new_voxels) / max(1.0, float(num_groups)),
         }
@@ -1025,7 +1054,7 @@ class Aggregator(nn.Module):
         current_frame_idx: int,
         current_view: Optional[Dict[str, Any]],
     ) -> bool:
-        if current_frame_idx == 0:
+        if current_frame_idx <= int(self.geo_warmup_frames):
             return True
         if current_frame_idx % int(self.geo_keyframe_interval) == 0:
             return True
@@ -1217,8 +1246,11 @@ class Aggregator(nn.Module):
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
         if max_past_tokens is not None:
             recent_frames_count = max(1, int(torch.unique(frame_idx[recent_mask]).numel()))
+            local_ratio = float(self.geo_local_budget_ratio)
+            if current_frame_idx <= int(self.geo_warmup_frames):
+                local_ratio = max(local_ratio, float(self.geo_warmup_local_budget_ratio))
             local_budget = min(
-                int(max_past_tokens * self.geo_local_budget_ratio),
+                int(max_past_tokens * local_ratio),
                 int(self.geo_local_budget_cap_per_frame) * recent_frames_count,
             )
         else:
