@@ -143,6 +143,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if use_geo_kv_prune:
             self.aggregator.reset_geo_cache_state()
         current_view = None
+        prev_world_to_cam_cpu = None
+        prev_conf_mean = None
         model_device = next(self.parameters()).device
 
         all_ress = []
@@ -209,12 +211,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     # Keep pruning view metadata on CPU to avoid repeated per-layer GPU->CPU transfers.
                     world_to_cam_cpu = world_to_cam.detach().cpu()
                     intrinsic_cpu = intrinsic_cur.detach().cpu() if intrinsic_cur is not None else None
-                    current_view = {
-                        "world_to_cam": world_to_cam_cpu,
-                        "intrinsic": intrinsic_cpu,
-                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
-                    }
-                    self.aggregator.update_geo_frame_metadata(
+                    pose_delta = 0.0
+                    if prev_world_to_cam_cpu is not None:
+                        pose_delta = float((world_to_cam_cpu[:, :3, 3] - prev_world_to_cam_cpu[:, :3, 3]).norm(dim=-1).mean().item())
+
+                    conf_mean = float(pts3d_conf.detach().to(torch.float32).mean().item())
+                    conf_drop = 0.0 if prev_conf_mean is None else max(0.0, float(prev_conf_mean - conf_mean))
+
+                    geo_meta_stats = self.aggregator.update_geo_frame_metadata(
                         frame_idx=i,
                         pts3d=pts3d.detach(),
                         conf=pts3d_conf.detach(),
@@ -222,6 +226,17 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                         intrinsic=intrinsic_cpu,
                         voxel_size=geo_voxel_size,
                     )
+
+                    current_view = {
+                        "world_to_cam": world_to_cam_cpu,
+                        "intrinsic": intrinsic_cpu,
+                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
+                        "pose_delta": pose_delta,
+                        "conf_drop": conf_drop,
+                        "new_voxel_ratio": float(geo_meta_stats.get("new_voxel_ratio", 0.0)),
+                    }
+                    prev_world_to_cam_cpu = world_to_cam_cpu
+                    prev_conf_mean = conf_mean
 
                 if self.track_head is not None and query_points is not None:
                     track_list, vis, conf = self.track_head(

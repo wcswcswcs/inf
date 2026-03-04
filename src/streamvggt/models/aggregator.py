@@ -89,8 +89,8 @@ class Aggregator(nn.Module):
         geo_anchor_invisible_read_weight: float = 0.5,
         geo_max_old_frames_to_score: int = 24,
         geo_max_candidate_tokens: int = 15000,
-        geo_selection_interval: int = 1,
-        geo_anchor_refresh_interval: int = 1,
+        geo_selection_interval: int = 3,
+        geo_anchor_refresh_interval: int = 4,
         geo_anchor_replace_ratio: float = 0.25,
         geo_anchor_min_ttl: int = 12,
         geo_bank_coarse_stride: int = 4,
@@ -99,6 +99,14 @@ class Aggregator(nn.Module):
         geo_keyframe_interval: int = 24,
         geo_keyframe_max_count: int = 96,
         geo_keyframe_token_quota: int = 1024,
+        geo_keyframe_time_bins: int = 4,
+        geo_anchor_stable_ratio: float = 0.6,
+        geo_anchor_adaptive_age_decay: float = 0.05,
+        geo_anchor_stable_age_decay: float = 0.005,
+        geo_full_select_pose_delta: float = 0.15,
+        geo_full_select_conf_drop: float = 0.15,
+        geo_full_select_new_voxel_ratio: float = 0.25,
+        geo_keyframe_protected_quota: int = 256,
     ):
         super().__init__()
 
@@ -207,6 +215,14 @@ class Aggregator(nn.Module):
         self.geo_keyframe_interval = max(1, int(geo_keyframe_interval))
         self.geo_keyframe_max_count = max(1, int(geo_keyframe_max_count))
         self.geo_keyframe_token_quota = max(0, int(geo_keyframe_token_quota))
+        self.geo_keyframe_time_bins = max(1, int(geo_keyframe_time_bins))
+        self.geo_anchor_stable_ratio = float(min(max(geo_anchor_stable_ratio, 0.0), 1.0))
+        self.geo_anchor_adaptive_age_decay = max(0.0, float(geo_anchor_adaptive_age_decay))
+        self.geo_anchor_stable_age_decay = max(0.0, float(geo_anchor_stable_age_decay))
+        self.geo_full_select_pose_delta = max(0.0, float(geo_full_select_pose_delta))
+        self.geo_full_select_conf_drop = max(0.0, float(geo_full_select_conf_drop))
+        self.geo_full_select_new_voxel_ratio = max(0.0, float(geo_full_select_new_voxel_ratio))
+        self.geo_keyframe_protected_quota = max(0, int(geo_keyframe_protected_quota))
         self.geo_identity_stride = 1 << 21
         self.geo_identity_offset = 1 << 18
         self.reset_geo_cache_state()
@@ -253,13 +269,14 @@ class Aggregator(nn.Module):
                 break
             self.geo_keyframe_set.discard(drop)
 
-    def _voxel_importance(self, item: Dict[str, float], now_frame_idx: int) -> float:
+    def _voxel_importance(self, item: Dict[str, float], now_frame_idx: int, age_decay: Optional[float] = None) -> float:
         age = max(0.0, float(now_frame_idx) - float(item["last_seen"]))
+        decay = self.geo_anchor_adaptive_age_decay if age_decay is None else max(0.0, float(age_decay))
         return (
             float(item["conf_ema"])
             * torch.log1p(torch.tensor(float(item["support"]))).item()
             * (1.0 / (1.0 + float(item["pos_var"])))
-            * (1.0 / (1.0 + 0.05 * age))
+            * (1.0 / (1.0 + decay * age))
         )
 
     def _active_frames_for_anchor_refresh(self, current_frame_idx: int) -> set[int]:
@@ -296,7 +313,8 @@ class Aggregator(nn.Module):
             return
 
         prev_anchors = self.geo_anchor_voxels
-        ranked = []
+        stable_ranked = []
+        adaptive_ranked = []
         for key, item in self.geo_voxel_bank.items():
             conf_ema = float(item["conf_ema"])
             support = float(item["support"])
@@ -306,14 +324,47 @@ class Aggregator(nn.Module):
             support_ok = support >= self.geo_anchor_min_support
             var_ok = pos_var <= self.geo_anchor_max_pos_var
             if conf_ok and support_ok and var_ok:
-                ranked.append((self._voxel_importance(item, now_frame_idx), key))
+                stable_ranked.append((self._voxel_importance(item, now_frame_idx, self.geo_anchor_stable_age_decay), key))
+                adaptive_ranked.append((self._voxel_importance(item, now_frame_idx, self.geo_anchor_adaptive_age_decay), key))
 
         # Avoid full sort on the whole bank: keep only a bounded top candidate set.
         candidate_pool = max(int(self.geo_anchor_voxel_budget) * 8, int(self.geo_anchor_voxel_budget) + 1024)
-        ranked = heapq.nlargest(candidate_pool, ranked, key=lambda x: x[0])
-        ranked.sort(key=lambda x: (-x[0], x[1]))
-        candidate = [k for _, k in ranked]
         budget = int(self.geo_anchor_voxel_budget)
+        stable_budget = min(budget, max(0, int(round(budget * self.geo_anchor_stable_ratio))))
+        adaptive_budget = max(0, budget - stable_budget)
+
+        stable_candidates = heapq.nlargest(candidate_pool, stable_ranked, key=lambda x: x[0])
+        adaptive_candidates = heapq.nlargest(candidate_pool, adaptive_ranked, key=lambda x: x[0])
+        stable_candidates.sort(key=lambda x: (-x[0], x[1]))
+        adaptive_candidates.sort(key=lambda x: (-x[0], x[1]))
+
+        candidate: List[Tuple[int, int, int]] = []
+        seen_candidate: set[Tuple[int, int, int]] = set()
+        for _, key in stable_candidates:
+            if key in seen_candidate:
+                continue
+            candidate.append(key)
+            seen_candidate.add(key)
+            if len(candidate) >= stable_budget:
+                break
+
+        if adaptive_budget > 0:
+            for _, key in adaptive_candidates:
+                if key in seen_candidate:
+                    continue
+                candidate.append(key)
+                seen_candidate.add(key)
+                if len(candidate) >= budget:
+                    break
+
+        if len(candidate) < budget:
+            for _, key in stable_candidates:
+                if key in seen_candidate:
+                    continue
+                candidate.append(key)
+                seen_candidate.add(key)
+                if len(candidate) >= budget:
+                    break
 
         if budget <= 0:
             self.geo_anchor_voxel_list = []
@@ -480,16 +531,16 @@ class Aggregator(nn.Module):
         world_to_cam: Optional[torch.Tensor],
         intrinsic: Optional[torch.Tensor],
         voxel_size: float,
-    ):
+    ) -> Dict[str, float]:
         if pts3d is None or conf is None:
-            return
+            return {"new_voxel_ratio": 0.0}
         if pts3d.ndim != 4 or conf.ndim != 3:
-            return
+            return {"new_voxel_ratio": 0.0}
 
         _, H, W, _ = pts3d.shape
         gh, gw = H // self.patch_size, W // self.patch_size
         if gh <= 0 or gw <= 0:
-            return
+            return {"new_voxel_ratio": 0.0}
 
         pts_patch = F.adaptive_avg_pool2d(pts3d.permute(0, 3, 1, 2), (gh, gw)).permute(0, 2, 3, 1)
         conf_patch = F.adaptive_avg_pool2d(conf.unsqueeze(1), (gh, gw)).squeeze(1)
@@ -524,12 +575,14 @@ class Aggregator(nn.Module):
         conf_mean_all = conf_sum / counts_f
         pos_mean_all = pts_sum / counts_f.unsqueeze(1)
 
+        new_voxels = 0
         for g in range(num_groups):
             key = tuple(int(v) for v in uniq_vox[g].tolist())
             conf_mean = float(conf_mean_all[g].item())
             pos_mean = pos_mean_all[g]
 
             if key not in self.geo_voxel_bank:
+                new_voxels += 1
                 self.geo_voxel_bank[key] = {
                     "conf_ema": conf_mean,
                     "support": 1.0,
@@ -617,6 +670,10 @@ class Aggregator(nn.Module):
                 self._update_frame_anchor_mask(fidx)
         else:
             self._update_frame_anchor_mask(frame_idx)
+
+        return {
+            "new_voxel_ratio": float(new_voxels) / max(1.0, float(num_groups)),
+        }
 
     @staticmethod
     def _frustum_mask(
@@ -920,6 +977,89 @@ class Aggregator(nn.Module):
             return torch.empty((0,), dtype=torch.long)
         return gid_pos.index_select(0, where[matched])
 
+    def _should_force_full_geo_selection(
+        self,
+        current_frame_idx: int,
+        current_view: Optional[Dict[str, Any]],
+    ) -> bool:
+        if current_frame_idx == 0:
+            return True
+        if current_frame_idx % int(self.geo_keyframe_interval) == 0:
+            return True
+        if current_view is None:
+            return False
+        pose_delta = float(current_view.get("pose_delta", 0.0) or 0.0)
+        conf_drop = float(current_view.get("conf_drop", 0.0) or 0.0)
+        new_voxel_ratio = float(current_view.get("new_voxel_ratio", 0.0) or 0.0)
+        return (
+            pose_delta >= self.geo_full_select_pose_delta
+            or conf_drop >= self.geo_full_select_conf_drop
+            or new_voxel_ratio >= self.geo_full_select_new_voxel_ratio
+        )
+
+    def _select_keyframe_tokens_stratified(
+        self,
+        meta: Dict[str, torch.Tensor],
+        keyframe_patch_idx: torch.Tensor,
+        quota: int,
+    ) -> torch.Tensor:
+        if quota <= 0 or keyframe_patch_idx.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+
+        frame_idx = meta["frame_idx"]
+        local_idx = meta["local_patch_idx"]
+        token_frame = frame_idx.index_select(0, keyframe_patch_idx)
+        unique_frames = torch.unique(token_frame).sort().values
+        if unique_frames.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+
+        bin_count = min(int(self.geo_keyframe_time_bins), int(unique_frames.numel()), int(quota))
+        frame_chunks = torch.chunk(unique_frames, bin_count)
+        weights = torch.arange(1, bin_count + 1, dtype=torch.float32)
+        raw_alloc = weights / weights.sum() * float(quota)
+        alloc = torch.floor(raw_alloc).to(torch.long)
+        alloc = torch.maximum(alloc, torch.ones_like(alloc))
+        while int(alloc.sum().item()) > int(quota):
+            for i in range(bin_count):
+                if alloc[i] > 1 and int(alloc.sum().item()) > int(quota):
+                    alloc[i] -= 1
+        extra = int(quota - int(alloc.sum().item()))
+        b = bin_count - 1
+        while extra > 0:
+            alloc[b] += 1
+            extra -= 1
+            b = max(0, b - 1)
+
+        selected: List[int] = []
+        for i, frames_bin in enumerate(frame_chunks):
+            q_bin = int(alloc[i].item())
+            if q_bin <= 0 or frames_bin.numel() == 0:
+                continue
+            in_bin = (token_frame.unsqueeze(1) == frames_bin.unsqueeze(0)).any(dim=1)
+            idx_bin = keyframe_patch_idx[in_bin]
+            if idx_bin.numel() == 0:
+                continue
+
+            frame_bin = frame_idx.index_select(0, idx_bin)
+            local_bin = local_idx.index_select(0, idx_bin).long()
+            score = torch.zeros((idx_bin.numel(),), dtype=torch.float32)
+            for j in range(idx_bin.numel()):
+                f = int(frame_bin[j].item())
+                lp = int(local_bin[j].item())
+                fm = self.geo_frame_meta.get(f)
+                if fm is not None and 0 <= lp < int(fm["conf"].shape[0]):
+                    score[j] = float(fm["conf"][lp].item())
+                else:
+                    score[j] = float(f)
+
+            k = min(q_bin, int(idx_bin.numel()))
+            top = torch.topk(score, k=k, largest=True).indices
+            selected.extend(idx_bin.index_select(0, top).tolist())
+
+        if not selected:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.unique(torch.tensor(selected, dtype=torch.long), sorted=True)
+
     def _select_geo_active_indices(
         self,
         meta: Dict[str, torch.Tensor],
@@ -975,18 +1115,21 @@ class Aggregator(nn.Module):
         # Reserve sparse keyframe tokens to preserve long-horizon constraints.
         keyframe_patch_idx = torch.nonzero(is_keyframe & (~is_special) & (~frame0_mask) & (local_idx >= 0), as_tuple=False).flatten()
         if keyframe_patch_idx.numel() > 0 and int(self.geo_keyframe_token_quota) > 0:
-            kf_frames = frame_idx.index_select(0, keyframe_patch_idx)
-            order = torch.argsort(kf_frames, descending=True)
-            keyframe_patch_idx = keyframe_patch_idx.index_select(0, order)
-            keyframe_patch_idx = keyframe_patch_idx[: int(self.geo_keyframe_token_quota)]
-            selected.update(keyframe_patch_idx.tolist())
+            keyframe_keep = self._select_keyframe_tokens_stratified(
+                meta,
+                keyframe_patch_idx,
+                quota=int(self.geo_keyframe_token_quota),
+            )
+            selected.update(keyframe_keep.tolist())
 
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         recent_min = max(0, current_frame_idx - int(recent_frames))
         recent_mask = frame_idx >= recent_min
 
-        # Optional fast-path (disabled by default, can be enabled by setting geo_selection_interval>1).
-        if self.geo_selection_interval > 1 and (current_frame_idx % self.geo_selection_interval != 0):
+        force_full_select = self._should_force_full_geo_selection(current_frame_idx, current_view)
+
+        # Optional fast-path (event/interval gated): only run full geo selection on key/unstable frames.
+        if self.geo_selection_interval > 1 and (not force_full_select) and (current_frame_idx % self.geo_selection_interval != 0):
             recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
             selected.update(recent_idx)
             keep_fast = torch.tensor(sorted(selected), dtype=torch.long)
