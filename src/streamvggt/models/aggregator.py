@@ -553,8 +553,16 @@ class Aggregator(nn.Module):
             "pts": pts_flat,
             "conf": conf_flat,
             "voxel_ids": voxel_ids,
-            "world_to_cam": world_to_cam.detach().cpu() if world_to_cam is not None else None,
-            "intrinsic": intrinsic.detach().cpu() if intrinsic is not None else None,
+            "world_to_cam": world_to_cam.detach().cpu()
+            if (world_to_cam is not None and world_to_cam.device.type != "cpu")
+            else world_to_cam.detach()
+            if world_to_cam is not None
+            else None,
+            "intrinsic": intrinsic.detach().cpu()
+            if (intrinsic is not None and intrinsic.device.type != "cpu")
+            else intrinsic.detach()
+            if intrinsic is not None
+            else None,
         }
         self.geo_frame_meta[frame_idx] = meta
         self.geo_frame_anchor_mask[frame_idx] = torch.zeros((voxel_ids.shape[0],), dtype=torch.bool)
@@ -946,36 +954,64 @@ class Aggregator(nn.Module):
     @staticmethod
     def _ensure_identity_lookup(meta: Dict[str, torch.Tensor]):
         gid = meta.get("global_id", torch.empty((0,), dtype=torch.long))
+        gid_len = int(gid.numel())
         if gid.numel() == 0:
-            meta["_gid_sorted"] = torch.empty((0,), dtype=torch.long)
-            meta["_gid_pos"] = torch.empty((0,), dtype=torch.long)
+            meta["_gid_to_pos"] = {}
+            meta["_gid_len"] = 0
             return
-        if "_gid_sorted" in meta and "_gid_pos" in meta and meta["_gid_sorted"].numel() == gid.numel():
+        if "_gid_to_pos" in meta and int(meta.get("_gid_len", -1)) == gid_len:
             return
-        order = torch.argsort(gid)
-        meta["_gid_sorted"] = gid.index_select(0, order)
-        meta["_gid_pos"] = order
+
+        gid_to_pos: Dict[int, int] = {}
+        for i, g in enumerate(gid.detach().cpu().long().tolist()):
+            gid_to_pos[int(g)] = i
+        meta["_gid_to_pos"] = gid_to_pos
+        meta["_gid_len"] = gid_len
 
     @staticmethod
     def _identity_keep_to_index(meta: Dict[str, torch.Tensor], identity_keep: torch.Tensor) -> torch.Tensor:
         if identity_keep is None or identity_keep.numel() == 0:
             return torch.empty(0, dtype=torch.long)
         Aggregator._ensure_identity_lookup(meta)
-        gid_sorted = meta.get("_gid_sorted", torch.empty((0,), dtype=torch.long))
-        gid_pos = meta.get("_gid_pos", torch.empty((0,), dtype=torch.long))
-        if gid_sorted.numel() == 0:
+        gid_to_pos = meta.get("_gid_to_pos", {})
+        if not gid_to_pos:
             return torch.empty(0, dtype=torch.long)
-        keys = torch.unique(identity_keep.detach().cpu().long(), sorted=True)
-        where = torch.searchsorted(gid_sorted, keys)
-        valid = where < gid_sorted.numel()
-        if valid.sum().item() == 0:
+
+        out: List[int] = []
+        seen = set()
+        for key in identity_keep.detach().cpu().long().tolist():
+            k = int(key)
+            if k in seen:
+                continue
+            seen.add(k)
+            if k in gid_to_pos:
+                out.append(int(gid_to_pos[k]))
+        if not out:
             return torch.empty((0,), dtype=torch.long)
-        where = where[valid]
-        keys_v = keys[valid]
-        matched = gid_sorted.index_select(0, where) == keys_v
-        if matched.sum().item() == 0:
+        return torch.tensor(out, dtype=torch.long)
+
+    @staticmethod
+    def _group_topk_by_hash(
+        voxel_hash: torch.Tensor,
+        scores: torch.Tensor,
+        token_idx: torch.Tensor,
+        topk_per_voxel: int,
+    ) -> torch.Tensor:
+        if voxel_hash.numel() == 0 or token_idx.numel() == 0 or topk_per_voxel <= 0:
             return torch.empty((0,), dtype=torch.long)
-        return gid_pos.index_select(0, where[matched])
+
+        order_score = torch.argsort(scores, descending=True, stable=True)
+        h = voxel_hash.index_select(0, order_score)
+        idx = token_idx.index_select(0, order_score)
+
+        order_hash = torch.argsort(h, stable=True)
+        h = h.index_select(0, order_hash)
+        idx = idx.index_select(0, order_hash)
+
+        _, counts = torch.unique_consecutive(h, return_counts=True)
+        starts = torch.cumsum(counts, dim=0) - counts
+        rank = torch.arange(h.numel(), dtype=torch.long) - torch.repeat_interleave(starts, counts)
+        return idx[rank < int(topk_per_voxel)]
 
     def _should_force_full_geo_selection(
         self,
@@ -1246,9 +1282,11 @@ class Aggregator(nn.Module):
             order = torch.argsort(cf)
             candidate_indices = candidate_indices.index_select(0, order)[-self.geo_max_candidate_tokens :]
 
-        # Global per-voxel top-k across all old frames (avoid per-frame duplicates)
-        bucket: Dict[Tuple[int, int, int], List[Tuple[float, int]]] = defaultdict(list)
-        bucket_conf_proxy: List[float] = []
+        # Global per-voxel top-k across all old frames (tensorized grouping to reduce Python overhead).
+        gather_idx: List[torch.Tensor] = []
+        gather_score: List[torch.Tensor] = []
+        gather_bank_conf: List[torch.Tensor] = []
+        gather_voxel_hash: List[torch.Tensor] = []
         candidate_count = int(candidate_indices.numel())
         visible_total = 0
 
@@ -1282,68 +1320,119 @@ class Aggregator(nn.Module):
                 far=far,
                 img_hw=img_hw,
             )
-            visible_count = int(visible.sum().item())
-            visible_total += visible_count
-            for j in range(in_frame.numel()):
-                gidx = int(in_frame[j].item())
-                key = tuple(int(v) for v in vox[j].tolist())
+            visible_total += int(visible.sum().item())
 
+            bank_conf_l: List[float] = []
+            bank_support_l: List[float] = []
+            bank_var_l: List[float] = []
+            is_anchor_vox_l: List[bool] = []
+            for key in (tuple(int(v) for v in row) for row in vox.tolist()):
                 bank = self.geo_voxel_bank.get(key)
                 if bank is None:
-                    bank_conf = float(conf[j].item())
-                    bank_support = 1.0
-                    bank_var = 0.0
+                    bank_conf_l.append(0.0)
+                    bank_support_l.append(1.0)
+                    bank_var_l.append(0.0)
                 else:
-                    bank_conf = float(bank["conf_ema"])
-                    bank_support = float(bank["support"])
-                    bank_var = float(bank["pos_var"])
-                bucket_conf_proxy.append(bank_conf)
+                    bank_conf_l.append(float(bank["conf_ema"]))
+                    bank_support_l.append(float(bank["support"]))
+                    bank_var_l.append(float(bank["pos_var"]))
+                is_anchor_vox_l.append(key in self.geo_anchor_voxels)
 
-                stability = 1.0 / (1.0 + bank_var)
-                support_gain = torch.log1p(torch.tensor(bank_support)).item()
-                base_score = max(float(conf[j].item()), 1e-6) * max(bank_conf, 1e-6) * support_gain * stability
-                if bool(visible[j].item()):
-                    vis_weight = 1.0
-                else:
-                    vis_weight = (
-                        self.geo_anchor_invisible_read_weight
-                        if key in self.geo_anchor_voxels
-                        else self.geo_invisible_read_weight
-                    )
-                score = base_score * vis_weight
+            bank_conf_t = torch.tensor(bank_conf_l, dtype=torch.float32)
+            bank_support_t = torch.tensor(bank_support_l, dtype=torch.float32)
+            bank_var_t = torch.tensor(bank_var_l, dtype=torch.float32)
+            anchor_vox_t = torch.tensor(is_anchor_vox_l, dtype=torch.bool)
 
-                # bucket threshold is adaptive to avoid empty/overcrowded bucket.
-                bucket[key].append((score, gidx, bank_conf))
+            conf_safe = conf.to(torch.float32).clamp_min(1e-6)
+            bank_conf_eff = torch.where(bank_conf_t > 0, bank_conf_t, conf_safe)
+            support_gain = torch.log1p(bank_support_t)
+            stability = (1.0 / (1.0 + bank_var_t)).to(torch.float32)
+            base_score = conf_safe * bank_conf_eff.clamp_min(1e-6) * support_gain * stability
+            vis_weight = torch.where(
+                visible,
+                torch.ones_like(base_score),
+                torch.where(
+                    anchor_vox_t,
+                    torch.full_like(base_score, float(self.geo_anchor_invisible_read_weight)),
+                    torch.full_like(base_score, float(self.geo_invisible_read_weight)),
+                ),
+            )
+            score_t = base_score * vis_weight
+
+            gather_idx.append(in_frame.to(torch.long))
+            gather_score.append(score_t)
+            gather_bank_conf.append(bank_conf_eff)
+            gather_voxel_hash.append(self._voxel_hash(vox))
+
+        if not gather_idx:
+            return torch.tensor(sorted(selected), dtype=torch.long)
+
+        idx_all = torch.cat(gather_idx, dim=0)
+        score_all = torch.cat(gather_score, dim=0)
+        bank_conf_all = torch.cat(gather_bank_conf, dim=0)
+        hash_all = torch.cat(gather_voxel_hash, dim=0)
 
         # Adaptive bucket threshold to control bucket size.
         remaining_budget = None
         if max_past_tokens is not None:
             remaining_budget = max(0, int(max_past_tokens) - len(selected))
-        tau_bucket = self._compute_dynamic_bucket_threshold(bucket_conf_proxy, remaining_budget or 0)
+        tau_bucket = self._compute_dynamic_bucket_threshold(bank_conf_all.tolist(), remaining_budget or 0)
 
         # Global anchor quota from ordered anchor list (deterministic).
         anchor_count = 0
+        selected_global: set[int] = set()
         if self.geo_anchor_voxel_list:
             anchor_quota = int(self.geo_anchor_read_quota)
             if max_past_tokens is not None:
                 anchor_quota = min(anchor_quota, max(0, int(max_past_tokens * self.geo_anchor_budget_ratio)))
+
+            anchor_hash_to_best: Dict[int, Tuple[float, int]] = {}
+            valid_anchor = bank_conf_all >= float(self.geo_anchor_conf_exit)
+            if valid_anchor.any():
+                idx_v = idx_all[valid_anchor]
+                score_v = score_all[valid_anchor]
+                hash_v = hash_all[valid_anchor]
+                for i in range(idx_v.numel()):
+                    h = int(hash_v[i].item())
+                    sc = float(score_v[i].item())
+                    token = int(idx_v[i].item())
+                    prev = anchor_hash_to_best.get(h)
+                    if prev is None or sc > prev[0]:
+                        anchor_hash_to_best[h] = (sc, token)
+
             for vox in self.geo_anchor_voxel_list:
-                if vox not in bucket:
+                h = int(self._voxel_hash(torch.tensor([vox], dtype=torch.long))[0].item())
+                if h not in anchor_hash_to_best:
                     continue
-                entries = [e for e in bucket[vox] if e[2] >= self.geo_anchor_conf_exit]
-                if not entries:
-                    continue
-                entries.sort(key=lambda x: x[0], reverse=True)
-                selected.add(entries[0][1])
+                token = int(anchor_hash_to_best[h][1])
+                selected.add(token)
+                selected_global.add(token)
                 anchor_count += 1
                 if anchor_count >= anchor_quota:
                     break
 
-        for _, entries in bucket.items():
-            entries = [e for e in entries if e[2] >= tau_bucket]
-            entries.sort(key=lambda x: x[0], reverse=True)
-            for _, gidx, _ in entries[: max(1, int(topk_per_voxel))]:
-                selected.add(gidx)
+        valid_global = bank_conf_all >= float(tau_bucket)
+        idx_valid = idx_all[valid_global]
+        score_valid = score_all[valid_global]
+        hash_valid = hash_all[valid_global]
+        grouped_idx = self._group_topk_by_hash(hash_valid, score_valid, idx_valid, topk_per_voxel=max(1, int(topk_per_voxel)))
+
+        if grouped_idx.numel() > 0:
+            if max_past_tokens is not None:
+                selected_base = len(selected)
+                left_budget = max(0, int(max_past_tokens) - selected_base)
+            else:
+                left_budget = int(grouped_idx.numel())
+
+            global_budget = left_budget
+            if max_past_tokens is not None:
+                global_floor = max(1, int(max_past_tokens * self.geo_anchor_budget_ratio))
+                global_budget = max(global_floor, left_budget)
+
+            addable = [int(v) for v in grouped_idx.tolist() if int(v) not in selected_global]
+            if addable and global_budget > 0:
+                addable = addable[:global_budget]
+                selected.update(addable)
 
         if not selected:
             return None
