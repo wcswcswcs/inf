@@ -95,6 +95,10 @@ class Aggregator(nn.Module):
         geo_anchor_min_ttl: int = 12,
         geo_bank_coarse_stride: int = 4,
         geo_bank_bucket_reserve: int = 1,
+        geo_bank_trim_interval: int = 8,
+        geo_keyframe_interval: int = 24,
+        geo_keyframe_max_count: int = 96,
+        geo_keyframe_token_quota: int = 1024,
     ):
         super().__init__()
 
@@ -199,6 +203,10 @@ class Aggregator(nn.Module):
         self.geo_anchor_min_ttl = geo_anchor_min_ttl
         self.geo_bank_coarse_stride = max(1, int(geo_bank_coarse_stride))
         self.geo_bank_bucket_reserve = max(0, int(geo_bank_bucket_reserve))
+        self.geo_bank_trim_interval = max(1, int(geo_bank_trim_interval))
+        self.geo_keyframe_interval = max(1, int(geo_keyframe_interval))
+        self.geo_keyframe_max_count = max(1, int(geo_keyframe_max_count))
+        self.geo_keyframe_token_quota = max(0, int(geo_keyframe_token_quota))
         self.geo_identity_stride = 1 << 21
         self.geo_identity_offset = 1 << 18
         self.reset_geo_cache_state()
@@ -214,10 +222,13 @@ class Aggregator(nn.Module):
         self.geo_anchor_hash_tensor = torch.empty((0,), dtype=torch.long)
         self.geo_anchor_version = 0
         self.geo_frame_anchor_version: Dict[int, int] = {}
+        self.geo_keyframes: List[int] = []
+        self.geo_keyframe_set: set[int] = set()
         self.geo_token_meta: Dict[int, Dict[str, torch.Tensor]] = {
             i: {
                 "frame_idx": torch.empty(0, dtype=torch.long),
                 "is_special": torch.empty(0, dtype=torch.bool),
+                "is_keyframe": torch.empty(0, dtype=torch.bool),
                 "local_patch_idx": torch.empty(0, dtype=torch.long),
                 "identity_local": torch.empty(0, dtype=torch.long),
                 "global_id": torch.empty(0, dtype=torch.long),
@@ -225,6 +236,22 @@ class Aggregator(nn.Module):
             }
             for i in range(self.depth)
         }
+
+    def _update_geo_keyframes(self, frame_idx: int):
+        frame_idx = int(frame_idx)
+        should_add = (frame_idx == 0) or (frame_idx % int(self.geo_keyframe_interval) == 0)
+        if not should_add or frame_idx in self.geo_keyframe_set:
+            return
+        self.geo_keyframes.append(frame_idx)
+        self.geo_keyframe_set.add(frame_idx)
+
+        max_count = int(self.geo_keyframe_max_count)
+        while len(self.geo_keyframes) > max_count:
+            drop = self.geo_keyframes.pop(0)
+            if drop == 0:
+                self.geo_keyframes.insert(0, drop)
+                break
+            self.geo_keyframe_set.discard(drop)
 
     def _voxel_importance(self, item: Dict[str, float], now_frame_idx: int) -> float:
         age = max(0.0, float(now_frame_idx) - float(item["last_seen"]))
@@ -237,6 +264,7 @@ class Aggregator(nn.Module):
 
     def _active_frames_for_anchor_refresh(self, current_frame_idx: int) -> set[int]:
         active: set[int] = {0, int(current_frame_idx)}
+        active.update(int(v) for v in self.geo_keyframes)
         for meta in self.geo_token_meta.values():
             fi = meta.get("frame_idx")
             if fi is None or fi.numel() == 0:
@@ -475,6 +503,7 @@ class Aggregator(nn.Module):
         self.geo_frame_anchor_mask[frame_idx] = torch.zeros((voxel_ids.shape[0],), dtype=torch.bool)
         self.geo_frame_anchor_version[frame_idx] = -1
         self.geo_max_frame_idx = max(self.geo_max_frame_idx, frame_idx)
+        self._update_geo_keyframes(frame_idx)
 
         # Update global voxel landmark bank (conf/support/stability/recency)
         voxel_to_idx: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
@@ -526,7 +555,14 @@ class Aggregator(nn.Module):
                 )
 
         # Keep global bank bounded.
-        if len(self.geo_voxel_bank) > self.geo_max_voxels:
+        do_trim = (
+            len(self.geo_voxel_bank) > self.geo_max_voxels
+            and (
+                (frame_idx % int(self.geo_bank_trim_interval) == 0)
+                or (len(self.geo_voxel_bank) > int(self.geo_max_voxels * 1.2))
+            )
+        )
+        if do_trim:
             keep_budget = int(self.geo_max_voxels)
             keep_keys: set[Tuple[int, int, int]] = set()
             keyed_importance: Dict[Tuple[int, int, int], float] = {}
@@ -617,6 +653,9 @@ class Aggregator(nn.Module):
         return {
             "frame_idx": meta["frame_idx"].index_select(0, keep_cpu),
             "is_special": meta["is_special"].index_select(0, keep_cpu),
+            "is_keyframe": meta["is_keyframe"].index_select(0, keep_cpu)
+            if "is_keyframe" in meta
+            else torch.zeros((keep_cpu.numel(),), dtype=torch.bool),
             "local_patch_idx": meta["local_patch_idx"].index_select(0, keep_cpu),
             "identity_local": meta["identity_local"].index_select(0, keep_cpu)
             if "identity_local" in meta
@@ -634,6 +673,13 @@ class Aggregator(nn.Module):
         return {
             "frame_idx": torch.cat([meta_a["frame_idx"], meta_b["frame_idx"]], dim=0),
             "is_special": torch.cat([meta_a["is_special"], meta_b["is_special"]], dim=0),
+            "is_keyframe": torch.cat(
+                [
+                    meta_a.get("is_keyframe", torch.zeros_like(meta_a["is_special"])),
+                    meta_b.get("is_keyframe", torch.zeros_like(meta_b["is_special"])),
+                ],
+                dim=0,
+            ),
             "local_patch_idx": torch.cat([meta_a["local_patch_idx"], meta_b["local_patch_idx"]], dim=0),
             "identity_local": torch.cat(
                 [
@@ -662,12 +708,13 @@ class Aggregator(nn.Module):
     def _protected_mask(meta: Dict[str, torch.Tensor], recent_frames: int) -> torch.Tensor:
         frame_idx = meta["frame_idx"]
         is_special = meta["is_special"]
+        is_keyframe = meta.get("is_keyframe", torch.zeros_like(is_special))
         is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
         if frame_idx.numel() == 0:
             return torch.empty(0, dtype=torch.bool)
         current_frame_idx = int(frame_idx.max().item())
         recent_min = max(0, current_frame_idx - int(recent_frames))
-        return is_special | is_anchor | (frame_idx == 0) | (frame_idx >= recent_min)
+        return is_special | is_keyframe | is_anchor | (frame_idx == 0) | (frame_idx >= recent_min)
 
     def _cap_keep_with_protection(
         self,
@@ -695,9 +742,10 @@ class Aggregator(nn.Module):
 
         frame_keep = frame_idx_all.index_select(0, keep)
         special_keep = is_special_all.index_select(0, keep)
+        keyframe_keep = meta.get("is_keyframe", torch.zeros_like(is_special_all)).index_select(0, keep)
         anchor_keep = is_anchor_all.index_select(0, keep)
 
-        protected = special_keep | anchor_keep | (frame_keep == 0) | (frame_keep >= recent_min)
+        protected = special_keep | keyframe_keep | anchor_keep | (frame_keep == 0) | (frame_keep >= recent_min)
         prot_idx = keep[protected]
         if prot_idx.numel() >= budget:
             # O(n) truncation from tail: keep most recent protected tokens without full sort.
@@ -740,6 +788,7 @@ class Aggregator(nn.Module):
         frame_idx_t = torch.full((tokens_per_frame,), int(frame_idx), dtype=torch.long)
         is_special = torch.zeros((tokens_per_frame,), dtype=torch.bool)
         is_special[:special] = True
+        is_keyframe = torch.full((tokens_per_frame,), bool(int(frame_idx) in self.geo_keyframe_set), dtype=torch.bool)
 
         local_patch_idx = torch.full((tokens_per_frame,), -1, dtype=torch.long)
         identity_local = torch.full((tokens_per_frame,), -1, dtype=torch.long)
@@ -753,6 +802,7 @@ class Aggregator(nn.Module):
         return {
             "frame_idx": frame_idx_t,
             "is_special": is_special,
+            "is_keyframe": is_keyframe,
             "local_patch_idx": local_patch_idx,
             "identity_local": identity_local,
             "global_id": global_id,
@@ -875,6 +925,7 @@ class Aggregator(nn.Module):
         selected = set()
         frame_idx = meta["frame_idx"]
         is_special = meta["is_special"]
+        is_keyframe = meta.get("is_keyframe", torch.zeros_like(is_special))
         local_idx = meta["local_patch_idx"]
         is_anchor = meta.get("is_anchor", torch.zeros_like(is_special))
 
@@ -908,6 +959,15 @@ class Aggregator(nn.Module):
             else:
                 k0 = min(int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
                 selected.update(frame0_patch_idx[:k0].tolist())
+
+        # Reserve sparse keyframe tokens to preserve long-horizon constraints.
+        keyframe_patch_idx = torch.nonzero(is_keyframe & (~is_special) & (~frame0_mask) & (local_idx >= 0), as_tuple=False).flatten()
+        if keyframe_patch_idx.numel() > 0 and int(self.geo_keyframe_token_quota) > 0:
+            kf_frames = frame_idx.index_select(0, keyframe_patch_idx)
+            order = torch.argsort(kf_frames, descending=True)
+            keyframe_patch_idx = keyframe_patch_idx.index_select(0, order)
+            keyframe_patch_idx = keyframe_patch_idx[: int(self.geo_keyframe_token_quota)]
+            selected.update(keyframe_patch_idx.tolist())
 
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         recent_min = max(0, current_frame_idx - int(recent_frames))
