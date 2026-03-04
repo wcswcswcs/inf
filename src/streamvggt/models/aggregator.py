@@ -853,11 +853,40 @@ class Aggregator(nn.Module):
         keyframe_keep = meta.get("is_keyframe", torch.zeros_like(is_special_all)).index_select(0, keep)
         anchor_keep = is_anchor_all.index_select(0, keep)
 
-        protected = special_keep | keyframe_keep | anchor_keep | (frame_keep == 0) | (frame_keep >= recent_min)
+        frame0_keep = frame_keep == 0
+        recent_keep = frame_keep >= recent_min
+        protected = special_keep | keyframe_keep | anchor_keep | frame0_keep | recent_keep
         prot_idx = keep[protected]
         if prot_idx.numel() >= budget:
-            # O(n) truncation from tail: keep most recent protected tokens without full sort.
-            return torch.unique(prot_idx[-budget:], sorted=True)
+            # Priority-aware cap inside protected to avoid recent tokens starving long-horizon anchors/keyframes.
+            pick = torch.zeros_like(prot_idx, dtype=torch.bool)
+
+            def _pick(mask: torch.Tensor, quota: Optional[int] = None):
+                nonlocal pick
+                if mask.sum().item() == 0:
+                    return
+                remaining = int(budget) - int(pick.sum().item())
+                if remaining <= 0:
+                    return
+                cand = torch.nonzero(mask, as_tuple=False).flatten()
+                if quota is None:
+                    take_n = min(remaining, int(cand.numel()))
+                else:
+                    take_n = min(remaining, int(cand.numel()), max(0, int(quota)))
+                if take_n <= 0:
+                    return
+                pick[cand[-take_n:]] = True
+
+            # Strong priority: special/frame0 first, then stable anchor quota, then keyframe quota, then recent.
+            _pick(special_keep[protected])
+            _pick(frame0_keep[protected])
+            anchor_quota = max(1, int(float(budget) * float(self.geo_anchor_budget_ratio)))
+            _pick(anchor_keep[protected], quota=anchor_quota)
+            _pick(keyframe_keep[protected], quota=int(self.geo_keyframe_protected_quota))
+            _pick(recent_keep[protected])
+            _pick(torch.ones_like(pick, dtype=torch.bool))
+
+            return torch.unique(prot_idx[pick], sorted=True)
 
         remain = budget - int(prot_idx.numel())
         non_prot_idx = keep[~protected]
@@ -994,12 +1023,22 @@ class Aggregator(nn.Module):
         if gid.numel() == 0:
             meta["_gid_to_pos"] = {}
             meta["_gid_len"] = 0
+            meta["_gid_is_sorted"] = True
             return
         if "_gid_to_pos" in meta and int(meta.get("_gid_len", -1)) == gid_len:
             return
 
+        gid_cpu = gid.detach().cpu().long()
+        gid_is_sorted = bool(torch.all(gid_cpu[1:] >= gid_cpu[:-1]).item()) if gid_cpu.numel() > 1 else True
+        meta["_gid_is_sorted"] = gid_is_sorted
+        if gid_is_sorted:
+            meta["_gid_sorted"] = gid_cpu
+            meta["_gid_len"] = gid_len
+            meta["_gid_to_pos"] = {}
+            return
+
         gid_to_pos: Dict[int, int] = {}
-        for i, g in enumerate(gid.detach().cpu().long().tolist()):
+        for i, g in enumerate(gid_cpu.tolist()):
             gid_to_pos[int(g)] = i
         meta["_gid_to_pos"] = gid_to_pos
         meta["_gid_len"] = gid_len
@@ -1009,6 +1048,22 @@ class Aggregator(nn.Module):
         if identity_keep is None or identity_keep.numel() == 0:
             return torch.empty(0, dtype=torch.long)
         Aggregator._ensure_identity_lookup(meta)
+        if bool(meta.get("_gid_is_sorted", False)):
+            gid_sorted = meta.get("_gid_sorted", torch.empty((0,), dtype=torch.long))
+            if gid_sorted.numel() == 0:
+                return torch.empty((0,), dtype=torch.long)
+            keys = torch.unique(identity_keep.detach().cpu().long(), sorted=True)
+            where = torch.searchsorted(gid_sorted, keys)
+            valid = where < gid_sorted.numel()
+            if valid.sum().item() == 0:
+                return torch.empty((0,), dtype=torch.long)
+            where = where[valid]
+            keys_v = keys[valid]
+            matched = gid_sorted.index_select(0, where) == keys_v
+            if matched.sum().item() == 0:
+                return torch.empty((0,), dtype=torch.long)
+            return torch.unique(where[matched], sorted=True)
+
         gid_to_pos = meta.get("_gid_to_pos", {})
         if not gid_to_pos:
             return torch.empty(0, dtype=torch.long)
