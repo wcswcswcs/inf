@@ -3202,7 +3202,7 @@ class Aggregator(nn.Module):
                             anchor_in_cache = int(merged_meta.get("is_anchor", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             debug_frame_idx = int(merged_meta["frame_idx"].max().item()) if merged_meta["frame_idx"].numel() > 0 else -1
                             if self._should_log_geo_debug(debug_frame_idx):
-                                logger.debug(
+                                logger.info(
                                     "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
