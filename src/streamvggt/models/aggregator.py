@@ -2941,10 +2941,10 @@ class Aggregator(nn.Module):
                     ref_layer_idx = idx
                     break
 
+            raw_ref_budget = max(0, int(current_budgets.min().item()) - P)
+            ref_budget = min(raw_ref_budget, int(self.geo_layer_budget_cap))
             if ref_layer_idx is not None:
                 ref_meta = self.geo_token_meta[ref_layer_idx]
-                raw_ref_budget = max(0, int(current_budgets.min().item()) - P)
-                ref_budget = min(raw_ref_budget, int(self.geo_layer_budget_cap))
                 cache_frame_idx = int(ref_meta["frame_idx"].max().item()) if ref_meta["frame_idx"].numel() > 0 else max(-1, int(past_frame_idx) - 1)
                 geo_reloc_active = int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off"
                 geo_prune_ready = self._geo_prune_ready(ref_meta, ref_budget, cache_frame_idx)
@@ -2995,6 +2995,48 @@ class Aggregator(nn.Module):
                         reanchor_overlap_avg=0.0,
                         budget=int(ref_budget),
                     )
+            else:
+                self._maybe_console_geo_log(
+                    current_frame_idx=max(-1, int(past_frame_idx)),
+                    total_tokens=0,
+                    candidate_count=0,
+                    visible_total=0,
+                    selected_count=0,
+                    anchor_count=0,
+                    stable_count=0,
+                    tau_bucket=float("nan"),
+                    stable_visible_voxel_overlap=0,
+                    stable_selected_visible=0,
+                    stable_selected_invisible=0,
+                    fast_path=4,
+                    cache_size=0,
+                    keep_overlap_cache=0,
+                    reanchor_added=0,
+                    reanchor_overlap_avg=0.0,
+                    budget=int(ref_budget),
+                )
+        elif use_cache and use_geo_kv_prune:
+            raw_ref_budget = max(0, int(current_budgets.min().item()) - P)
+            ref_budget = min(raw_ref_budget, int(self.geo_layer_budget_cap))
+            self._maybe_console_geo_log(
+                current_frame_idx=max(-1, int(past_frame_idx)),
+                total_tokens=0,
+                candidate_count=0,
+                visible_total=0,
+                selected_count=0,
+                anchor_count=0,
+                stable_count=0,
+                tau_bucket=float("nan"),
+                stable_visible_voxel_overlap=0,
+                stable_selected_visible=0,
+                stable_selected_invisible=0,
+                fast_path=5,
+                cache_size=0,
+                keep_overlap_cache=0,
+                reanchor_added=0,
+                reanchor_overlap_avg=0.0,
+                budget=int(ref_budget),
+            )
 
 
         for _ in range(self.aa_block_num):
