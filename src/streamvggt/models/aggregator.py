@@ -359,6 +359,7 @@ class Aggregator(nn.Module):
         self.geo_trim_cursor = 0
         self.geo_last_console_log_frame = -1
         self.geo_last_debug_log_frame = -1
+        self.geo_last_bootstrap_log_frame = -1
         self.geo_anchor_version = 0
         self.geo_frame_anchor_version: Dict[int, int] = {}
         self.geo_keyframes: List[int] = []
@@ -1294,18 +1295,19 @@ class Aggregator(nn.Module):
 
         self._prune_geo_frame_meta(frame_idx)
 
-        logger.info(
-            "[geo_bootstrap] frame=%d voxel_bank=%d ref_bank=%d stable_anchors=%d trust=%.4f recovery=%d reloc=%d matched_ratio=%.4f ref_overlap=%d",
-            int(frame_idx),
-            int(len(self.geo_voxel_bank)),
-            int(len(self.geo_reference_bank)),
-            int(len(self.geo_stable_anchor_voxels)),
-            float(self.geo_trust_score),
-            int(self.geo_recovery_frames_left),
-            int(self.geo_reloc_frames_left),
-            float(matched_ratio),
-            int(ref_overlap),
-        )
+        if self._should_log_geo_bootstrap(int(frame_idx)):
+            logger.info(
+                "[geo_bootstrap] frame=%d voxel_bank=%d ref_bank=%d stable_anchors=%d trust=%.4f recovery=%d reloc=%d matched_ratio=%.4f ref_overlap=%d",
+                int(frame_idx),
+                int(len(self.geo_voxel_bank)),
+                int(len(self.geo_reference_bank)),
+                int(len(self.geo_stable_anchor_voxels)),
+                float(self.geo_trust_score),
+                int(self.geo_recovery_frames_left),
+                int(self.geo_reloc_frames_left),
+                float(matched_ratio),
+                int(ref_overlap),
+            )
 
         return {
             "new_voxel_ratio": float(new_voxels) / max(1.0, float(num_groups)),
@@ -1884,6 +1886,20 @@ class Aggregator(nn.Module):
         if int(self.geo_last_debug_log_frame) == int(current_frame_idx):
             return False
         self.geo_last_debug_log_frame = int(current_frame_idx)
+        return True
+
+    def _should_log_geo_bootstrap(self, current_frame_idx: int) -> bool:
+        if current_frame_idx < 0:
+            return False
+        interval = int(self.geo_console_log_interval)
+        if interval < 0:
+            return False
+        interval = max(1, interval)
+        if (int(current_frame_idx) % interval) != 0:
+            return False
+        if int(self.geo_last_bootstrap_log_frame) == int(current_frame_idx):
+            return False
+        self.geo_last_bootstrap_log_frame = int(current_frame_idx)
         return True
 
     def _extract_landmark_cache(
