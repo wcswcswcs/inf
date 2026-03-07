@@ -205,13 +205,19 @@ def run_inference(args: argparse.Namespace):
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
     parser = argparse.ArgumentParser(
         description="Run InfiniteVGGT inference from the command line.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        help="Python logging level (e.g. DEBUG, INFO, WARNING).",
     )
     parser.add_argument(
         "--input_dir", 

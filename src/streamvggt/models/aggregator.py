@@ -1293,7 +1293,7 @@ class Aggregator(nn.Module):
 
         self._prune_geo_frame_meta(frame_idx)
 
-        logger.debug(
+        logger.info(
             "[geo_bootstrap] frame=%d voxel_bank=%d ref_bank=%d stable_anchors=%d trust=%.4f recovery=%d reloc=%d matched_ratio=%.4f ref_overlap=%d",
             int(frame_idx),
             int(len(self.geo_voxel_bank)),
@@ -2087,12 +2087,33 @@ class Aggregator(nn.Module):
             return None
         if max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(self.geo_prune_start_ratio)):
             keep_all = torch.arange(total_tokens, dtype=torch.long)
-            logger.debug(
+            logger.info(
                 "[geo_keep] total_tokens=%d budget=%d selected=%d selected_ratio=%.4f skip_prune=1",
                 int(total_tokens),
                 int(max_past_tokens),
                 int(keep_all.numel()),
                 float(keep_all.numel()) / float(max(1, total_tokens)),
+            )
+            self.geo_cached_landmark_keep = self._extract_landmark_cache(meta, keep_all, max_past_tokens)
+            overlap = self._count_keep_cache_overlap(keep_all, self.geo_cached_landmark_keep)
+            self._maybe_console_geo_log(
+                current_frame_idx=int(meta["frame_idx"].max().item()) if meta["frame_idx"].numel() > 0 else -1,
+                total_tokens=total_tokens,
+                candidate_count=0,
+                visible_total=0,
+                selected_count=int(keep_all.numel()),
+                anchor_count=int(meta.get("is_anchor", torch.zeros_like(meta["is_special"])).sum().item()),
+                stable_count=0,
+                tau_bucket=float("nan"),
+                stable_visible_voxel_overlap=0,
+                stable_selected_visible=0,
+                stable_selected_invisible=0,
+                fast_path=2,
+                cache_size=int(self.geo_cached_landmark_keep.numel()),
+                keep_overlap_cache=overlap,
+                reanchor_added=0,
+                reanchor_overlap_avg=0.0,
+                budget=int(max_past_tokens or 0),
             )
             return keep_all
 
@@ -3087,7 +3108,7 @@ class Aggregator(nn.Module):
                             ref_in_cache = int(merged_meta.get("is_reference", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             landmark_in_cache = int(merged_meta.get("is_landmark", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             anchor_in_cache = int(merged_meta.get("is_anchor", torch.zeros_like(merged_meta["is_special"])).sum().item())
-                            logger.debug(
+                            logger.info(
                                 "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
                                 int(layer_idx),
                                 int(kv_before_len),
