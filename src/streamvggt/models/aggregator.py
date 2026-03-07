@@ -2976,6 +2976,25 @@ class Aggregator(nn.Module):
                     geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
                 else:
                     geo_shared_identity_keep = None
+                    self._maybe_console_geo_log(
+                        current_frame_idx=cache_frame_idx,
+                        total_tokens=int(ref_meta["frame_idx"].numel()),
+                        candidate_count=0,
+                        visible_total=0,
+                        selected_count=max(0, min(int(ref_meta["frame_idx"].numel()), int(ref_budget))),
+                        anchor_count=int(ref_meta.get("is_anchor", torch.zeros_like(ref_meta["is_special"])).sum().item()),
+                        stable_count=0,
+                        tau_bucket=float("nan"),
+                        stable_visible_voxel_overlap=0,
+                        stable_selected_visible=0,
+                        stable_selected_invisible=0,
+                        fast_path=3,
+                        cache_size=0,
+                        keep_overlap_cache=0,
+                        reanchor_added=0,
+                        reanchor_overlap_avg=0.0,
+                        budget=int(ref_budget),
+                    )
 
 
         for _ in range(self.aa_block_num):
