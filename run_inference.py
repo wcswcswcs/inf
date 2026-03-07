@@ -204,11 +204,6 @@ def run_inference(args: argparse.Namespace):
     return predictions
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
-
     parser = argparse.ArgumentParser(
         description="Run InfiniteVGGT inference from the command line.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -354,6 +349,10 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     result = run_inference(args)
 
     if result is None:
