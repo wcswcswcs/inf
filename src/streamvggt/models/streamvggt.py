@@ -157,7 +157,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
         log_interval = max(1, int(memory_log_interval))
 
+        total_frames = len(frames)
         for i, frame in enumerate(frame_iter):
+            if not show_progress:
+                print(f"Inference step {i + 1}/{total_frames}", flush=True)
 
             images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
             aggregator_output = self.aggregator(
