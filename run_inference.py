@@ -5,6 +5,7 @@ import sys
 import glob
 import time
 import argparse
+import logging
 from typing import List, Dict, Optional
 
 # Add project source to the Python path
@@ -44,6 +45,7 @@ def run_inference(args: argparse.Namespace):
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
     model_total_budget = args.total_budget if args.use_geo_kv_prune else 1200000
+    print(f"Geo prune budget config: total_budget={model_total_budget} (arg_total_budget={args.total_budget}, use_geo_kv_prune={args.use_geo_kv_prune})")
     aggregator_kwargs = {
         "geo_conf_ema_alpha": args.geo_conf_ema_alpha,
         "geo_var_ema_alpha": args.geo_var_ema_alpha,
@@ -68,6 +70,19 @@ def run_inference(args: argparse.Namespace):
         "geo_max_candidate_tokens": args.geo_max_candidate_tokens,
         "geo_selection_interval": args.geo_selection_interval,
         "geo_anchor_refresh_interval": args.geo_anchor_refresh_interval,
+        "geo_stable_keyframe_topk_per_frame": args.geo_stable_keyframe_topk_per_frame,
+        "geo_layer_budget_cap": args.geo_layer_budget_cap,
+        "geo_reloc_frames": args.geo_reloc_frames,
+        "geo_reloc_trigger_overlap": args.geo_reloc_trigger_overlap,
+        "geo_reloc_trigger_visible_ratio": args.geo_reloc_trigger_visible_ratio,
+        "geo_reloc_local_budget_ratio": args.geo_reloc_local_budget_ratio,
+        "geo_reloc_stable_read_budget_ratio": args.geo_reloc_stable_read_budget_ratio,
+        "geo_reloc_hard_frames": args.geo_reloc_hard_frames,
+        "geo_bootstrap_frames": args.geo_bootstrap_frames,
+        "geo_bootstrap_min_voxels": args.geo_bootstrap_min_voxels,
+        "geo_bootstrap_min_refs": args.geo_bootstrap_min_refs,
+        "geo_prune_start_ratio": args.geo_prune_start_ratio,
+        "geo_console_log_interval": args.geo_console_log_interval,
     }
     model = StreamVGGT(total_budget=model_total_budget, aggregator_kwargs=aggregator_kwargs)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
@@ -152,7 +167,6 @@ def run_inference(args: argparse.Namespace):
         summary = {"per_frame_only": True}
         if args.frame_cache_dir:
             summary["frame_cache_dir"] = args.frame_cache_dir
-        torch.cuda.empty_cache()
         return summary
 
     # Extract results from the output structure
@@ -183,9 +197,6 @@ def run_inference(args: argparse.Namespace):
     predictions["extrinsic"] = extrinsic.squeeze(0)
     predictions["intrinsic"] = intrinsic.squeeze(0) if intrinsic is not None else None
 
-    # Clean up GPU cache
-    torch.cuda.empty_cache()
-
     for key, value in predictions.items():
         if isinstance(value, torch.Tensor):
             predictions[key] = value.detach().cpu()
@@ -193,6 +204,11 @@ def run_inference(args: argparse.Namespace):
     return predictions
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         description="Run InfiniteVGGT inference from the command line.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -312,6 +328,24 @@ if __name__ == "__main__":
     parser.add_argument("--geo_max_candidate_tokens", type=int, default=15000)
     parser.add_argument("--geo_selection_interval", type=int, default=1)
     parser.add_argument("--geo_anchor_refresh_interval", type=int, default=1)
+    parser.add_argument("--geo_stable_keyframe_topk_per_frame", type=int, default=2)
+    parser.add_argument("--geo_layer_budget_cap", type=int, default=8192)
+    parser.add_argument("--geo_reloc_frames", type=int, default=8)
+    parser.add_argument("--geo_reloc_trigger_overlap", type=int, default=128)
+    parser.add_argument("--geo_reloc_trigger_visible_ratio", type=float, default=0.75)
+    parser.add_argument("--geo_reloc_local_budget_ratio", type=float, default=0.1)
+    parser.add_argument("--geo_reloc_stable_read_budget_ratio", type=float, default=0.4)
+    parser.add_argument("--geo_reloc_hard_frames", type=int, default=2)
+    parser.add_argument("--geo_bootstrap_frames", type=int, default=64)
+    parser.add_argument("--geo_bootstrap_min_voxels", type=int, default=4096)
+    parser.add_argument("--geo_bootstrap_min_refs", type=int, default=64)
+    parser.add_argument("--geo_prune_start_ratio", type=float, default=0.9)
+    parser.add_argument(
+        "--geo_console_log_interval",
+        type=int,
+        default=50,
+        help="Print geo prune console stats every N views; set -1 to disable.",
+    )
     
     args = parser.parse_args()
     result = run_inference(args)

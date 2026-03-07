@@ -143,6 +143,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if use_geo_kv_prune:
             self.aggregator.reset_geo_cache_state()
         current_view = None
+        last_reliable_view = None
+        prev_world_to_cam_cpu = None
+        prev_conf_mean = None
         model_device = next(self.parameters()).device
 
         all_ress = []
@@ -168,7 +171,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 geo_recent_frames=geo_recent_frames,
                 geo_near=geo_near,
                 geo_far=geo_far,
-                current_view=current_view,
+                current_view=(last_reliable_view if (last_reliable_view is not None and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold) else current_view),
             )
 
             
@@ -209,12 +212,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     # Keep pruning view metadata on CPU to avoid repeated per-layer GPU->CPU transfers.
                     world_to_cam_cpu = world_to_cam.detach().cpu()
                     intrinsic_cpu = intrinsic_cur.detach().cpu() if intrinsic_cur is not None else None
-                    current_view = {
-                        "world_to_cam": world_to_cam_cpu,
-                        "intrinsic": intrinsic_cpu,
-                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
-                    }
-                    self.aggregator.update_geo_frame_metadata(
+                    pose_delta = 0.0
+                    if prev_world_to_cam_cpu is not None:
+                        pose_delta = float((world_to_cam_cpu[:, :3, 3] - prev_world_to_cam_cpu[:, :3, 3]).norm(dim=-1).mean().item())
+
+                    conf_mean = float(pts3d_conf.detach().to(torch.float32).mean().item())
+                    conf_drop = 0.0 if prev_conf_mean is None else max(0.0, float(prev_conf_mean - conf_mean))
+
+                    geo_meta_stats = self.aggregator.update_geo_frame_metadata(
                         frame_idx=i,
                         pts3d=pts3d.detach(),
                         conf=pts3d_conf.detach(),
@@ -222,6 +227,21 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                         intrinsic=intrinsic_cpu,
                         voxel_size=geo_voxel_size,
                     )
+
+                    current_view = {
+                        "world_to_cam": world_to_cam_cpu,
+                        "intrinsic": intrinsic_cpu,
+                        "img_hw": tuple(int(x) for x in images.shape[-2:]),
+                        "pose_delta": pose_delta,
+                        "conf_drop": conf_drop,
+                        "new_voxel_ratio": float(geo_meta_stats.get("new_voxel_ratio", 0.0)),
+                    }
+                    trust_now = float(geo_meta_stats.get("trust_score", float(self.aggregator.geo_trust_score)))
+                    matched_ratio_now = float(geo_meta_stats.get("matched_ratio", 0.0))
+                    if trust_now >= float(self.aggregator.geo_selection_low_trust_threshold) and matched_ratio_now >= 0.05:
+                        last_reliable_view = current_view
+                    prev_world_to_cam_cpu = world_to_cam_cpu
+                    prev_conf_mean = conf_mean
 
                 if self.track_head is not None and query_points is not None:
                     track_list, vis, conf = self.track_head(
@@ -245,18 +265,21 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     else {}
                 ),
             }
-            res_cpu = {
-                k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                for k, v in res_gpu.items()
-            }
-            if frame_writer is not None:
-                frame_writer(i, frame, res_cpu)
+            needs_cpu_export = (frame_writer is not None) or cache_results
+            if needs_cpu_export:
+                res_cpu = {
+                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in res_gpu.items()
+                }
 
-            if cache_results:
-                all_ress.append(res_cpu)
-                processed_frames.append(
-                    {nk: nv.detach().cpu() if isinstance(nv, torch.Tensor) else nv for nk, nv in frame.items()}
-                )
+                if frame_writer is not None:
+                    frame_writer(i, frame, res_cpu)
+
+                if cache_results:
+                    all_ress.append(res_cpu)
+                    processed_frames.append(
+                        {nk: nv.detach().cpu() if isinstance(nv, torch.Tensor) else nv for nk, nv in frame.items()}
+                    )
 
             if memory_diagnostics and model_device.type == "cuda" and ((i + 1) % log_interval == 0 or (i + 1) == len(frames)):
                 allocated_gb = torch.cuda.memory_allocated(model_device) / (1024 ** 3)
