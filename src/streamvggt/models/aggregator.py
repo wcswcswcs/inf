@@ -358,6 +358,7 @@ class Aggregator(nn.Module):
         self.geo_cached_landmark_keep: torch.Tensor = torch.empty((0,), dtype=torch.long)
         self.geo_trim_cursor = 0
         self.geo_last_console_log_frame = -1
+        self.geo_last_debug_log_frame = -1
         self.geo_anchor_version = 0
         self.geo_frame_anchor_version: Dict[int, int] = {}
         self.geo_keyframes: List[int] = []
@@ -1871,6 +1872,20 @@ class Aggregator(nn.Module):
                 flush=True,
             )
 
+    def _should_log_geo_debug(self, current_frame_idx: int) -> bool:
+        if current_frame_idx < 0:
+            return False
+        interval = int(self.geo_console_log_interval)
+        if interval < 0:
+            return False
+        interval = max(1, interval)
+        if (int(current_frame_idx) % interval) != 0:
+            return False
+        if int(self.geo_last_debug_log_frame) == int(current_frame_idx):
+            return False
+        self.geo_last_debug_log_frame = int(current_frame_idx)
+        return True
+
     def _extract_landmark_cache(
         self,
         meta: Dict[str, torch.Tensor],
@@ -3169,25 +3184,27 @@ class Aggregator(nn.Module):
                             ref_in_cache = int(merged_meta.get("is_reference", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             landmark_in_cache = int(merged_meta.get("is_landmark", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             anchor_in_cache = int(merged_meta.get("is_anchor", torch.zeros_like(merged_meta["is_special"])).sum().item())
-                            logger.debug(
-                                "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
-                                int(layer_idx),
-                                int(kv_before_len),
-                                int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
-                                int(debug_protected.numel()),
-                                int(debug_keep_idx.numel()),
-                                int(debug_pre_keep.numel()),
-                                int(new_kv[0].shape[2]),
-                                int(merged_meta["frame_idx"].numel()),
-                                int(layer_budget),
-                                float(self.geo_trust_score),
-                                int(self.geo_recovery_frames_left),
-                                int(self.geo_reloc_frames_left),
-                                int(frame0_in_cache),
-                                int(ref_in_cache),
-                                int(landmark_in_cache),
-                                int(anchor_in_cache),
-                            )
+                            debug_frame_idx = int(merged_meta["frame_idx"].max().item()) if merged_meta["frame_idx"].numel() > 0 else -1
+                            if self._should_log_geo_debug(debug_frame_idx):
+                                logger.debug(
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
+                                    int(layer_idx),
+                                    int(kv_before_len),
+                                    int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
+                                    int(debug_protected.numel()),
+                                    int(debug_keep_idx.numel()),
+                                    int(debug_pre_keep.numel()),
+                                    int(new_kv[0].shape[2]),
+                                    int(merged_meta["frame_idx"].numel()),
+                                    int(layer_budget),
+                                    float(self.geo_trust_score),
+                                    int(self.geo_recovery_frames_left),
+                                    int(self.geo_reloc_frames_left),
+                                    int(frame0_in_cache),
+                                    int(ref_in_cache),
+                                    int(landmark_in_cache),
+                                    int(anchor_in_cache),
+                                )
                             assert int(merged_meta["frame_idx"].numel()) == int(new_kv[0].shape[2]), "geo meta/KV length mismatch"
                             self.geo_token_meta[layer_idx] = merged_meta
 
