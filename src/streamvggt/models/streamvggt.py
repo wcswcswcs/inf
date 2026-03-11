@@ -16,6 +16,7 @@ from dataclasses import dataclass
 class StreamVGGTOutput(ModelOutput):
     ress: Optional[List[dict]] = None
     views: Optional[torch.Tensor] = None
+    state: Optional[dict] = None
 
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -123,6 +124,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         frames, 
         query_points: torch.Tensor = None, 
         past_key_values=None, 
+        past_key_values_camera=None,
+        current_view: Optional[dict] = None,
+        last_reliable_view: Optional[dict] = None,
+        geo_state: Optional[dict] = None,
+        rolling_state: Optional[dict] = None,
         frame_writer: Optional[Callable[[int, dict, dict], None]] = None,
         cache_results: bool = True,
         total_budget=None,
@@ -136,16 +142,25 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         memory_diagnostics: bool = False,
         memory_log_interval: int = 1,
     ):
-        past_key_values = [None] * self.aggregator.depth
-        past_key_values_camera = [None] * self.camera_head.trunk_depth
+        if past_key_values is None:
+            past_key_values = [None] * self.aggregator.depth
+        if past_key_values_camera is None:
+            past_key_values_camera = [None] * self.camera_head.trunk_depth
         if total_budget is None:
             total_budget = self.total_budget
         if use_geo_kv_prune:
-            self.aggregator.reset_geo_cache_state()
-        current_view = None
-        last_reliable_view = None
-        prev_world_to_cam_cpu = None
-        prev_conf_mean = None
+            if geo_state is None:
+                self.aggregator.reset_geo_cache_state()
+                current_view = None
+                last_reliable_view = None
+            else:
+                self.aggregator.load_geo_cache_state(geo_state)
+        if rolling_state is None:
+            prev_world_to_cam_cpu = None
+            prev_conf_mean = None
+        else:
+            prev_world_to_cam_cpu = rolling_state.get("prev_world_to_cam_cpu", None)
+            prev_conf_mean = rolling_state.get("prev_conf_mean", None)
         model_device = next(self.parameters()).device
 
         all_ress = []
@@ -168,6 +183,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 print(f"Inference step {i + 1}/{total_frames}", flush=True)
 
             images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
+            selected_view = current_view
+            if use_geo_kv_prune:
+                policy = self.aggregator._geo_compute_adaptive_policy(
+                    current_frame_idx=i,
+                    total_tokens=0,
+                    max_past_tokens=None,
+                    current_view=current_view,
+                )
+                use_stale_view = bool(policy["use_stale_view"])
+                selected_view = None if (not use_stale_view) else current_view
+                if use_stale_view and last_reliable_view is not None and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold:
+                    selected_view = last_reliable_view
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
@@ -179,7 +206,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 geo_recent_frames=geo_recent_frames,
                 geo_near=geo_near,
                 geo_far=geo_far,
-                current_view=(last_reliable_view if (last_reliable_view is not None and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold) else current_view),
+                current_view=selected_view,
             )
 
             
@@ -300,7 +327,20 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
             del res_gpu
 
+        final_state = {
+            "past_key_values": past_key_values,
+            "past_key_values_camera": past_key_values_camera,
+            "geo_state": self.aggregator.export_geo_cache_state() if use_geo_kv_prune else None,
+            "current_view": current_view,
+            "last_reliable_view": last_reliable_view,
+            "rolling_state": {
+                "prev_world_to_cam_cpu": prev_world_to_cam_cpu,
+                "prev_conf_mean": prev_conf_mean,
+            },
+        }
+
         return StreamVGGTOutput(
             ress=all_ress if cache_results else None,
             views=processed_frames if cache_results else None,
+            state=final_state,
         )
