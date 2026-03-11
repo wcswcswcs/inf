@@ -2863,7 +2863,6 @@ class Aggregator(nn.Module):
         identity_local_keep = identity_local_all.index_select(0, keep)
         role_keep = geo_role_all.index_select(0, keep)
         keyframe_keep = role_keep == 1
-        landmark_keep = role_keep == 2
         anchor_keep = role_keep == 3
         reference_keep = role_keep == 4
 
@@ -2899,11 +2898,10 @@ class Aggregator(nn.Module):
             reference_quota = int(max(reference_quota, round(reference_quota * self.geo_recovery_ref_boost)))
         hard_anchor = _take_tail(keep[anchor_keep], min(anchor_quota, budget))
         hard_reference = _take_tail(keep[reference_keep], min(reference_quota, budget))
-        hard_landmark = _take_tail(keep[landmark_keep], min(int(self.geo_landmark_token_quota), budget))
         hard_keyframe = _take_tail(keep[keyframe_keep], min(int(self.geo_keyframe_protected_quota), budget))
 
         hard_idx = torch.unique(
-            torch.cat([hard_special, hard_recent_keep, hard_reference, hard_landmark, hard_anchor, hard_keyframe, hard_frame0], dim=0),
+            torch.cat([hard_special, hard_recent_keep, hard_reference, hard_anchor, hard_keyframe, hard_frame0], dim=0),
             sorted=True,
         )
         if hard_idx.numel() >= budget:
@@ -2915,7 +2913,6 @@ class Aggregator(nn.Module):
                 torch.unique(hard_recent_keep, sorted=True),
                 torch.unique(hard_keyframe, sorted=True),
                 torch.unique(hard_reference, sorted=True),
-                torch.unique(hard_landmark, sorted=True),
                 torch.unique(hard_anchor, sorted=True),
             ]:
                 if remain <= 0:
@@ -3608,7 +3605,7 @@ class Aggregator(nn.Module):
         is_special = meta["is_special"].index_select(0, keep)
         geo_role = meta.get("geo_role", self._compute_primary_geo_role(meta)).index_select(0, keep)
 
-        cache_idx = keep[(~is_special) & ((geo_role == 4) | (geo_role == 3) | (geo_role == 2) | (geo_role == 1))]
+        cache_idx = keep[(~is_special) & ((geo_role == 4) | (geo_role == 3) | (geo_role == 1))]
         if cache_idx.numel() == 0:
             return torch.empty((0,), dtype=torch.long)
 
@@ -4543,7 +4540,6 @@ class Aggregator(nn.Module):
         geo_role = meta.get("geo_role", self._compute_primary_geo_role(meta))
         is_reference = geo_role == 4
         is_anchor = geo_role == 3
-        is_landmark = geo_role == 2
         is_keyframe = geo_role == 1
 
         def _bounded_recent(mask: torch.Tensor, quota: int) -> torch.Tensor:
@@ -4560,17 +4556,14 @@ class Aggregator(nn.Module):
                 int(self.geo_anchor_read_quota),
                 max(1, int(float(max_past_tokens) * anchor_ratio)),
             )
-            landmark_quota = min(int(self.geo_landmark_token_quota), max(32, int(float(max_past_tokens) * 0.10)))
             reference_quota = min(int(self.geo_reference_token_quota), max(16, int(float(max_past_tokens) * 0.05)))
             keyframe_quota = min(int(self.geo_keyframe_protected_quota), max(32, int(float(max_past_tokens) * 0.10)))
         else:
             anchor_quota = int(self.geo_anchor_read_quota)
-            landmark_quota = int(self.geo_landmark_token_quota)
             reference_quota = int(self.geo_reference_token_quota)
             keyframe_quota = int(self.geo_keyframe_protected_quota)
 
         seeded.update(int(v) for v in _bounded_recent(is_reference, reference_quota).tolist())
-        seeded.update(int(v) for v in _bounded_recent(is_landmark, landmark_quota).tolist())
         seeded.update(int(v) for v in _bounded_recent(is_anchor, anchor_quota).tolist())
         seeded.update(int(v) for v in _bounded_recent(is_keyframe, keyframe_quota).tolist())
         return seeded
@@ -5799,6 +5792,7 @@ class Aggregator(nn.Module):
         scores = []
         self.geo_pending_console_log = None
         geo_policy: Optional[Dict[str, Any]] = None
+        effective_mode = "legacy"
         safe_warmup = False
         enable_landmark_logic = True
         enable_reference_logic = True
@@ -6009,7 +6003,8 @@ class Aggregator(nn.Module):
 
         if use_geo_kv_prune:
             geo_policy = copy.deepcopy(geo_policy or self._geo_default_policy(int(past_frame_idx)))
-            safe_warmup = bool(geo_policy["mode"] == "legacy" and (not geo_policy["use_anchor_labels"]))
+            effective_mode = str(effective_mode or (geo_policy or {}).get("mode", "legacy"))
+            safe_warmup = bool(effective_mode == "legacy" and (not geo_policy["use_anchor_labels"]))
             enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
             enable_reference_logic = bool(geo_policy["use_reference_labels"])
             enable_stable_logic = bool(geo_policy["use_reference_labels"])
@@ -6025,9 +6020,12 @@ class Aggregator(nn.Module):
                     if use_cache:
                         layer_idx = global_idx
                         raw_layer_budget = int(current_budgets[layer_idx].item())
-                        if use_geo_kv_prune and bool((geo_policy or {}).get("mode", "legacy") == "legacy"):
+                        if use_geo_kv_prune and effective_mode == "legacy":
                             raw_layer_budget = max(raw_layer_budget, int(self.geo_early_budget_floor))
-                        layer_budget = self._scheduled_layer_budget(raw_layer_budget, int(past_frame_idx), policy=geo_policy) if use_geo_kv_prune else raw_layer_budget
+                        if use_geo_kv_prune and effective_mode != "legacy":
+                            layer_budget = self._scheduled_layer_budget(raw_layer_budget, int(past_frame_idx), policy=geo_policy)
+                        else:
+                            layer_budget = raw_layer_budget
                         debug_protected = torch.empty((0,), dtype=torch.long)
                         debug_keep_idx = torch.empty((0,), dtype=torch.long)
                         debug_pre_keep = torch.empty((0,), dtype=torch.long)
