@@ -185,11 +185,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
             selected_view = current_view
             if use_geo_kv_prune:
-                policy = self.aggregator._geo_compute_adaptive_policy(
-                    current_frame_idx=i,
+                policy = self.aggregator._geo_peek_adaptive_policy(
+                    frame_idx=i,
                     total_tokens=0,
                     max_past_tokens=None,
                     current_view=current_view,
+                    observation=self.aggregator._geo_get_last_observation(),
+                    selector_diag=self.aggregator._geo_get_last_selector_diag(),
                 )
                 use_stale_view = bool(policy["use_stale_view"])
                 selected_view = None if (not use_stale_view) else current_view

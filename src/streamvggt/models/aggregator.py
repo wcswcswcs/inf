@@ -416,17 +416,25 @@ class Aggregator(nn.Module):
         self.geo_handover_unready_streak: int = 0
         self.geo_recovery_enter_streak: int = 0
         self.geo_recovery_exit_streak: int = 0
-        self.geo_last_frame_stats: Dict[str, float] = {
+        self.geo_last_observation: Dict[str, float] = {
+            "frame_idx": -1,
             "matched_ratio": 0.0,
-            "new_voxel_ratio": 1.0,
+            "new_voxel_ratio": 0.0,
             "ref_overlap": 0.0,
+            "trust_score": 1.0,
         }
         self.geo_last_selector_diag: Dict[str, float] = {
+            "frame_idx": -1,
             "stable_visible_overlap": 0.0,
             "stable_visible_ratio": 0.0,
             "visible_total": 0.0,
             "selected_total": 0.0,
         }
+        self.geo_last_committed_policy: Optional[Dict[str, Any]] = None
+        self.geo_last_policy_frame: int = -1
+        self.geo_last_policy_inputs: Dict[str, Any] = {}
+        self.geo_last_policy_metrics: Dict[str, float] = {}
+        self.geo_last_commit_guard_frame: int = -1
         self.geo_current_selector_latched: bool = False
         self.geo_current_selector_ready_streak: int = 0
         self.geo_current_selector_unready_streak: int = 0
@@ -529,8 +537,13 @@ class Aggregator(nn.Module):
             "geo_handover_unready_streak": int(self.geo_handover_unready_streak),
             "geo_recovery_enter_streak": int(self.geo_recovery_enter_streak),
             "geo_recovery_exit_streak": int(self.geo_recovery_exit_streak),
-            "geo_last_frame_stats": copy.deepcopy(self.geo_last_frame_stats),
+            "geo_last_observation": copy.deepcopy(self.geo_last_observation),
             "geo_last_selector_diag": copy.deepcopy(self.geo_last_selector_diag),
+            "geo_last_committed_policy": copy.deepcopy(self.geo_last_committed_policy),
+            "geo_last_policy_frame": int(self.geo_last_policy_frame),
+            "geo_last_policy_inputs": copy.deepcopy(self.geo_last_policy_inputs),
+            "geo_last_policy_metrics": copy.deepcopy(self.geo_last_policy_metrics),
+            "geo_last_commit_guard_frame": int(self.geo_last_commit_guard_frame),
             "last_scores": self.last_scores.detach().cpu().clone(),
         }
 
@@ -615,8 +628,22 @@ class Aggregator(nn.Module):
         self.geo_handover_unready_streak = int(state.get("geo_handover_unready_streak", 0))
         self.geo_recovery_enter_streak = int(state.get("geo_recovery_enter_streak", 0))
         self.geo_recovery_exit_streak = int(state.get("geo_recovery_exit_streak", 0))
-        self.geo_last_frame_stats = copy.deepcopy(state.get("geo_last_frame_stats", self.geo_last_frame_stats))
+        legacy_stats = copy.deepcopy(state.get("geo_last_frame_stats", {}))
+        self.geo_last_observation = copy.deepcopy(state.get("geo_last_observation", self.geo_last_observation))
+        if (not isinstance(self.geo_last_observation, dict)) or int(self.geo_last_observation.get("frame_idx", -1)) < 0:
+            self.geo_last_observation = {
+                "frame_idx": int(state.get("geo_last_observation_frame", -1)),
+                "matched_ratio": float(legacy_stats.get("matched_ratio", 0.0)),
+                "new_voxel_ratio": float(legacy_stats.get("new_voxel_ratio", 0.0)),
+                "ref_overlap": float(legacy_stats.get("ref_overlap", 0.0)),
+                "trust_score": float(self.geo_trust_score),
+            }
         self.geo_last_selector_diag = copy.deepcopy(state.get("geo_last_selector_diag", self.geo_last_selector_diag))
+        self.geo_last_committed_policy = copy.deepcopy(state.get("geo_last_committed_policy", None))
+        self.geo_last_policy_frame = int(state.get("geo_last_policy_frame", -1))
+        self.geo_last_policy_inputs = copy.deepcopy(state.get("geo_last_policy_inputs", {}))
+        self.geo_last_policy_metrics = copy.deepcopy(state.get("geo_last_policy_metrics", {}))
+        self.geo_last_commit_guard_frame = int(state.get("geo_last_commit_guard_frame", -1))
         scores_state = state.get("last_scores", None)
         if torch.is_tensor(scores_state):
             self.last_scores = scores_state.detach().cpu().to(self.last_scores.dtype).clone()
@@ -1304,57 +1331,316 @@ class Aggregator(nn.Module):
     def _ema(self, old: float, new: float, alpha: float = 0.8) -> float:
         return float(alpha) * float(old) + (1.0 - float(alpha)) * float(new)
 
-    def _geo_update_adaptive_stats(
+    def _geo_default_policy(self, frame_idx: int) -> Dict[str, Any]:
+        return {
+            "mode": "legacy",
+            "use_anchor_labels": False,
+            "use_landmark_labels": False,
+            "use_reference_labels": False,
+            "use_recovery": False,
+            "use_reloc": False,
+            "use_cap": False,
+            "cap_alpha": 0.0,
+            "hard_recent_frames": int(max(6, int(self.geo_hard_recent_frames))),
+            "recent_window": int(max(12, int(self.geo_legacy_recent_window))),
+            "soft_recent_window": int(max(16, int(self.geo_legacy_soft_recent_frames))),
+            "anchor_quota_ratio": float(max(0.03, min(0.08, float(self.geo_anchor_budget_ratio)))),
+            "local_budget_ratio": float(max(0.45, min(0.85, float(self.geo_local_budget_ratio)))),
+            "stable_read_budget_ratio": float(max(0.15, min(0.45, float(self.geo_stable_read_budget_ratio)))),
+            "frame0_patch_cap": int(max(256, min(2048, int(self.geo_frame0_patch_cap)))),
+            "use_stale_view": bool(int(frame_idx) >= 64),
+        }
+
+    def _geo_has_complete_policy_context(self, ref_meta: Optional[Dict[str, torch.Tensor]], ref_past_budget: Optional[int]) -> bool:
+        return bool(ref_meta is not None and ref_meta.get("frame_idx") is not None and ref_meta["frame_idx"].numel() > 0 and ref_past_budget is not None and int(ref_past_budget) > 0)
+
+    def _geo_get_last_observation(self) -> Optional[Dict[str, Any]]:
+        obs = copy.deepcopy(self.geo_last_observation)
+        return None if int(obs.get("frame_idx", -1)) < 0 else obs
+
+    def _geo_get_last_selector_diag(self) -> Optional[Dict[str, Any]]:
+        diag = copy.deepcopy(self.geo_last_selector_diag)
+        return None if int(diag.get("frame_idx", -1)) < 0 else diag
+
+    def _geo_collect_policy_signals(
         self,
-        current_frame_idx: int,
+        *,
+        frame_idx: int,
         total_tokens: int,
         max_past_tokens: Optional[int],
         current_view: Optional[Dict[str, Any]],
-    ) -> None:
-        pressure = 0.0
+        observation: Optional[Dict[str, Any]],
+        selector_diag: Optional[Dict[str, Any]],
+    ) -> Dict[str, Optional[float]]:
+        pressure: Optional[float] = None
         if max_past_tokens is not None and int(max_past_tokens) > 0:
             pressure = float(total_tokens) / float(max(1, int(max_past_tokens)))
 
-        pose_delta = float(current_view.get("pose_delta", 0.0) or 0.0) if current_view else 0.0
-        conf_drop = float(current_view.get("conf_drop", 0.0) or 0.0) if current_view else 0.0
-        matched_ratio = float(self.geo_last_frame_stats.get("matched_ratio", 0.0))
-        new_voxel_ratio = float(self.geo_last_frame_stats.get("new_voxel_ratio", 0.0))
-        ref_overlap = float(self.geo_last_frame_stats.get("ref_overlap", 0.0))
-        selector_overlap = float(self.geo_last_selector_diag.get("stable_visible_overlap", 0.0))
-        selector_vis_ratio = float(self.geo_last_selector_diag.get("stable_visible_ratio", 0.0))
+        pose_delta: Optional[float] = None
+        conf_drop: Optional[float] = None
+        if current_view is not None:
+            if current_view.get("pose_delta") is not None:
+                pose_delta = float(current_view.get("pose_delta") or 0.0)
+            if current_view.get("conf_drop") is not None:
+                conf_drop = float(current_view.get("conf_drop") or 0.0)
 
-        self.geo_pressure_ema = self._ema(self.geo_pressure_ema, pressure)
-        self.geo_motion_ema = self._ema(self.geo_motion_ema, pose_delta)
-        self.geo_confdrop_ema = self._ema(self.geo_confdrop_ema, conf_drop)
-        self.geo_matched_ema = self._ema(self.geo_matched_ema, matched_ratio)
-        self.geo_new_voxel_ema = self._ema(self.geo_new_voxel_ema, new_voxel_ratio)
-        self.geo_ref_overlap_ema = self._ema(self.geo_ref_overlap_ema, ref_overlap)
-        self.geo_selector_overlap_ema = self._ema(self.geo_selector_overlap_ema, selector_overlap)
-        self.geo_selector_visible_ratio_ema = self._ema(self.geo_selector_visible_ratio_ema, selector_vis_ratio)
+        matched_ratio: Optional[float] = None
+        new_voxel_ratio: Optional[float] = None
+        ref_overlap: Optional[float] = None
+        trust_score: Optional[float] = None
+        if observation is not None:
+            matched_ratio = float(observation.get("matched_ratio", 0.0)) if observation.get("matched_ratio") is not None else None
+            new_voxel_ratio = float(observation.get("new_voxel_ratio", 0.0)) if observation.get("new_voxel_ratio") is not None else None
+            ref_overlap = float(observation.get("ref_overlap", 0.0)) if observation.get("ref_overlap") is not None else None
+            trust_score = float(observation.get("trust_score", self.geo_trust_score)) if observation.get("trust_score") is not None else None
 
-    def _geo_compute_maturity(self) -> float:
+        selector_overlap: Optional[float] = None
+        selector_visible_ratio: Optional[float] = None
+        if selector_diag is not None:
+            selector_overlap = float(selector_diag.get("stable_visible_overlap", 0.0)) if selector_diag.get("stable_visible_overlap") is not None else None
+            selector_visible_ratio = float(selector_diag.get("stable_visible_ratio", 0.0)) if selector_diag.get("stable_visible_ratio") is not None else None
+
+        return {
+            "frame_idx": float(frame_idx),
+            "pressure": pressure,
+            "pose_delta": pose_delta,
+            "conf_drop": conf_drop,
+            "matched_ratio": matched_ratio,
+            "new_voxel_ratio": new_voxel_ratio,
+            "ref_overlap": ref_overlap,
+            "trust_score": trust_score,
+            "selector_overlap": selector_overlap,
+            "selector_visible_ratio": selector_visible_ratio,
+        }
+
+    def _geo_preview_maturity(self, *, matched_ema: float, trust_score: Optional[float]) -> float:
         m_vox = min(1.0, float(len(self.geo_voxel_bank)) / 1024.0)
         m_stable = min(1.0, float(len(self.geo_stable_anchor_voxels)) / 256.0)
         m_land = min(1.0, float(len(self.geo_landmark_voxels)) / 256.0)
         m_ref = min(1.0, float(len(self.geo_reference_bank)) / 128.0)
-        m_match = min(1.0, float(self.geo_matched_ema) / 0.25)
-        m_trust = min(1.0, max(0.0, float(self.geo_trust_score)))
-        maturity = 0.20 * m_vox + 0.20 * m_stable + 0.15 * m_land + 0.15 * m_ref + 0.15 * m_match + 0.15 * m_trust
-        self.geo_maturity_ema = self._ema(self.geo_maturity_ema, maturity)
-        return float(self.geo_maturity_ema)
+        m_match = min(1.0, float(matched_ema) / 0.25)
+        trust_now = float(self.geo_trust_score) if trust_score is None else float(trust_score)
+        m_trust = min(1.0, max(0.0, trust_now))
+        maturity_raw = 0.20 * m_vox + 0.20 * m_stable + 0.15 * m_land + 0.15 * m_ref + 0.15 * m_match + 0.15 * m_trust
+        return self._ema(self.geo_maturity_ema, maturity_raw)
 
-    def _geo_compute_instability(self) -> float:
-        i_trust = 1.0 - min(1.0, max(0.0, float(self.geo_trust_score)))
-        i_match = max(0.0, min(1.0, (0.15 - float(self.geo_matched_ema)) / 0.15))
-        i_novel = min(1.0, float(self.geo_new_voxel_ema) / 0.4)
-        i_overlap = max(0.0, min(1.0, (16.0 - float(self.geo_selector_overlap_ema)) / 16.0))
-        i_vis = max(0.0, min(1.0, (0.6 - float(self.geo_selector_visible_ratio_ema)) / 0.6))
-        i_motion = min(1.0, float(self.geo_motion_ema) / max(1e-6, float(self.geo_full_select_pose_delta)))
-        i_confdrop = min(1.0, float(self.geo_confdrop_ema) / max(1e-6, float(self.geo_full_select_conf_drop)))
-        i_pressure = max(0.0, min(1.0, (float(self.geo_pressure_ema) - 0.85) / 0.15))
-        instability = 0.20 * i_trust + 0.15 * i_match + 0.10 * i_novel + 0.15 * i_overlap + 0.10 * i_vis + 0.10 * i_motion + 0.10 * i_confdrop + 0.10 * i_pressure
-        self.geo_instability_ema = self._ema(self.geo_instability_ema, instability)
-        return float(self.geo_instability_ema)
+    def _geo_preview_instability(
+        self,
+        *,
+        trust_score: Optional[float],
+        matched_ema: float,
+        new_voxel_ema: float,
+        selector_overlap_ema: float,
+        selector_visible_ratio_ema: float,
+        motion_ema: float,
+        confdrop_ema: float,
+        pressure_ema: float,
+    ) -> float:
+        trust_now = float(self.geo_trust_score) if trust_score is None else float(trust_score)
+        i_trust = 1.0 - min(1.0, max(0.0, trust_now))
+        i_match = max(0.0, min(1.0, (0.15 - float(matched_ema)) / 0.15))
+        i_novel = min(1.0, float(new_voxel_ema) / 0.4)
+        i_overlap = max(0.0, min(1.0, (16.0 - float(selector_overlap_ema)) / 16.0))
+        i_vis = max(0.0, min(1.0, (0.6 - float(selector_visible_ratio_ema)) / 0.6))
+        i_motion = min(1.0, float(motion_ema) / max(1e-6, float(self.geo_full_select_pose_delta)))
+        i_confdrop = min(1.0, float(confdrop_ema) / max(1e-6, float(self.geo_full_select_conf_drop)))
+        i_pressure = max(0.0, min(1.0, (float(pressure_ema) - 0.85) / 0.15))
+        instability_raw = 0.20 * i_trust + 0.15 * i_match + 0.10 * i_novel + 0.15 * i_overlap + 0.10 * i_vis + 0.10 * i_motion + 0.10 * i_confdrop + 0.10 * i_pressure
+        return self._ema(self.geo_instability_ema, instability_raw)
+
+    def _geo_preview_adaptive_metrics(self, *, signals: Dict[str, Optional[float]]) -> Dict[str, float]:
+        def _ema_preview(old: float, key: str) -> float:
+            val = signals.get(key)
+            return float(old) if val is None else self._ema(old, float(val))
+
+        pressure_ema = _ema_preview(self.geo_pressure_ema, "pressure")
+        motion_ema = _ema_preview(self.geo_motion_ema, "pose_delta")
+        confdrop_ema = _ema_preview(self.geo_confdrop_ema, "conf_drop")
+        matched_ema = _ema_preview(self.geo_matched_ema, "matched_ratio")
+        new_voxel_ema = _ema_preview(self.geo_new_voxel_ema, "new_voxel_ratio")
+        ref_overlap_ema = _ema_preview(self.geo_ref_overlap_ema, "ref_overlap")
+        selector_overlap_ema = _ema_preview(self.geo_selector_overlap_ema, "selector_overlap")
+        selector_visible_ratio_ema = _ema_preview(self.geo_selector_visible_ratio_ema, "selector_visible_ratio")
+
+        maturity = self._geo_preview_maturity(matched_ema=matched_ema, trust_score=signals.get("trust_score"))
+        instability = self._geo_preview_instability(
+            trust_score=signals.get("trust_score"),
+            matched_ema=matched_ema,
+            new_voxel_ema=new_voxel_ema,
+            selector_overlap_ema=selector_overlap_ema,
+            selector_visible_ratio_ema=selector_visible_ratio_ema,
+            motion_ema=motion_ema,
+            confdrop_ema=confdrop_ema,
+            pressure_ema=pressure_ema,
+        )
+
+        return {
+            "pressure_ema": pressure_ema,
+            "motion_ema": motion_ema,
+            "confdrop_ema": confdrop_ema,
+            "matched_ema": matched_ema,
+            "new_voxel_ema": new_voxel_ema,
+            "ref_overlap_ema": ref_overlap_ema,
+            "selector_overlap_ema": selector_overlap_ema,
+            "selector_visible_ratio_ema": selector_visible_ratio_ema,
+            "maturity": maturity,
+            "instability": instability,
+        }
+
+    def _geo_preview_adaptive_policy(self, *, frame_idx: int, metrics: Dict[str, float]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        maturity = float(metrics["maturity"])
+        instability = float(metrics["instability"])
+        matched_ema = float(metrics["matched_ema"])
+        selector_overlap_ema = float(metrics["selector_overlap_ema"])
+
+        bootstrap_ready = len(self.geo_voxel_bank) >= 256 and len(self.geo_stable_anchor_voxels) >= 32 and len(self.geo_keyframes) >= 2
+        landmark_ready = bootstrap_ready and maturity >= 0.45 and matched_ema >= 0.12
+        reference_ready = landmark_ready and maturity >= 0.65 and len(self.geo_landmark_voxels) >= 128 and selector_overlap_ema >= 16.0
+
+        handover_ready_streak = int(self.geo_handover_ready_streak)
+        handover_unready_streak = int(self.geo_handover_unready_streak)
+        recovery_enter_streak = int(self.geo_recovery_enter_streak)
+        recovery_exit_streak = int(self.geo_recovery_exit_streak)
+        selector_mode = str(self.geo_selector_mode)
+
+        if reference_ready and instability <= 0.45:
+            handover_ready_streak += 1
+            handover_unready_streak = 0
+        else:
+            handover_ready_streak = 0
+            handover_unready_streak += 1
+
+        if selector_mode == "legacy":
+            if handover_ready_streak >= 5:
+                selector_mode = "current"
+        elif selector_mode == "current":
+            if instability >= 0.70:
+                recovery_enter_streak += 1
+            else:
+                recovery_enter_streak = 0
+            if recovery_enter_streak >= 3:
+                selector_mode = "recovery"
+            elif handover_unready_streak >= 8:
+                selector_mode = "legacy"
+        else:
+            if instability <= 0.35:
+                recovery_exit_streak += 1
+            else:
+                recovery_exit_streak = 0
+            if recovery_exit_streak >= 8:
+                selector_mode = "current"
+
+        policy = {
+            "mode": selector_mode,
+            "use_anchor_labels": bool(bootstrap_ready),
+            "use_landmark_labels": bool(landmark_ready),
+            "use_reference_labels": bool(reference_ready),
+            "use_recovery": bool(landmark_ready),
+            "use_reloc": bool(reference_ready and instability >= 0.50),
+            "use_cap": bool(reference_ready),
+            "cap_alpha": 0.0 if not reference_ready else min(1.0, max(0.0, (maturity - 0.65) / 0.35)),
+            "hard_recent_frames": int(max(6, min(24, round(8 + 10 * instability)))),
+            "recent_window": int(max(12, min(32, round(12 + 12 * instability)))),
+            "soft_recent_window": int(max(16, min(40, round(16 + 12 * instability)))),
+            "anchor_quota_ratio": float(max(0.03, min(0.08, 0.03 + 0.05 * (1.0 - maturity)))),
+            "local_budget_ratio": float(max(0.45, min(0.85, 0.55 + 0.25 * instability - 0.15 * maturity))),
+            "stable_read_budget_ratio": float(max(0.15, min(0.45, 0.15 + 0.30 * instability))),
+            "frame0_patch_cap": int(max(256, min(2048, round((0.12 * 2048.0) * (1.0 - 0.5 * maturity))))),
+            "use_stale_view": not (
+                int(frame_idx) < 64
+                or instability >= 0.60
+                or float(metrics["motion_ema"]) >= float(self.geo_full_select_pose_delta)
+            ),
+        }
+        fsm = {
+            "selector_mode_next": selector_mode,
+            "handover_ready_streak_next": handover_ready_streak,
+            "handover_unready_streak_next": handover_unready_streak,
+            "recovery_enter_streak_next": recovery_enter_streak,
+            "recovery_exit_streak_next": recovery_exit_streak,
+        }
+        return policy, fsm
+
+    def _geo_commit_adaptive_policy_once(
+        self,
+        *,
+        frame_idx: int,
+        total_tokens: int,
+        max_past_tokens: Optional[int],
+        current_view: Optional[Dict[str, Any]],
+        observation: Optional[Dict[str, Any]],
+        selector_diag: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if int(self.geo_last_commit_guard_frame) == int(frame_idx):
+            return copy.deepcopy(self.geo_last_committed_policy or self._geo_default_policy(frame_idx))
+
+        signals = self._geo_collect_policy_signals(
+            frame_idx=frame_idx,
+            total_tokens=total_tokens,
+            max_past_tokens=max_past_tokens,
+            current_view=current_view,
+            observation=observation,
+            selector_diag=selector_diag,
+        )
+        metrics = self._geo_preview_adaptive_metrics(signals=signals)
+        policy, fsm = self._geo_preview_adaptive_policy(frame_idx=frame_idx, metrics=metrics)
+        if max_past_tokens is not None:
+            policy["frame0_patch_cap"] = int(max(256, min(2048, round((0.12 * float(max_past_tokens or 2048)) * (1.0 - 0.5 * float(metrics["maturity"]))))))
+
+        self.geo_pressure_ema = float(metrics["pressure_ema"])
+        self.geo_motion_ema = float(metrics["motion_ema"])
+        self.geo_confdrop_ema = float(metrics["confdrop_ema"])
+        self.geo_matched_ema = float(metrics["matched_ema"])
+        self.geo_new_voxel_ema = float(metrics["new_voxel_ema"])
+        self.geo_ref_overlap_ema = float(metrics["ref_overlap_ema"])
+        self.geo_selector_overlap_ema = float(metrics["selector_overlap_ema"])
+        self.geo_selector_visible_ratio_ema = float(metrics["selector_visible_ratio_ema"])
+        self.geo_maturity_ema = float(metrics["maturity"])
+        self.geo_instability_ema = float(metrics["instability"])
+
+        self.geo_selector_mode = str(fsm["selector_mode_next"])
+        self.geo_handover_ready_streak = int(fsm["handover_ready_streak_next"])
+        self.geo_handover_unready_streak = int(fsm["handover_unready_streak_next"])
+        self.geo_recovery_enter_streak = int(fsm["recovery_enter_streak_next"])
+        self.geo_recovery_exit_streak = int(fsm["recovery_exit_streak_next"])
+
+        self.geo_last_committed_policy = copy.deepcopy(policy)
+        self.geo_last_policy_frame = int(frame_idx)
+        self.geo_last_policy_inputs = {
+            "frame_idx": int(frame_idx),
+            "total_tokens": int(total_tokens),
+            "max_past_tokens": int(max_past_tokens) if max_past_tokens is not None else None,
+            "observation_frame": int(observation.get("frame_idx", -1)) if observation else -1,
+            "selector_diag_frame": int(selector_diag.get("frame_idx", -1)) if selector_diag else -1,
+            "used_current_view": bool(current_view is not None),
+        }
+        self.geo_last_policy_metrics = copy.deepcopy(metrics)
+        self.geo_last_commit_guard_frame = int(frame_idx)
+        return copy.deepcopy(policy)
+
+    def _geo_peek_adaptive_policy(
+        self,
+        *,
+        frame_idx: int,
+        total_tokens: int,
+        max_past_tokens: Optional[int],
+        current_view: Optional[Dict[str, Any]],
+        observation: Optional[Dict[str, Any]],
+        selector_diag: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        signals = self._geo_collect_policy_signals(
+            frame_idx=frame_idx,
+            total_tokens=total_tokens,
+            max_past_tokens=max_past_tokens,
+            current_view=current_view,
+            observation=observation,
+            selector_diag=selector_diag,
+        )
+        metrics = self._geo_preview_adaptive_metrics(signals=signals)
+        policy, _ = self._geo_preview_adaptive_policy(frame_idx=frame_idx, metrics=metrics)
+        if max_past_tokens is not None:
+            policy["frame0_patch_cap"] = int(max(256, min(2048, round((0.12 * float(max_past_tokens or 2048)) * (1.0 - 0.5 * float(metrics["maturity"]))))))
+        return policy
 
     def _geo_compute_adaptive_policy(
         self,
@@ -1363,65 +1649,36 @@ class Aggregator(nn.Module):
         max_past_tokens: Optional[int],
         current_view: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        self._geo_update_adaptive_stats(current_frame_idx, total_tokens, max_past_tokens, current_view)
+        # Backward-compatible wrapper: pure preview only (no state mutation).
+        return self._geo_peek_adaptive_policy(
+            frame_idx=int(current_frame_idx),
+            total_tokens=int(total_tokens),
+            max_past_tokens=max_past_tokens,
+            current_view=current_view,
+            observation=self._geo_get_last_observation(),
+            selector_diag=self._geo_get_last_selector_diag(),
+        )
 
-        maturity = self._geo_compute_maturity()
-        instability = self._geo_compute_instability()
-
-        bootstrap_ready = len(self.geo_voxel_bank) >= 256 and len(self.geo_stable_anchor_voxels) >= 32 and len(self.geo_keyframes) >= 2
-        landmark_ready = bootstrap_ready and self.geo_maturity_ema >= 0.45 and self.geo_matched_ema >= 0.12
-        reference_ready = landmark_ready and self.geo_maturity_ema >= 0.65 and len(self.geo_landmark_voxels) >= 128 and self.geo_selector_overlap_ema >= 16.0
-
-        if reference_ready and self.geo_instability_ema <= 0.45:
-            self.geo_handover_ready_streak = int(self.geo_handover_ready_streak) + 1
-            self.geo_handover_unready_streak = 0
-        else:
-            self.geo_handover_ready_streak = 0
-            self.geo_handover_unready_streak = int(self.geo_handover_unready_streak) + 1
-
-        if str(self.geo_selector_mode) == "legacy":
-            if int(self.geo_handover_ready_streak) >= 5:
-                self.geo_selector_mode = "current"
-        elif str(self.geo_selector_mode) == "current":
-            if float(self.geo_instability_ema) >= 0.70:
-                self.geo_recovery_enter_streak = int(self.geo_recovery_enter_streak) + 1
-            else:
-                self.geo_recovery_enter_streak = 0
-            if int(self.geo_recovery_enter_streak) >= 3:
-                self.geo_selector_mode = "recovery"
-            elif int(self.geo_handover_unready_streak) >= 8:
-                self.geo_selector_mode = "legacy"
-        else:
-            if float(self.geo_instability_ema) <= 0.35:
-                self.geo_recovery_exit_streak = int(self.geo_recovery_exit_streak) + 1
-            else:
-                self.geo_recovery_exit_streak = 0
-            if int(self.geo_recovery_exit_streak) >= 8:
-                self.geo_selector_mode = "current"
-
-        policy = {
-            "mode": str(self.geo_selector_mode),
-            "use_anchor_labels": bool(bootstrap_ready),
-            "use_landmark_labels": bool(landmark_ready),
-            "use_reference_labels": bool(reference_ready),
-            "use_recovery": bool(landmark_ready),
-            "use_reloc": bool(reference_ready and self.geo_instability_ema >= 0.50),
-            "use_cap": bool(reference_ready),
-            "cap_alpha": 0.0 if not reference_ready else min(1.0, max(0.0, (maturity - 0.65) / 0.35)),
-            "hard_recent_frames": int(max(6, min(24, round(8 + 10 * float(self.geo_instability_ema))))),
-            "recent_window": int(max(12, min(32, round(12 + 12 * float(self.geo_instability_ema))))),
-            "soft_recent_window": int(max(16, min(40, round(16 + 12 * float(self.geo_instability_ema))))),
-            "anchor_quota_ratio": float(max(0.03, min(0.08, 0.03 + 0.05 * (1.0 - maturity)))),
-            "local_budget_ratio": float(max(0.45, min(0.85, 0.55 + 0.25 * instability - 0.15 * maturity))),
-            "stable_read_budget_ratio": float(max(0.15, min(0.45, 0.15 + 0.30 * instability))),
-            "frame0_patch_cap": int(max(256, min(2048, round((0.12 * float(max_past_tokens or 2048)) * (1.0 - 0.5 * maturity))))),
-            "use_stale_view": not (
-                int(current_frame_idx) < 64
-                or instability >= 0.60
-                or float(self.geo_motion_ema) >= float(self.geo_full_select_pose_delta)
-            ),
-        }
-        return policy
+    def _geo_get_effective_policy_for_forward(
+        self,
+        *,
+        frame_idx: int,
+        ref_meta: Optional[Dict[str, torch.Tensor]],
+        ref_past_budget: Optional[int],
+        current_view: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if self._geo_has_complete_policy_context(ref_meta, ref_past_budget):
+            return self._geo_commit_adaptive_policy_once(
+                frame_idx=int(frame_idx),
+                total_tokens=int(ref_meta["frame_idx"].numel()),
+                max_past_tokens=int(ref_past_budget) if ref_past_budget is not None else None,
+                current_view=current_view,
+                observation=self._geo_get_last_observation(),
+                selector_diag=self._geo_get_last_selector_diag(),
+            )
+        if self.geo_last_committed_policy is not None:
+            return copy.deepcopy(self.geo_last_committed_policy)
+        return self._geo_default_policy(int(frame_idx))
 
     def _scheduled_layer_budget(self, raw_layer_budget: int, frame_idx: int, policy: Optional[Dict[str, Any]] = None) -> int:
         raw_b = max(0, int(raw_layer_budget))
@@ -1855,12 +2112,7 @@ class Aggregator(nn.Module):
             ref_residuals.append(float(((pos_mean - ref_pos) ** 2).mean().sqrt().item()))
         ref_overlap = int(len(ref_residuals))
 
-        policy = self._geo_compute_adaptive_policy(
-            current_frame_idx=int(frame_idx),
-            total_tokens=0,
-            max_past_tokens=None,
-            current_view=None,
-        )
+        policy = copy.deepcopy(self.geo_last_committed_policy) if self.geo_last_committed_policy is not None else self._geo_default_policy(int(frame_idx))
         safe_warmup = not bool(policy["use_anchor_labels"])
 
         structure_ready = self._geo_structure_ready(frame_idx)
@@ -2076,10 +2328,12 @@ class Aggregator(nn.Module):
             policy=policy,
         )
 
-        self.geo_last_frame_stats = {
+        self.geo_last_observation = {
+            "frame_idx": int(frame_idx),
             "matched_ratio": float(matched_ratio),
             "new_voxel_ratio": float(new_voxels) / max(1.0, float(num_groups)),
             "ref_overlap": float(ref_overlap),
+            "trust_score": float(self.geo_trust_score),
         }
 
         if self._should_log_geo_bootstrap(int(frame_idx)):
@@ -2751,6 +3005,27 @@ class Aggregator(nn.Module):
             guard_frame=True,
         )
 
+    def _update_geo_selector_diag(
+        self,
+        *,
+        current_frame_idx: int,
+        stable_visible_voxel_overlap: int,
+        stable_selected_visible: int,
+        stable_selected_invisible: int,
+        visible_total: int,
+        selected_total: int,
+    ) -> None:
+        vis = float(stable_selected_visible)
+        invis = float(stable_selected_invisible)
+        stable_vis_ratio = vis / float(max(1.0, vis + invis))
+        self.geo_last_selector_diag = {
+            "frame_idx": int(current_frame_idx),
+            "stable_visible_overlap": float(stable_visible_voxel_overlap),
+            "stable_visible_ratio": float(stable_vis_ratio),
+            "visible_total": float(visible_total),
+            "selected_total": float(selected_total),
+        }
+
     def _queue_geo_console_log(
         self,
         current_frame_idx: int,
@@ -2783,15 +3058,6 @@ class Aggregator(nn.Module):
             return
         if int(self.geo_last_console_log_frame) == int(current_frame_idx):
             return
-        vis = float(stable_selected_visible or 0)
-        invis = float(stable_selected_invisible or 0)
-        stable_vis_ratio = vis / float(max(1.0, vis + invis))
-        self.geo_last_selector_diag = {
-            "stable_visible_overlap": float(stable_visible_voxel_overlap or 0.0),
-            "stable_visible_ratio": float(stable_vis_ratio),
-            "visible_total": float(visible_total),
-            "selected_total": float(selected_count),
-        }
         self.geo_pending_console_log = {
             "current_frame_idx": int(current_frame_idx),
             "total_tokens": int(total_tokens),
@@ -2937,6 +3203,18 @@ class Aggregator(nn.Module):
                 f"reanchor_overlap_avg={overlap_avg:.2f} budget={int(budget or 0)}",
                 flush=True,
             )
+
+        policy = self.geo_last_committed_policy or self._geo_default_policy(int(current_frame_idx))
+        inp = self.geo_last_policy_inputs if isinstance(self.geo_last_policy_inputs, dict) else {}
+        met = self.geo_last_policy_metrics if isinstance(self.geo_last_policy_metrics, dict) else {}
+        print(
+            f"[geo_policy] policy_frame={int(self.geo_last_policy_frame)} policy_mode={str(policy.get('mode', 'legacy'))} "
+            f"observation_frame={int(inp.get('observation_frame', -1))} selector_diag_frame={int(inp.get('selector_diag_frame', -1))} "
+            f"total_tokens={int(inp.get('total_tokens', 0) or 0)} max_past_tokens={inp.get('max_past_tokens', None)} "
+            f"maturity={float(met.get('maturity', self.geo_maturity_ema)):.4f} instability={float(met.get('instability', self.geo_instability_ema)):.4f} "
+            f"use_stale_view={bool(policy.get('use_stale_view', False))} use_cap={bool(policy.get('use_cap', False))} use_reloc={bool(policy.get('use_reloc', False))}",
+            flush=True,
+        )
 
     def _should_log_geo_debug(self, current_frame_idx: int) -> bool:
         if current_frame_idx < 0:
@@ -3509,6 +3787,14 @@ class Aggregator(nn.Module):
                 keep = self._cap_keep_with_protection(meta, keep, budget=int(max_past_tokens), recent_frames=recent_frames)
             elif keep.numel() < int(max_past_tokens):
                 keep = self._fill_keep_to_budget(meta, keep, budget=int(max_past_tokens), mode="legacy")
+        self._update_geo_selector_diag(
+            current_frame_idx=current_frame_idx,
+            stable_visible_voxel_overlap=0,
+            stable_selected_visible=0,
+            stable_selected_invisible=0,
+            visible_total=0,
+            selected_total=int(keep.numel()),
+        )
         return keep
 
     def _select_geo_active_indices(
@@ -3545,6 +3831,14 @@ class Aggregator(nn.Module):
             overlap = self._count_keep_cache_overlap(keep_all, self.geo_cached_landmark_keep)
             kv_old = self._summarize_kv_meta(meta, recent_frames=recent_frames)
             kv_keep = self._summarize_kv_meta(meta, recent_frames=recent_frames, subset_idx=keep_all)
+            self._update_geo_selector_diag(
+                current_frame_idx=current_frame_idx,
+                stable_visible_voxel_overlap=0,
+                stable_selected_visible=0,
+                stable_selected_invisible=0,
+                visible_total=0,
+                selected_total=int(keep_all.numel()),
+            )
             self._queue_geo_console_log(
                 current_frame_idx=current_frame_idx,
                 total_tokens=total_tokens,
@@ -3649,6 +3943,14 @@ class Aggregator(nn.Module):
             overlap = self._count_keep_cache_overlap(keep_fast, self.geo_cached_landmark_keep)
             kv_old = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff)
             kv_keep = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff, subset_idx=keep_fast)
+            self._update_geo_selector_diag(
+                current_frame_idx=current_frame_idx,
+                stable_visible_voxel_overlap=0,
+                stable_selected_visible=0,
+                stable_selected_invisible=0,
+                visible_total=0,
+                selected_total=int(keep_fast.numel()),
+            )
             self._queue_geo_console_log(
                 current_frame_idx=current_frame_idx,
                 total_tokens=total_tokens,
@@ -4290,6 +4592,14 @@ class Aggregator(nn.Module):
         reanchor_overlap_avg = (float(reanchor_overlap_sum) / float(max(1, reanchor_frames_used))) if reanchor_frames_used > 0 else 0.0
         kv_old = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff)
         kv_keep = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff, subset_idx=keep)
+        self._update_geo_selector_diag(
+            current_frame_idx=current_frame_idx,
+            stable_visible_voxel_overlap=int(stable_visible_voxel_overlap),
+            stable_selected_visible=int(stable_visible_selected),
+            stable_selected_invisible=int(stable_invisible_selected),
+            visible_total=int(visible_total),
+            selected_total=int(keep.numel()),
+        )
         self._queue_geo_console_log(
             current_frame_idx=current_frame_idx,
             total_tokens=total_tokens,
@@ -4443,17 +4753,12 @@ class Aggregator(nn.Module):
         enable_stable_logic = True
         enable_reanchor_logic = True
         if use_geo_kv_prune:
-            geo_policy = self._geo_compute_adaptive_policy(
-                current_frame_idx=int(past_frame_idx),
-                total_tokens=0,
-                max_past_tokens=None,
+            geo_policy = self._geo_get_effective_policy_for_forward(
+                frame_idx=int(past_frame_idx),
+                ref_meta=None,
+                ref_past_budget=None,
                 current_view=current_view,
             )
-            safe_warmup = bool(geo_policy["mode"] == "legacy" and (not geo_policy["use_anchor_labels"]))
-            enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
-            enable_reference_logic = bool(geo_policy["use_reference_labels"])
-            enable_stable_logic = bool(geo_policy["use_reference_labels"])
-            enable_reanchor_logic = bool(geo_policy["use_reloc"])
 
         # In geo mode, build one shared keep plan per frame instead of re-running
         # expensive Python/CPU geo selection for every global layer.
@@ -4468,11 +4773,19 @@ class Aggregator(nn.Module):
                     break
 
             raw_ref_layer_budget = max(0, int(current_budgets.min().item()))
-            ref_layer_budget = self._scheduled_layer_budget(raw_ref_layer_budget, int(past_frame_idx), policy=geo_policy) if use_geo_kv_prune else raw_ref_layer_budget
+            ref_past_budget_for_policy = max(0, int(raw_ref_layer_budget) - P)
+            ref_meta = self.geo_token_meta[ref_layer_idx] if ref_layer_idx is not None else None
+            cache_frame_idx = int(ref_meta["frame_idx"].max().item()) if (ref_meta is not None and ref_meta["frame_idx"].numel() > 0) else max(-1, int(past_frame_idx) - 1)
+            geo_policy = self._geo_get_effective_policy_for_forward(
+                frame_idx=int(cache_frame_idx),
+                ref_meta=ref_meta,
+                ref_past_budget=ref_past_budget_for_policy,
+                current_view=current_view,
+            )
+
+            ref_layer_budget = self._scheduled_layer_budget(raw_ref_layer_budget, int(past_frame_idx), policy=geo_policy)
             ref_past_budget = max(0, int(ref_layer_budget) - P)
-            if ref_layer_idx is not None:
-                ref_meta = self.geo_token_meta[ref_layer_idx]
-                cache_frame_idx = int(ref_meta["frame_idx"].max().item()) if ref_meta["frame_idx"].numel() > 0 else max(-1, int(past_frame_idx) - 1)
+            if ref_meta is not None:
                 mode_now = str((geo_policy or {}).get("mode", "legacy"))
                 geo_prune_ready = True
                 if mode_now == "legacy":
@@ -4498,10 +4811,10 @@ class Aggregator(nn.Module):
                         far=geo_far,
                         current_view=current_view,
                         max_past_tokens=ref_past_budget,
-                        enable_reference_logic=enable_reference_logic,
-                        enable_landmark_logic=enable_landmark_logic,
-                        enable_stable_logic=enable_stable_logic,
-                        enable_reanchor_logic=enable_reanchor_logic,
+                        enable_reference_logic=bool(geo_policy["use_reference_labels"]),
+                        enable_landmark_logic=bool(geo_policy["use_landmark_labels"]),
+                        enable_stable_logic=bool(geo_policy["use_reference_labels"]),
+                        enable_reanchor_logic=bool(geo_policy["use_reloc"]),
                         policy=geo_policy,
                     )
                     protected_ref = torch.nonzero(self._hard_protected_mask(ref_meta), as_tuple=False).view(-1)
@@ -4544,7 +4857,7 @@ class Aggregator(nn.Module):
                 )
         elif use_cache and use_geo_kv_prune:
             raw_ref_layer_budget = max(0, int(current_budgets.min().item()))
-            ref_layer_budget = self._scheduled_layer_budget(raw_ref_layer_budget, int(past_frame_idx), policy=geo_policy) if use_geo_kv_prune else raw_ref_layer_budget
+            ref_layer_budget = self._scheduled_layer_budget(raw_ref_layer_budget, int(past_frame_idx), policy=geo_policy)
             ref_past_budget = max(0, int(ref_layer_budget) - P)
             self._queue_geo_console_log(
                 current_frame_idx=max(-1, int(past_frame_idx)),
@@ -4567,6 +4880,13 @@ class Aggregator(nn.Module):
                 kv_comp_old=self._summarize_kv_meta(None, recent_frames=geo_recent_frames),
             )
 
+        if use_geo_kv_prune:
+            geo_policy = copy.deepcopy(geo_policy or self._geo_default_policy(int(past_frame_idx)))
+            safe_warmup = bool(geo_policy["mode"] == "legacy" and (not geo_policy["use_anchor_labels"]))
+            enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
+            enable_reference_logic = bool(geo_policy["use_reference_labels"])
+            enable_stable_logic = bool(geo_policy["use_reference_labels"])
+            enable_reanchor_logic = bool(geo_policy["use_reloc"])
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
