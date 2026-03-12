@@ -119,6 +119,30 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 ress.append(res)
             return StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
     
+    @staticmethod
+    def _kv_list_to_cpu(kv_list):
+        out = []
+        for kv in kv_list:
+            if kv is None:
+                out.append(None)
+            else:
+                out.append((kv[0].detach().cpu(), kv[1].detach().cpu()))
+        return out
+
+    @staticmethod
+    def _kv_list_to_device(kv_list, device):
+        out = []
+        for kv in kv_list:
+            if kv is None:
+                out.append(None)
+            else:
+                out.append((
+                    kv[0].to(device, non_blocking=True),
+                    kv[1].to(device, non_blocking=True),
+                ))
+        return out
+
+    @torch.inference_mode()
     def inference(
         self, 
         frames, 
@@ -141,6 +165,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         show_progress: bool = True,
         memory_diagnostics: bool = False,
         memory_log_interval: int = 1,
+        offload_camera_cache_to_cpu: bool = False,
     ):
         if past_key_values is None:
             past_key_values = [None] * self.aggregator.depth
@@ -183,20 +208,31 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 print(f"Inference step {i + 1}/{total_frames}", flush=True)
 
             images = frame["img"].unsqueeze(0).to(model_device, non_blocking=True)
-            selected_view = current_view
+            policy_view = current_view
+            selector_view = policy_view
+            policy_view_source = "current_view" if policy_view is not None else "none"
+            selector_view_source = policy_view_source
+            geo_use_view_pruning = True
             if use_geo_kv_prune:
-                policy = self.aggregator._geo_peek_adaptive_policy(
-                    frame_idx=i,
-                    total_tokens=0,
-                    max_past_tokens=None,
-                    current_view=current_view,
-                    observation=self.aggregator._geo_get_last_observation(),
-                    selector_diag=self.aggregator._geo_get_last_selector_diag(),
+                policy = self.aggregator._geo_peek_effective_policy_for_inference(
+                    past_key_values=past_key_values,
+                    past_frame_idx=i,
+                    total_budget=total_budget,
+                    current_view=policy_view,
+                    geo_recent_frames=geo_recent_frames,
                 )
-                use_stale_view = bool(policy["use_stale_view"])
-                selected_view = None if (not use_stale_view) else current_view
-                if use_stale_view and last_reliable_view is not None and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold:
-                    selected_view = last_reliable_view
+                geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
+                prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
+                if (
+                    prefer_last_reliable_view
+                    and last_reliable_view is not None
+                    and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
+                ):
+                    selector_view = last_reliable_view
+                    selector_view_source = "last_reliable_view"
+                else:
+                    selector_view = policy_view
+                    selector_view_source = "current_view" if selector_view is not None else "none"
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
@@ -208,7 +244,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 geo_recent_frames=geo_recent_frames,
                 geo_near=geo_near,
                 geo_far=geo_far,
-                current_view=selected_view,
+                geo_use_view_pruning=geo_use_view_pruning,
+                current_view=selector_view,
+                policy_view=policy_view,
+                policy_view_source=policy_view_source,
+                selector_view_source=selector_view_source,
             )
 
             
@@ -217,27 +257,56 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             else:
                 aggregated_tokens, patch_start_idx = aggregator_output        
             
-            with torch.cuda.amp.autocast(enabled=False):
-                if self.camera_head is not None:
-                    pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
-                    pose_enc = pose_enc[-1]
-                    camera_pose = pose_enc[:, 0, :]
+            needs_cpu_export = (frame_writer is not None) or cache_results
+            need_camera = self.camera_head is not None
+            need_depth = (self.depth_head is not None) and bool(needs_cpu_export)
+            need_point = (self.point_head is not None) and bool(needs_cpu_export or use_geo_kv_prune)
+            need_track = (self.track_head is not None) and (query_points is not None)
 
-                if self.depth_head is not None:
+            camera_cache_for_step = past_key_values_camera
+            if offload_camera_cache_to_cpu and camera_cache_for_step is not None:
+                camera_cache_for_step = self._kv_list_to_device(camera_cache_for_step, model_device)
+
+            pose_enc = None
+            camera_pose = None
+            depth = None
+            depth_conf = None
+            pts3d = None
+            pts3d_conf = None
+            track = None
+            vis = None
+            track_conf = None
+            new_camera_cache = None
+            extrinsic = None
+            intrinsic = None
+            world_to_cam = None
+            intrinsic_cur = None
+
+            with torch.cuda.amp.autocast(enabled=False):
+                if need_camera:
+                    pose_enc, new_camera_cache = self.camera_head(
+                        aggregated_tokens,
+                        past_key_values_camera=camera_cache_for_step,
+                        use_cache=True,
+                    )
+                    pose_enc = pose_enc[-1]
+                    camera_pose = pose_enc[:, 0, :] if needs_cpu_export else None
+
+                if need_depth:
                     depth, depth_conf = self.depth_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx
                     )
-                    depth = depth[:, 0] 
+                    depth = depth[:, 0]
                     depth_conf = depth_conf[:, 0]
-                
-                if self.point_head is not None:
+
+                if need_point:
                     pts3d, pts3d_conf = self.point_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx
                     )
-                    pts3d = pts3d[:, 0] 
+                    pts3d = pts3d[:, 0]
                     pts3d_conf = pts3d_conf[:, 0]
 
-                if use_geo_kv_prune and self.point_head is not None and self.camera_head is not None:
+                if use_geo_kv_prune and need_point and need_camera and pose_enc is not None and pts3d_conf is not None:
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(
                         pose_enc,
                         images.shape[-2:]
@@ -251,7 +320,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     intrinsic_cpu = intrinsic_cur.detach().cpu() if intrinsic_cur is not None else None
                     pose_delta = 0.0
                     if prev_world_to_cam_cpu is not None:
-                        pose_delta = float((world_to_cam_cpu[:, :3, 3] - prev_world_to_cam_cpu[:, :3, 3]).norm(dim=-1).mean().item())
+                        t_cur = world_to_cam_cpu[:, :3, 3]
+                        t_prev = prev_world_to_cam_cpu[:, :3, 3]
+                        trans_delta = float((t_cur - t_prev).norm(dim=-1).mean().item())
+
+                        r_cur = world_to_cam_cpu[:, :3, :3]
+                        r_prev = prev_world_to_cam_cpu[:, :3, :3]
+                        r_rel = torch.matmul(r_cur, r_prev.transpose(-1, -2))
+                        trace = r_rel[:, 0, 0] + r_rel[:, 1, 1] + r_rel[:, 2, 2]
+                        cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+                        rot_delta = float(torch.acos(cos_theta).mean().item())
+
+                        pose_delta = float(trans_delta + 0.5 * rot_delta)
 
                     conf_mean = float(pts3d_conf.detach().to(torch.float32).mean().item())
                     conf_drop = 0.0 if prev_conf_mean is None else max(0.0, float(prev_conf_mean - conf_mean))
@@ -280,34 +360,42 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     prev_world_to_cam_cpu = world_to_cam_cpu
                     prev_conf_mean = conf_mean
 
-                if self.track_head is not None and query_points is not None:
+                if need_track:
                     track_list, vis, conf = self.track_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx, query_points=query_points
-                )
-                    track = track_list[-1][:, 0]  
+                    )
+                    track = track_list[-1][:, 0]
                     query_points = track
                     vis = vis[:, 0]
                     track_conf = conf[:, 0]
 
-            res_gpu = {
-                "pts3d_in_other_view": pts3d,
-                "conf": pts3d_conf,
-                "depth": depth,
-                "depth_conf": depth_conf,
-                "camera_pose": camera_pose,
-                **({"valid_mask": frame["valid_mask"]} if "valid_mask" in frame else {}),
-                **(
-                    {"track": track, "vis": vis, "track_conf": track_conf}
-                    if query_points is not None
-                    else {}
-                ),
-            }
-            needs_cpu_export = (frame_writer is not None) or cache_results
+            if need_camera:
+                if offload_camera_cache_to_cpu:
+                    past_key_values_camera = self._kv_list_to_cpu(new_camera_cache)
+                else:
+                    past_key_values_camera = new_camera_cache
+
+            res_cpu = None
             if needs_cpu_export:
-                res_cpu = {
-                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                    for k, v in res_gpu.items()
-                }
+                res_cpu = {}
+                if pts3d is not None:
+                    res_cpu["pts3d_in_other_view"] = pts3d.detach().cpu()
+                    res_cpu["conf"] = pts3d_conf.detach().cpu() if pts3d_conf is not None else None
+                if depth is not None:
+                    res_cpu["depth"] = depth.detach().cpu()
+                    res_cpu["depth_conf"] = depth_conf.detach().cpu() if depth_conf is not None else None
+                if camera_pose is not None:
+                    res_cpu["camera_pose"] = camera_pose.detach().cpu()
+                if "valid_mask" in frame:
+                    res_cpu["valid_mask"] = (
+                        frame["valid_mask"].detach().cpu()
+                        if isinstance(frame["valid_mask"], torch.Tensor)
+                        else frame["valid_mask"]
+                    )
+                if need_track and track is not None:
+                    res_cpu["track"] = track.detach().cpu()
+                    res_cpu["vis"] = vis.detach().cpu() if vis is not None else None
+                    res_cpu["track_conf"] = track_conf.detach().cpu() if track_conf is not None else None
 
                 if frame_writer is not None:
                     frame_writer(i, frame, res_cpu)
@@ -327,7 +415,38 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     f"allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB, max_allocated={max_allocated_gb:.2f} GB"
                 )
 
-            del res_gpu
+            del aggregated_tokens
+            if pose_enc is not None:
+                del pose_enc
+            if camera_pose is not None:
+                del camera_pose
+            if depth is not None:
+                del depth
+            if depth_conf is not None:
+                del depth_conf
+            if pts3d is not None:
+                del pts3d
+            if pts3d_conf is not None:
+                del pts3d_conf
+            if track is not None:
+                del track
+            if vis is not None:
+                del vis
+            if track_conf is not None:
+                del track_conf
+            if extrinsic is not None:
+                del extrinsic
+            if intrinsic is not None:
+                del intrinsic
+            if world_to_cam is not None:
+                del world_to_cam
+            if intrinsic_cur is not None:
+                del intrinsic_cur
+            if camera_cache_for_step is not None and offload_camera_cache_to_cpu:
+                del camera_cache_for_step
+            if new_camera_cache is not None and offload_camera_cache_to_cpu:
+                del new_camera_cache
+            del images
 
         final_state = {
             "past_key_values": past_key_values,
