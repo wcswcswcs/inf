@@ -2261,7 +2261,10 @@ class Aggregator(nn.Module):
             policy=policy,
         )
 
-        selected: set[int] = set(int(v) for v in hard_keep.tolist())
+        selected: set[int] = set()
+        selected_order: List[int] = []
+        self._ordered_add(selected, selected_order, hard_keep)
+
         n = int(meta.get("frame_idx", torch.empty((0,), dtype=torch.long)).numel())
         if n <= 0:
             return torch.empty((0,), dtype=torch.long)
@@ -2279,19 +2282,25 @@ class Aggregator(nn.Module):
             remain_budget = max(0, b - len(selected))
             recent_quota = min(int(recent_patch.numel()), max(128, remain_budget))
             recent_keep = self._take_recent_quota(recent_patch, frame_idx=frame_idx, quota=int(recent_quota))
-            selected.update(int(v) for v in recent_keep.tolist())
+            self._ordered_add(selected, selected_order, recent_keep)
 
-        keep = torch.tensor(sorted(selected), dtype=torch.long) if selected else torch.empty((0,), dtype=torch.long)
+        keep = torch.tensor(selected_order, dtype=torch.long) if selected_order else torch.empty((0,), dtype=torch.long)
         keep = self._cap_keep_with_hard_protection(
             meta=meta,
             keep_idx=keep,
             hard_keep=hard_keep,
             budget=b,
             recent_frames=max(1, int(recent_frames)),
+            priority_keep_idx=keep,
         )
 
         if keep.numel() < b:
-            keep = self._fill_keep_to_budget_preserve_order(meta, keep, budget=b, mode="balanced")
+            keep = self._fill_keep_to_budget_preserve_order(
+                meta,
+                keep,
+                budget=b,
+                mode="balanced",
+            )
         return keep
 
     def _geo_anchor_ready(self, frame_idx: int) -> bool:
@@ -4089,10 +4098,11 @@ class Aggregator(nn.Module):
         idx_all = torch.arange(n, dtype=torch.long)
         frame_idx = meta["frame_idx"]
         is_special = meta.get("is_special", torch.zeros((n,), dtype=torch.bool))
-        is_reference = meta.get("is_reference", torch.zeros((n,), dtype=torch.bool))
-        is_landmark = meta.get("is_landmark", torch.zeros((n,), dtype=torch.bool))
-        is_anchor = meta.get("is_anchor", torch.zeros((n,), dtype=torch.bool))
-        is_keyframe = meta.get("is_keyframe", torch.zeros((n,), dtype=torch.bool))
+        geo_role = meta.get("geo_role", self._compute_primary_geo_role(meta))
+        is_reference = geo_role == 4
+        is_landmark = geo_role == 2
+        is_anchor = geo_role == 3
+        is_keyframe = geo_role == 1
 
         max_frame = int(frame_idx.max().item()) if frame_idx.numel() > 0 else -1
         recent_mask = frame_idx >= max(-1, max_frame - max(1, int(recent_frames)) + 1)
@@ -4834,24 +4844,25 @@ class Aggregator(nn.Module):
         max_past_tokens: Optional[int],
         recent_frames_eff: int,
         policy: Optional[Dict[str, Any]],
-    ) -> set[int]:
+    ) -> torch.Tensor:
         _ = int(current_frame_idx)
         _ = int(max(1, recent_frames_eff))
         n = int(meta["frame_idx"].numel()) if meta.get("frame_idx") is not None else 0
         if n <= 0:
-            return set()
+            return torch.empty((0,), dtype=torch.long)
 
-        seeded: set[int] = set()
+        ordered_parts: List[torch.Tensor] = []
         cached = self._identity_keep_to_index(
             meta,
             self.geo_cached_landmark_identity_keep,
+            preserve_order=True,
         )
         if cached.numel() > 0:
             if max_past_tokens is not None:
                 cache_cap = min(int(cached.numel()), max(64, int(float(max_past_tokens) * 0.25)))
                 if cached.numel() > cache_cap:
                     cached = cached[-cache_cap:]
-            seeded.update(int(v) for v in cached.tolist())
+            ordered_parts.append(cached)
 
         idx_all = torch.arange(n, dtype=torch.long)
         frame_idx = meta["frame_idx"]
@@ -4882,10 +4893,20 @@ class Aggregator(nn.Module):
             reference_quota = int(self.geo_reference_token_quota)
             keyframe_quota = int(self.geo_keyframe_protected_quota)
 
-        seeded.update(int(v) for v in _bounded_recent(is_reference, reference_quota).tolist())
-        seeded.update(int(v) for v in _bounded_recent(is_anchor, anchor_quota).tolist())
-        seeded.update(int(v) for v in _bounded_recent(is_keyframe, keyframe_quota).tolist())
-        return seeded
+        ref_keep = _bounded_recent(is_reference, reference_quota)
+        anchor_keep = _bounded_recent(is_anchor, anchor_quota)
+        keyframe_keep = _bounded_recent(is_keyframe, keyframe_quota)
+
+        if ref_keep.numel() > 0:
+            ordered_parts.append(ref_keep)
+        if anchor_keep.numel() > 0:
+            ordered_parts.append(anchor_keep)
+        if keyframe_keep.numel() > 0:
+            ordered_parts.append(keyframe_keep)
+
+        if not ordered_parts:
+            return torch.empty((0,), dtype=torch.long)
+        return self._unique_preserve_order_long(torch.cat(ordered_parts, dim=0))
 
     @staticmethod
     def _compute_primary_geo_role(meta: Dict[str, torch.Tensor]) -> torch.LongTensor:
