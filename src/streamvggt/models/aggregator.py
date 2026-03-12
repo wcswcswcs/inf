@@ -3893,7 +3893,11 @@ class Aggregator(nn.Module):
         if keep_idx is None or keep_idx.numel() == 0:
             return torch.empty((0,), dtype=torch.long)
 
-        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+        keep = self._sanitize_keep_idx_preserve_order(
+            keep_idx.detach().cpu().long(),
+            meta_len=int(meta["frame_idx"].numel()),
+            kv_len=int(meta["frame_idx"].numel()),
+        )
         is_special = meta["is_special"].index_select(0, keep)
         geo_role = meta.get("geo_role", self._compute_primary_geo_role(meta)).index_select(0, keep)
 
@@ -3912,7 +3916,7 @@ class Aggregator(nn.Module):
             cap = 1024
         if cache_identity.numel() > cap:
             cache_identity = cache_identity[-cap:]
-        return torch.unique(cache_identity.detach().cpu().long(), sorted=True)
+        return self._unique_preserve_order_long(cache_identity.detach().cpu().long())
 
     @staticmethod
     def _count_keep_cache_overlap_identity(
@@ -4111,10 +4115,12 @@ class Aggregator(nn.Module):
         score = score + is_reference.to(torch.float32) * 3.0 + is_landmark.to(torch.float32) * 2.0 + is_anchor.to(torch.float32) * 1.5 + is_keyframe.to(torch.float32) * 1.0
 
         bounded_special = self._bounded_special_idx(meta, idx_all, budget=int(max_past_tokens), recent_frames=recent_frames)
-        selected_parts: List[torch.Tensor] = [bounded_special]
+        selected_set: set[int] = set()
+        selected_order: List[int] = []
         selected_mask = torch.zeros((n,), dtype=torch.bool)
-        if selected_parts[0].numel() > 0:
-            selected_mask[selected_parts[0]] = True
+        self._ordered_add(selected_set, selected_order, bounded_special)
+        if bounded_special.numel() > 0:
+            selected_mask[bounded_special] = True
 
         def _pick(mask: torch.Tensor, quota: int):
             nonlocal selected_mask
@@ -4127,7 +4133,7 @@ class Aggregator(nn.Module):
             sc = score.index_select(0, cand)
             top = torch.topk(sc, k=k, largest=True).indices
             out = cand.index_select(0, top)
-            selected_parts.append(out)
+            self._ordered_add(selected_set, selected_order, out)
             selected_mask[out] = True
 
         if policy is not None:
@@ -4147,7 +4153,7 @@ class Aggregator(nn.Module):
         _pick(is_keyframe, q_key)
         _pick(recent_mask & (~is_special), q_recent)
 
-        keep = torch.unique(torch.cat([p for p in selected_parts if p.numel() > 0], dim=0), sorted=True)
+        keep = torch.tensor(selected_order, dtype=torch.long) if selected_order else torch.empty((0,), dtype=torch.long)
         hard_mode = str(self.geo_reloc_state) == "hard"
         if (not hard_mode) and keep.numel() < int(max_past_tokens):
             remain = int(max_past_tokens) - int(keep.numel())
@@ -4156,9 +4162,11 @@ class Aggregator(nn.Module):
                 k = min(int(extra.numel()), int(min(remain, 512)))
                 sc = score.index_select(0, extra)
                 top = torch.topk(sc, k=k, largest=True).indices
-                keep = torch.unique(torch.cat([keep, extra.index_select(0, top)], dim=0), sorted=True)
+                extra_tokens = extra.index_select(0, top)
+                self._ordered_add(selected_set, selected_order, extra_tokens)
+                keep = torch.tensor(selected_order, dtype=torch.long) if selected_order else torch.empty((0,), dtype=torch.long)
 
-        keep = self._sanitize_keep_idx(keep, meta_len=n, kv_len=n)
+        keep = self._sanitize_keep_idx_preserve_order(keep, meta_len=n, kv_len=n)
         keep = self._cap_keep_for_geo_mode(
             meta=meta,
             keep_idx=keep,
