@@ -2103,6 +2103,77 @@ class Aggregator(nn.Module):
             return torch.unique(torch.cat([keep, fill[:need]], dim=0), sorted=True)
         return keep
 
+    def _fill_keep_to_budget_preserve_order(
+        self,
+        meta: Dict[str, torch.Tensor],
+        keep: torch.Tensor,
+        budget: int,
+        mode: str = "balanced",
+    ) -> torch.Tensor:
+        n = int(meta["frame_idx"].numel())
+        if n <= 0 or keep.numel() >= int(budget):
+            return self._sanitize_keep_idx_preserve_order(keep, meta_len=n, kv_len=n)
+
+        keep_ord = self._sanitize_keep_idx_preserve_order(keep, meta_len=n, kv_len=n)
+        idx_all = torch.arange(n, dtype=torch.long)
+        frame_idx = meta["frame_idx"]
+
+        leftover = idx_all[~torch.isin(idx_all, keep_ord)]
+        if leftover.numel() == 0:
+            return keep_ord
+
+        need = int(budget) - int(keep_ord.numel())
+        if need <= 0:
+            return keep_ord
+
+        picked_extra: List[int] = []
+
+        if str(mode) == "legacy":
+            left_frames = frame_idx.index_select(0, leftover)
+            uniq_frames = torch.unique(left_frames, sorted=True)
+            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
+            for f in uniq_frames.tolist():
+                idx_f = leftover[left_frames == int(f)]
+                if idx_f.numel() > 0:
+                    for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist():
+                        picked_extra.append(int(v))
+
+        elif str(mode) == "balanced":
+            left_frames = frame_idx.index_select(0, leftover)
+            uniq_frames = torch.unique(left_frames, sorted=True)
+            selected_fill: List[int] = []
+            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
+            step_denom = max(1, int(need // max(1, per_frame)))
+            stride = max(1, int(math.ceil(float(max(1, uniq_frames.numel())) / float(step_denom))))
+            for f in uniq_frames[::stride].tolist():
+                idx_f = leftover[left_frames == int(f)]
+                if idx_f.numel() > 0:
+                    selected_fill.extend(int(v) for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist())
+            picked_extra.extend(selected_fill)
+
+        else:
+            left_frames = frame_idx.index_select(0, leftover)
+            uniq_frames = torch.unique(left_frames, sorted=True)
+            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
+            for f in uniq_frames.tolist():
+                idx_f = leftover[left_frames == int(f)]
+                if idx_f.numel() > 0:
+                    picked_extra.extend(int(v) for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist())
+
+        if len(picked_extra) < need:
+            picked_extra_set = set(picked_extra)
+            for v in leftover.tolist():
+                iv = int(v)
+                if iv not in picked_extra_set:
+                    picked_extra.append(iv)
+                    picked_extra_set.add(iv)
+                if len(picked_extra) >= need:
+                    break
+
+        fill = torch.tensor(picked_extra[:need], dtype=torch.long) if picked_extra else torch.empty((0,), dtype=torch.long)
+        out = self._unique_preserve_order_long(torch.cat([keep_ord, fill], dim=0))
+        return out
+
     def _bounded_special_idx(
         self,
         meta: Dict[str, torch.Tensor],
@@ -2220,7 +2291,7 @@ class Aggregator(nn.Module):
         )
 
         if keep.numel() < b:
-            keep = self._fill_keep_to_budget(meta, keep, budget=b, mode="balanced")
+            keep = self._fill_keep_to_budget_preserve_order(meta, keep, budget=b, mode="balanced")
         return keep
 
     def _geo_anchor_ready(self, frame_idx: int) -> bool:
@@ -4663,7 +4734,7 @@ class Aggregator(nn.Module):
                         recent_frames=recent_frames_eff,
                     )
             elif keep.numel() < int(max_past_tokens):
-                keep = self._fill_keep_to_budget(meta, keep, budget=int(max_past_tokens), mode="balanced")
+                keep = self._fill_keep_to_budget_preserve_order(meta, keep, budget=int(max_past_tokens), mode="balanced")
 
         diag_final = self._recompute_selector_diag_from_final_keep(
             meta=meta,
@@ -6646,6 +6717,12 @@ class Aggregator(nn.Module):
                             # Keep explicit hard cap in geo mode with hard-backbone-first protection.
                             if new_kv[0].shape[2] > layer_budget:
                                 cap_all = torch.arange(new_kv[0].shape[2], dtype=torch.long)
+                                frame_idx_all = merged_meta["frame_idx"]
+                                current_frame_tokens = cap_all[frame_idx_all == int(past_frame_idx)]
+                                past_tokens = cap_all[frame_idx_all < int(past_frame_idx)]
+                                priority_cap_idx = self._unique_preserve_order_long(
+                                    torch.cat([current_frame_tokens, past_tokens], dim=0)
+                                )
                                 hard_keep_final = self._build_hard_backbone_keep(
                                     merged_meta,
                                     current_frame_idx=int(past_frame_idx),
@@ -6658,7 +6735,7 @@ class Aggregator(nn.Module):
                                     hard_keep=hard_keep_final,
                                     budget=int(layer_budget),
                                     recent_frames=int(geo_recent_frames),
-                                    priority_keep_idx=cap_all,
+                                    priority_keep_idx=priority_cap_idx,
                                 )
                                 cap_keep = self._sanitize_keep_idx_preserve_order(
                                     cap_keep,
