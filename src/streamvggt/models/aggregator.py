@@ -3058,6 +3058,29 @@ class Aggregator(nn.Module):
         return keep
 
     @staticmethod
+    def _sanitize_keep_idx_preserve_order(keep_idx: torch.Tensor, meta_len: int, kv_len: int) -> torch.Tensor:
+        if keep_idx is None or keep_idx.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        upper = min(int(meta_len), int(kv_len))
+        if upper <= 0:
+            return torch.empty(0, dtype=torch.long)
+
+        keep_cpu = keep_idx.detach().cpu().long().view(-1)
+        out: List[int] = []
+        seen = set()
+        for v in keep_cpu.tolist():
+            iv = int(v)
+            if iv < 0 or iv >= upper:
+                continue
+            if iv in seen:
+                continue
+            seen.add(iv)
+            out.append(iv)
+        if not out:
+            return torch.empty(0, dtype=torch.long)
+        return torch.tensor(out, dtype=torch.long)
+
+    @staticmethod
     def _is_full_range_keep(keep_idx: torch.Tensor, length: int) -> bool:
         if keep_idx is None:
             return False
@@ -4926,11 +4949,24 @@ class Aggregator(nn.Module):
         recent_frames: int,
         priority_keep_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        meta_len = int(meta["frame_idx"].numel())
         if budget is None:
-            return torch.unique(keep_idx.detach().cpu().long(), sorted=True)
+            return self._sanitize_keep_idx_preserve_order(
+                keep_idx,
+                meta_len=meta_len,
+                kv_len=meta_len,
+            )
         b = max(0, int(budget))
-        keep = torch.unique(keep_idx.detach().cpu().long(), sorted=True)
-        hard = self._sanitize_keep_idx(hard_keep.detach().cpu().long() if hard_keep is not None else torch.empty((0,), dtype=torch.long), meta_len=int(meta["frame_idx"].numel()), kv_len=int(meta["frame_idx"].numel()))
+        keep = self._sanitize_keep_idx_preserve_order(
+            keep_idx,
+            meta_len=meta_len,
+            kv_len=meta_len,
+        )
+        hard = self._sanitize_keep_idx_preserve_order(
+            hard_keep.detach().cpu().long() if hard_keep is not None else torch.empty((0,), dtype=torch.long),
+            meta_len=meta_len,
+            kv_len=meta_len,
+        )
         if keep.numel() <= b:
             return keep
         if hard.numel() >= b:
@@ -4946,10 +4982,10 @@ class Aggregator(nn.Module):
             out = hard
         else:
             if priority_keep_idx is not None and priority_keep_idx.numel() > 0:
-                priority = self._sanitize_keep_idx(
+                priority = self._sanitize_keep_idx_preserve_order(
                     priority_keep_idx.detach().cpu().long(),
-                    meta_len=int(meta["frame_idx"].numel()),
-                    kv_len=int(meta["frame_idx"].numel()),
+                    meta_len=meta_len,
+                    kv_len=meta_len,
                 )
                 soft_order = priority[
                     torch.isin(priority, keep) & (~torch.isin(priority, hard))
@@ -4968,7 +5004,7 @@ class Aggregator(nn.Module):
                         ),
                     )
                 pick_soft = remain[:take_n]
-            out = torch.unique(torch.cat([hard, pick_soft], dim=0), sorted=True)
+            out = self._unique_preserve_order_long(torch.cat([hard, pick_soft], dim=0))
         if out.numel() > b:
             out = self._cap_hard_backbone_only(
                 meta=meta,
@@ -5077,7 +5113,7 @@ class Aggregator(nn.Module):
             return torch.empty((0,), dtype=torch.long)
 
         total = int(meta["frame_idx"].numel())
-        keep = self._sanitize_keep_idx(
+        keep = self._sanitize_keep_idx_preserve_order(
             keep_idx.detach().cpu().long(),
             meta_len=total,
             kv_len=total,
@@ -5092,7 +5128,7 @@ class Aggregator(nn.Module):
             policy=policy,
         )
 
-        keep_all = torch.unique(torch.cat([keep, hard_keep], dim=0), sorted=True)
+        keep_all = self._unique_preserve_order_long(torch.cat([keep, hard_keep], dim=0))
         if priority_keep_idx is None:
             priority_keep_idx = keep
         out = self._cap_keep_with_hard_protection(
@@ -5104,7 +5140,7 @@ class Aggregator(nn.Module):
             priority_keep_idx=priority_keep_idx,
         )
 
-        return self._sanitize_keep_idx(
+        return self._sanitize_keep_idx_preserve_order(
             out,
             meta_len=total,
             kv_len=total,
@@ -6533,12 +6569,13 @@ class Aggregator(nn.Module):
                                 past_kv_block = None
                                 past_meta = self.geo_token_meta[layer_idx]
                             elif not self._is_full_range_keep(pre_keep, past_kv_block[0].shape[2]):
-                                pre_keep_dev = pre_keep.to(past_kv_block[0].device)
+                                pre_keep_mat = torch.sort(pre_keep).values
+                                pre_keep_dev = pre_keep_mat.to(past_kv_block[0].device)
                                 past_kv_block = (
                                     torch.index_select(past_kv_block[0], 2, pre_keep_dev),
                                     torch.index_select(past_kv_block[1], 2, pre_keep_dev),
                                 )
-                                past_meta = self._index_meta(past_meta, pre_keep)
+                                past_meta = self._index_meta(past_meta, pre_keep_mat)
 
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
@@ -6628,12 +6665,13 @@ class Aggregator(nn.Module):
                                     meta_len=merged_meta["frame_idx"].numel(),
                                     kv_len=new_kv[0].shape[2],
                                 )
-                                cap_keep_dev = cap_keep.to(new_kv[0].device)
+                                cap_keep_mat = torch.sort(cap_keep).values
+                                cap_keep_dev = cap_keep_mat.to(new_kv[0].device)
                                 new_kv = (
                                     torch.index_select(new_kv[0], 2, cap_keep_dev),
                                     torch.index_select(new_kv[1], 2, cap_keep_dev),
                                 )
-                                merged_meta = self._index_meta(merged_meta, cap_keep)
+                                merged_meta = self._index_meta(merged_meta, cap_keep_mat)
                             frame0_in_cache = int((merged_meta["frame_idx"] == 0).sum().item())
                             ref_in_cache = int(merged_meta.get("is_reference", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             landmark_in_cache = int(merged_meta.get("is_landmark", torch.zeros_like(merged_meta["is_special"])).sum().item())
