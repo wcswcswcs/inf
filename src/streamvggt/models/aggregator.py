@@ -2126,47 +2126,54 @@ class Aggregator(nn.Module):
         if need <= 0:
             return keep_ord
 
+        left_frames = frame_idx.index_select(0, leftover)
+        uniq_frames = torch.unique(left_frames, sorted=True)
+        frame_to_tokens: Dict[int, torch.Tensor] = {}
+        for f in uniq_frames.tolist():
+            frame_to_tokens[int(f)] = leftover[left_frames == int(f)]
+
         picked_extra: List[int] = []
 
-        if str(mode) == "legacy":
-            left_frames = frame_idx.index_select(0, leftover)
-            uniq_frames = torch.unique(left_frames, sorted=True)
-            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
-            for f in uniq_frames.tolist():
-                idx_f = leftover[left_frames == int(f)]
-                if idx_f.numel() > 0:
-                    for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist():
-                        picked_extra.append(int(v))
-
-        elif str(mode) == "balanced":
-            left_frames = frame_idx.index_select(0, leftover)
-            uniq_frames = torch.unique(left_frames, sorted=True)
-            selected_fill: List[int] = []
-            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
+        if str(mode) == "balanced":
+            rev_frames = torch.flip(uniq_frames, dims=[0])
+            per_frame = max(16, min(64, int(need // max(1, rev_frames.numel()))))
             step_denom = max(1, int(need // max(1, per_frame)))
-            stride = max(1, int(math.ceil(float(max(1, uniq_frames.numel())) / float(step_denom))))
-            for f in uniq_frames[::stride].tolist():
-                idx_f = leftover[left_frames == int(f)]
-                if idx_f.numel() > 0:
-                    selected_fill.extend(int(v) for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist())
-            picked_extra.extend(selected_fill)
-
-        else:
-            left_frames = frame_idx.index_select(0, leftover)
-            uniq_frames = torch.unique(left_frames, sorted=True)
-            per_frame = max(16, min(64, int(need // max(1, uniq_frames.numel()))))
-            for f in uniq_frames.tolist():
-                idx_f = leftover[left_frames == int(f)]
+            stride = max(1, int(math.ceil(float(max(1, rev_frames.numel())) / float(step_denom))))
+            chosen_frames = rev_frames[::stride]
+            for f in chosen_frames.tolist():
+                idx_f = frame_to_tokens[int(f)]
                 if idx_f.numel() > 0:
                     picked_extra.extend(int(v) for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist())
 
+        elif str(mode) == "legacy":
+            rev_frames = torch.flip(uniq_frames, dims=[0])
+            per_frame = max(16, min(64, int(need // max(1, rev_frames.numel()))))
+            for f in rev_frames.tolist():
+                idx_f = frame_to_tokens[int(f)]
+                if idx_f.numel() > 0:
+                    picked_extra.extend(int(v) for v in idx_f[: min(int(per_frame), int(idx_f.numel()))].tolist())
+
+        else:
+            rev_frames = torch.flip(uniq_frames, dims=[0])
+            for f in rev_frames.tolist():
+                idx_f = frame_to_tokens[int(f)]
+                if idx_f.numel() > 0:
+                    picked_extra.extend(int(v) for v in idx_f.tolist())
+                    if len(picked_extra) >= need:
+                        break
+
         if len(picked_extra) < need:
             picked_extra_set = set(picked_extra)
-            for v in leftover.tolist():
-                iv = int(v)
-                if iv not in picked_extra_set:
-                    picked_extra.append(iv)
-                    picked_extra_set.add(iv)
+            rev_frames = torch.flip(uniq_frames, dims=[0])
+            for f in rev_frames.tolist():
+                idx_f = frame_to_tokens[int(f)]
+                for v in idx_f.tolist():
+                    iv = int(v)
+                    if iv not in picked_extra_set:
+                        picked_extra.append(iv)
+                        picked_extra_set.add(iv)
+                    if len(picked_extra) >= need:
+                        break
                 if len(picked_extra) >= need:
                     break
 
