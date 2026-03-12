@@ -6631,7 +6631,7 @@ class Aggregator(nn.Module):
                                     )
 
                             debug_keep_idx = keep_idx
-                            keep_idx = self._sanitize_keep_idx(
+                            keep_idx = self._sanitize_keep_idx_preserve_order(
                                 keep_idx,
                                 meta_len=past_meta["frame_idx"].numel(),
                                 kv_len=past_kv_block[0].shape[2],
@@ -6640,9 +6640,8 @@ class Aggregator(nn.Module):
                             protected_idx = torch.nonzero(self._hard_protected_mask(past_meta), as_tuple=False).view(-1)
                             debug_protected = protected_idx
                             if keep_idx.numel() > 0 and protected_idx.numel() > 0:
-                                pre_keep_all = torch.unique(
-                                    torch.cat([keep_idx.detach().cpu().long(), protected_idx], dim=0),
-                                    sorted=True,
+                                pre_keep_all = self._unique_preserve_order_long(
+                                    torch.cat([keep_idx.detach().cpu().long(), protected_idx], dim=0)
                                 )
                             elif keep_idx.numel() > 0:
                                 pre_keep_all = keep_idx
