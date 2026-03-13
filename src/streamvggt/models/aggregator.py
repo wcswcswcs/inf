@@ -2377,12 +2377,14 @@ class Aggregator(nn.Module):
             if policy is not None else True
         )
         ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
+
         if (not allow_reloc_trigger) and (not ongoing_reloc):
             self.geo_reloc_state = "off"
             self.geo_reloc_frames_left = 0
             self.geo_reloc_hard_left = 0
             self.geo_reloc_good_streak = 0
             return
+
         runtime_map_ready = bool(self._update_geo_runtime_ready(frame_idx) if runtime_map_ready is None else runtime_map_ready)
         structure_ready = self._geo_structure_ready()
 
@@ -2396,6 +2398,17 @@ class Aggregator(nn.Module):
                 self.geo_reloc_state = "off"
                 self.geo_reloc_hard_left = 0
                 self.geo_reloc_good_streak = 0
+
+        ongoing_after_decay = bool(
+            int(self.geo_reloc_frames_left) > 0
+            or str(self.geo_reloc_state) != "off"
+        )
+        if (not allow_reloc_trigger) and (not ongoing_after_decay):
+            self.geo_reloc_state = "off"
+            self.geo_reloc_frames_left = 0
+            self.geo_reloc_hard_left = 0
+            self.geo_reloc_good_streak = 0
+            return
 
         if runtime_map_ready:
             bad_runtime = (
@@ -2416,7 +2429,7 @@ class Aggregator(nn.Module):
                 )
             )
 
-        if bad_runtime and str(self.geo_reloc_state) == "off":
+        if bool(allow_reloc_trigger) and bad_runtime and str(self.geo_reloc_state) == "off":
             self.geo_reloc_state = "hard"
             self.geo_reloc_hard_left = int(self.geo_reloc_hard_frames)
             self.geo_reloc_frames_left = int(self.geo_reloc_frames)
@@ -3914,6 +3927,7 @@ class Aggregator(nn.Module):
             f"reloc_phase_open={bool(inp.get('reloc_phase_open', policy.get('reloc_phase_open', False)))} "
             f"use_recovery={bool(inp.get('use_recovery', policy.get('use_recovery', False)))} "
             f"allow_reloc_trigger={bool(inp.get('allow_reloc_trigger', policy.get('allow_reloc_trigger', False)))} "
+            f"reloc_gate_open={bool(inp.get('reloc_gate_open', inp.get('allow_reloc_trigger', policy.get('allow_reloc_trigger', False))))} "
             f"use_reloc={bool(inp.get('use_reloc', policy.get('use_reloc', False)))} "
             f"ongoing_recovery={bool(inp.get('ongoing_recovery', int(self.geo_recovery_frames_left) > 0))} "
             f"ongoing_reloc={bool(inp.get('ongoing_reloc', int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != 'off'))} "
@@ -6532,6 +6546,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["reloc_phase_open"] = bool((geo_policy or {}).get("reloc_phase_open", False))
             self.geo_last_policy_inputs["use_recovery"] = bool((geo_policy or {}).get("use_recovery", False))
             self.geo_last_policy_inputs["allow_reloc_trigger"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
+            self.geo_last_policy_inputs["reloc_gate_open"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
             self.geo_last_policy_inputs["use_reloc"] = bool((geo_policy or {}).get("use_reloc", False))
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(int(self.geo_recovery_frames_left) > 0)
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")

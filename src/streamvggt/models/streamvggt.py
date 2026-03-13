@@ -199,14 +199,43 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         log_interval = max(1, int(memory_log_interval))
 
         total_frames = len(frames)
+        expected_next_from_roll = None
+        if rolling_state is not None and rolling_state.get("next_frame_idx", None) is not None:
+            expected_next_from_roll = int(rolling_state["next_frame_idx"])
+
+        expected_next_from_geo = None
+        if use_geo_kv_prune and geo_state is not None:
+            expected_next_from_geo = int(getattr(self.aggregator, "geo_max_frame_idx", -1)) + 1
+
         if frame_start_idx is not None:
-            base_frame_idx = int(frame_start_idx)
-        elif rolling_state is not None and rolling_state.get("next_frame_idx", None) is not None:
-            base_frame_idx = int(rolling_state["next_frame_idx"])
-        elif use_geo_kv_prune and geo_state is not None:
-            base_frame_idx = int(getattr(self.aggregator, "geo_max_frame_idx", -1)) + 1
+            frame_start_idx = int(frame_start_idx)
+            if expected_next_from_roll is not None and expected_next_from_roll != frame_start_idx:
+                raise ValueError(
+                    f"Inconsistent resume state: frame_start_idx={frame_start_idx} "
+                    f"but rolling_state.next_frame_idx={expected_next_from_roll}"
+                )
+            if expected_next_from_geo is not None and expected_next_from_geo != frame_start_idx:
+                raise ValueError(
+                    f"Inconsistent resume state: frame_start_idx={frame_start_idx} "
+                    f"but geo_state implies next_frame_idx={expected_next_from_geo}"
+                )
+            base_frame_idx = frame_start_idx
         else:
-            base_frame_idx = 0
+            if (
+                expected_next_from_roll is not None
+                and expected_next_from_geo is not None
+                and expected_next_from_roll != expected_next_from_geo
+            ):
+                raise ValueError(
+                    f"Inconsistent resume state: rolling_state.next_frame_idx={expected_next_from_roll} "
+                    f"but geo_state implies next_frame_idx={expected_next_from_geo}"
+                )
+            if expected_next_from_roll is not None:
+                base_frame_idx = expected_next_from_roll
+            elif expected_next_from_geo is not None:
+                base_frame_idx = expected_next_from_geo
+            else:
+                base_frame_idx = 0
 
         no_progress_log_interval = 50
         for i, frame in enumerate(frame_iter):
