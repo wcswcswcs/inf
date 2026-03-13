@@ -175,9 +175,9 @@ class Aggregator(nn.Module):
         geo_cap_ramp_start: int = 960,
         geo_cap_ramp_end: int = 1216,
         geo_anchor_enable_after: int = 0,
-        geo_landmark_enable_after: int = 832,
-        geo_reference_enable_after: int = 960,
-        geo_reloc_enable_after: int = 960,
+        geo_landmark_enable_after: int = 128,
+        geo_reference_enable_after: int = 192,
+        geo_reloc_enable_after: int = 192,
         geo_stable_map_ratio_runtime: float = 0.25,
         geo_stable_min_voxels_runtime: int = 128,
     ):
@@ -363,9 +363,9 @@ class Aggregator(nn.Module):
         self.geo_cap_ramp_start = max(0, int(geo_cap_ramp_start))
         self.geo_cap_ramp_end = max(int(self.geo_cap_ramp_start) + 1, int(geo_cap_ramp_end))
         self.geo_anchor_enable_after = max(0, int(geo_anchor_enable_after))
-        self.geo_landmark_enable_after = max(int(self.geo_bootstrap_until), int(geo_landmark_enable_after))
+        self.geo_landmark_enable_after = max(int(self.geo_bootstrap_frames), int(geo_landmark_enable_after))
         self.geo_reference_enable_after = max(int(self.geo_landmark_enable_after), int(geo_reference_enable_after))
-        self.geo_reloc_enable_after = max(0, int(geo_reloc_enable_after))
+        self.geo_reloc_enable_after = max(int(self.geo_reference_enable_after), int(geo_reloc_enable_after))
         self.geo_stable_map_ratio_runtime = float(min(max(geo_stable_map_ratio_runtime, 0.05), 0.9))
         self.geo_stable_min_voxels_runtime = max(32, int(geo_stable_min_voxels_runtime))
         self.geo_identity_stride = 1 << 21
@@ -6438,7 +6438,7 @@ class Aggregator(nn.Module):
                 self.geo_last_policy_inputs["final_ref_layer_budget"] = int(ref_layer_budget)
                 self.geo_last_policy_inputs["policy_view_source"] = str(policy_view_source)
                 self.geo_last_policy_inputs["selector_view_source"] = str(selector_view_source)
-                self.geo_last_policy_inputs["use_view_pruning"] = bool(geo_use_view_pruning)
+                self.geo_last_policy_inputs["use_view_pruning"] = bool((geo_policy or {}).get("use_view_pruning", geo_use_view_pruning))
                 self.geo_last_policy_inputs["prefer_last_reliable_view"] = bool((policy_preview or {}).get("prefer_last_reliable_view", False))
                 self.geo_last_policy_inputs["selector_mode"] = str((geo_policy or {}).get("mode", "legacy"))
                 self.geo_last_policy_inputs["fixed_point_iters_used"] = int(fp_iters_used)
@@ -6459,6 +6459,7 @@ class Aggregator(nn.Module):
                 self.geo_last_policy_inputs["fixed_point_iters_used"] = int(0)
                 self.geo_last_policy_inputs["fixed_point_converged"] = bool(False)
 
+            selector_use_view_pruning = bool((geo_policy or {}).get("use_view_pruning", geo_use_view_pruning))
             self.geo_last_policy_inputs["structure_ready"] = bool(structure_ready_now)
             self.geo_last_policy_inputs["bootstrap_bank_ready"] = bool(bootstrap_bank_ready_now)
             self.geo_last_policy_inputs["ref_budget_source"] = str(ref_budget_source)
@@ -6469,7 +6470,7 @@ class Aggregator(nn.Module):
 
             self.geo_last_policy_inputs["policy_view_source"] = str(policy_view_source)
             self.geo_last_policy_inputs["selector_view_source"] = str(selector_view_source)
-            self.geo_last_policy_inputs["use_view_pruning"] = bool(geo_use_view_pruning)
+            self.geo_last_policy_inputs["use_view_pruning"] = bool(selector_use_view_pruning)
             self.geo_last_policy_inputs["prefer_last_reliable_view"] = bool((geo_policy or {}).get("prefer_last_reliable_view", False))
             self.geo_last_policy_inputs["selector_mode"] = str((geo_policy or {}).get("mode", "legacy"))
             self.geo_last_policy_inputs["landmark_growth_ready"] = bool((geo_policy or {}).get("landmark_growth_ready", False))
@@ -6486,11 +6487,18 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
 
             policy_mode = str((geo_policy or {}).get("mode", "legacy"))
-            effective_mode = policy_mode
-            if not bool(structure_ready_now):
+            ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
+            ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
+            if ongoing_reloc or policy_mode == "recovery":
+                effective_mode = "recovery"
+            elif (policy_mode == "current") and (not bool(structure_ready_now)):
                 effective_mode = "legacy"
+            else:
+                effective_mode = policy_mode
             self.geo_last_policy_inputs["policy_mode"] = str(policy_mode)
             self.geo_last_policy_inputs["effective_mode"] = str(effective_mode)
+            self.geo_last_policy_inputs["ongoing_recovery"] = bool(ongoing_recovery)
+            self.geo_last_policy_inputs["ongoing_reloc"] = bool(ongoing_reloc)
             self.geo_last_policy_inputs["structure_ready"] = bool(structure_ready_now)
             self.geo_last_policy_inputs["bootstrap_bank_ready"] = bool(bootstrap_bank_ready_now)
 
@@ -6513,7 +6521,7 @@ class Aggregator(nn.Module):
                         far=geo_far,
                         current_view=current_view,
                         hard_keep=hard_keep_for_bootstrap,
-                        use_view_pruning=bool(geo_use_view_pruning),
+                        use_view_pruning=bool(selector_use_view_pruning),
                         max_past_tokens=ref_past_budget,
                         policy=geo_policy,
                     )
@@ -6528,7 +6536,7 @@ class Aggregator(nn.Module):
                         far=geo_far,
                         current_view=current_view,
                         trigger_view=policy_view,
-                        use_view_pruning=bool(geo_use_view_pruning),
+                        use_view_pruning=bool(selector_use_view_pruning),
                         max_past_tokens=ref_past_budget,
                         enable_reference_logic=bool(geo_policy["use_reference_labels"]),
                         enable_landmark_logic=bool(geo_policy["use_landmark_labels"]),
