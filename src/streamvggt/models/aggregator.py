@@ -1609,6 +1609,29 @@ class Aggregator(nn.Module):
             if recovery_exit_streak >= 8:
                 selector_mode = "current"
 
+        reference_support_ready = bool(
+            len(self.geo_reference_bank) >= max(
+                8,
+                min(16, int(self._geo_effective_bootstrap_thresholds()["refs"])),
+            )
+            or len(self.geo_stable_anchor_voxels) >= 64
+            or len(self.geo_landmark_voxels) >= 128
+        )
+        allow_reloc_trigger = bool(
+            reloc_phase_open
+            and reference_support_ready
+        )
+        reloc_signal = bool(
+            instability >= 0.50
+            or matched_ema < 0.08
+            or selector_ready_overlap < 8.0
+            or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
+        )
+        ongoing_reloc = bool(
+            int(self.geo_reloc_frames_left) > 0
+            or str(self.geo_reloc_state) != "off"
+        )
+
         policy = {
             "mode": selector_mode,
             "use_anchor_labels": bool(anchor_ready),
@@ -1621,7 +1644,8 @@ class Aggregator(nn.Module):
             "landmark_label_ready": bool(landmark_label_ready),
             "reference_label_ready": bool(reference_label_ready),
             "use_recovery": bool((selector_mode == "recovery") or landmark_label_ready or int(self.geo_recovery_frames_left) > 0),
-            "use_reloc": bool((reloc_phase_open and reference_label_ready and instability >= 0.50) or int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off"),
+            "allow_reloc_trigger": bool(allow_reloc_trigger),
+            "use_reloc": bool(ongoing_reloc or (allow_reloc_trigger and reloc_signal)),
             "use_cap": bool(reference_label_ready),
             "cap_alpha": 0.0 if not reference_label_ready else min(1.0, max(0.0, (maturity - 0.65) / 0.35)),
             "hard_recent_frames": int(max(6, min(24, round(8 + 10 * instability)))),
@@ -2348,9 +2372,12 @@ class Aggregator(nn.Module):
         runtime_map_ready: Optional[bool] = None,
         policy: Optional[Dict[str, Any]] = None,
     ):
-        use_reloc = bool(policy["use_reloc"]) if policy is not None else True
+        allow_reloc_trigger = (
+            bool(policy.get("allow_reloc_trigger", policy.get("use_reloc", True)))
+            if policy is not None else True
+        )
         ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
-        if (not use_reloc) and (not ongoing_reloc):
+        if (not allow_reloc_trigger) and (not ongoing_reloc):
             self.geo_reloc_state = "off"
             self.geo_reloc_frames_left = 0
             self.geo_reloc_hard_left = 0
@@ -2596,8 +2623,9 @@ class Aggregator(nn.Module):
             self.geo_recovery_frames_left = 0
         recovery_mode = bool((bool(policy["use_recovery"]) or int(self.geo_recovery_frames_left) > 0) and self.geo_recovery_frames_left > 0)
 
+        allow_reloc_trigger = bool(policy.get("allow_reloc_trigger", policy.get("use_reloc", False)))
         ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
-        if (not bool(policy["use_reloc"])) and (not ongoing_reloc):
+        if (not allow_reloc_trigger) and (not ongoing_reloc):
             self.geo_reloc_state = "off"
             self.geo_reloc_frames_left = 0
             self.geo_reloc_hard_left = 0
@@ -3869,9 +3897,11 @@ class Aggregator(nn.Module):
             f"reference_phase_open={bool(inp.get('reference_phase_open', policy.get('reference_phase_open', False)))} "
             f"reloc_phase_open={bool(inp.get('reloc_phase_open', policy.get('reloc_phase_open', False)))} "
             f"use_recovery={bool(inp.get('use_recovery', policy.get('use_recovery', False)))} "
+            f"allow_reloc_trigger={bool(inp.get('allow_reloc_trigger', policy.get('allow_reloc_trigger', False)))} "
             f"use_reloc={bool(inp.get('use_reloc', policy.get('use_reloc', False)))} "
             f"ongoing_recovery={bool(inp.get('ongoing_recovery', int(self.geo_recovery_frames_left) > 0))} "
             f"ongoing_reloc={bool(inp.get('ongoing_reloc', int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != 'off'))} "
+            f"recovery_selector={bool(inp.get('recovery_selector', False))} "
             f"ref_budget_source={str(inp.get('ref_budget_source', 'na'))} "
             f"prefer_last_reliable_view={bool(inp.get('prefer_last_reliable_view', policy.get('prefer_last_reliable_view', False)))} "
             f"use_cap={bool(policy.get('use_cap', False))} cap_alpha={float(policy.get('cap_alpha', 0.0)):.4f}",
@@ -6484,6 +6514,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["reference_phase_open"] = bool((geo_policy or {}).get("reference_phase_open", False))
             self.geo_last_policy_inputs["reloc_phase_open"] = bool((geo_policy or {}).get("reloc_phase_open", False))
             self.geo_last_policy_inputs["use_recovery"] = bool((geo_policy or {}).get("use_recovery", False))
+            self.geo_last_policy_inputs["allow_reloc_trigger"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
             self.geo_last_policy_inputs["use_reloc"] = bool((geo_policy or {}).get("use_reloc", False))
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(int(self.geo_recovery_frames_left) > 0)
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
@@ -6493,7 +6524,7 @@ class Aggregator(nn.Module):
             ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
             if ongoing_reloc:
                 effective_mode = "reloc"
-            elif policy_mode == "recovery":
+            elif policy_mode == "recovery" or ongoing_recovery:
                 effective_mode = "recovery"
             elif (policy_mode == "current") and (not bool(structure_ready_now)):
                 effective_mode = "legacy"
@@ -6505,6 +6536,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(ongoing_reloc)
             self.geo_last_policy_inputs["structure_ready"] = bool(structure_ready_now)
             self.geo_last_policy_inputs["bootstrap_bank_ready"] = bool(bootstrap_bank_ready_now)
+            self.geo_last_policy_inputs["recovery_selector"] = bool(False)
 
             if ref_meta is not None:
                 mode_now = str(effective_mode)
@@ -6516,6 +6548,7 @@ class Aggregator(nn.Module):
                     policy=geo_policy,
                 )
                 if mode_now == "legacy":
+                    self.geo_last_policy_inputs["recovery_selector"] = bool(False)
                     geo_reloc_active = False
                     geo_shared_keep_idx = self._select_geo_active_indices_bootstrap(
                         meta=ref_meta,
@@ -6533,6 +6566,7 @@ class Aggregator(nn.Module):
                 elif mode_now in {"current", "recovery"}:
                     geo_reloc_active = False
                     recovery_selector = bool(mode_now == "recovery" or int(self.geo_recovery_frames_left) > 0)
+                    self.geo_last_policy_inputs["recovery_selector"] = bool(recovery_selector)
                     selector_policy = copy.deepcopy(geo_policy or {})
                     if recovery_selector:
                         selector_policy["use_cap"] = False
