@@ -1549,7 +1549,7 @@ class Aggregator(nn.Module):
         bootstrap_bank_ready = self._geo_bootstrap_bank_ready(int(frame_idx))
         structure_ready = self._geo_structure_ready()
 
-        anchor_ready = bool(bootstrap_bank_ready)
+        anchor_ready = self._geo_anchor_ready(int(frame_idx))
         landmark_growth_ready = bool(
             bootstrap_bank_ready
             and maturity >= 0.45
@@ -2301,13 +2301,6 @@ class Aggregator(nn.Module):
             priority_keep_idx=keep,
         )
 
-        if keep.numel() < b:
-            keep = self._fill_keep_to_budget_preserve_order(
-                meta,
-                keep,
-                budget=b,
-                mode="balanced",
-            )
         return keep
 
     def _geo_anchor_ready(self, frame_idx: int) -> bool:
@@ -3851,6 +3844,8 @@ class Aggregator(nn.Module):
             f"fixed_point_iters_used={int(inp.get('fixed_point_iters_used', 0) or 0)} fixed_point_converged={bool(inp.get('fixed_point_converged', False))} "
             f"maturity={float(met.get('maturity', self.geo_maturity_ema)):.4f} instability={float(met.get('instability', self.geo_instability_ema)):.4f} "
             f"use_view_pruning={bool(inp.get('use_view_pruning', policy.get('use_view_pruning', True)))} "
+            f"use_anchor_labels={bool(inp.get('use_anchor_labels', policy.get('use_anchor_labels', False)))} "
+            f"safe_warmup={bool(inp.get('safe_warmup', False))} "
             f"bootstrap_bank_ready={bool(inp.get('bootstrap_bank_ready', policy.get('bootstrap_bank_ready', False)))} "
             f"structure_ready={bool(inp.get('structure_ready', policy.get('structure_ready', False)))} "
             f"landmark_growth_ready={bool(inp.get('landmark_growth_ready', policy.get('landmark_growth_ready', False)))} "
@@ -4699,6 +4694,7 @@ class Aggregator(nn.Module):
             reanchor_added=int(diag["reanchor_added"]),
             reanchor_overlap_avg=float(diag["reanchor_overlap_avg"]),
             diag_payload=diag,
+            allow_fill=False,
         )
 
     def _finalize_geo_keep(
@@ -4723,6 +4719,7 @@ class Aggregator(nn.Module):
         reanchor_overlap_avg: float = 0.0,
         hard_keep_idx: Optional[torch.Tensor] = None,
         diag_payload: Optional[Dict[str, Any]] = None,
+        allow_fill: bool = True,
     ) -> torch.Tensor:
         total_tokens = int(meta["frame_idx"].numel()) if meta.get("frame_idx") is not None else 0
         if selected_order is not None:
@@ -4758,7 +4755,7 @@ class Aggregator(nn.Module):
                         budget=max(0, int(max_past_tokens)),
                         recent_frames=recent_frames_eff,
                     )
-            elif keep.numel() < int(max_past_tokens):
+            elif keep.numel() < int(max_past_tokens) and bool(allow_fill):
                 keep = self._fill_keep_to_budget_preserve_order(meta, keep, budget=int(max_past_tokens), mode="balanced")
 
         diag_final = self._recompute_selector_diag_from_final_keep(
@@ -6565,7 +6562,12 @@ class Aggregator(nn.Module):
         if use_geo_kv_prune:
             geo_policy = copy.deepcopy(geo_policy or self._geo_default_policy(int(past_frame_idx)))
             effective_mode = str(effective_mode or (geo_policy or {}).get("mode", "legacy"))
-            safe_warmup = bool((effective_mode == "legacy") and (not bootstrap_bank_ready_now))
+            safe_warmup = bool(
+                (effective_mode == "legacy")
+                and (not bool((geo_policy or {}).get("use_anchor_labels", False)))
+            )
+            self.geo_last_policy_inputs["use_anchor_labels"] = bool((geo_policy or {}).get("use_anchor_labels", False))
+            self.geo_last_policy_inputs["safe_warmup"] = bool(safe_warmup)
             enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
             enable_reference_logic = bool(geo_policy["use_reference_labels"])
             enable_stable_logic = bool(geo_policy["use_reference_labels"])
@@ -6695,57 +6697,53 @@ class Aggregator(nn.Module):
                             current_meta = self._build_current_frame_meta(past_frame_idx, P)
                             merged_meta = self._concat_meta(past_meta, current_meta)
                             self._decay_persistent_labels(merged_meta, int(past_frame_idx))
-                            eligible = self._label_eligible_mask(merged_meta)
-                            if safe_warmup:
-                                merged_meta["is_anchor"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_landmark"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_reference"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                            elif not bool(bootstrap_bank_ready_now):
-                                merged_meta["is_anchor"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_landmark"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_reference"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                            elif not bool(structure_ready_now):
-                                anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
-                                new_anchor = self._bounded_label_from_mask(merged_meta, eligible & anchor_raw, per_frame_quota=256)
-                                merged_meta["is_anchor"] = merged_meta.get("is_anchor", torch.zeros_like(new_anchor)) | new_anchor
-                                merged_meta["is_landmark"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_reference"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                            elif not bool((geo_policy or {}).get("use_landmark_labels", True)):
-                                anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
-                                new_anchor = self._bounded_label_from_mask(merged_meta, eligible & anchor_raw, per_frame_quota=256)
-                                merged_meta["is_anchor"] = merged_meta.get("is_anchor", torch.zeros_like(new_anchor)) | new_anchor
-                                merged_meta["is_landmark"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                                merged_meta["is_reference"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
-                            elif not bool((geo_policy or {}).get("use_reference_labels", True)):
-                                anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
-                                landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
-                                new_anchor = self._bounded_label_from_mask(merged_meta, eligible & anchor_raw, per_frame_quota=256)
-                                new_landmark = self._bounded_label_from_mask(merged_meta, eligible & landmark_raw, per_frame_quota=128)
-                                merged_meta["is_anchor"] = merged_meta.get("is_anchor", torch.zeros_like(new_anchor)) | new_anchor
-                                merged_meta["is_landmark"] = merged_meta.get("is_landmark", torch.zeros_like(new_landmark)) | new_landmark
-                                merged_meta["is_reference"] = torch.zeros((merged_meta["frame_idx"].numel(),), dtype=torch.bool)
+                            anchor_enabled = bool((geo_policy or {}).get("use_anchor_labels", False))
+                            landmark_enabled = bool((geo_policy or {}).get("use_landmark_labels", False))
+                            reference_enabled = bool((geo_policy or {}).get("use_reference_labels", False))
+
+                            n_meta = int(merged_meta["frame_idx"].numel())
+                            zeros = torch.zeros((n_meta,), dtype=torch.bool)
+                            anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
+                            self.geo_last_policy_inputs["anchor_count_raw"] = int(anchor_raw.sum().item())
+
+                            if not anchor_enabled:
+                                merged_meta["is_anchor"] = zeros
+                                merged_meta["is_landmark"] = zeros
+                                merged_meta["is_reference"] = zeros
                             else:
-                                anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
-                                landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
-                                reference_raw = self._derive_reference_mask_from_meta(merged_meta)
-                                new_anchor = self._bounded_label_from_mask(
-                                    merged_meta,
-                                    eligible & anchor_raw,
-                                    per_frame_quota=256,
-                                )
-                                new_landmark = self._bounded_label_from_mask(
-                                    merged_meta,
-                                    eligible & landmark_raw,
-                                    per_frame_quota=128,
-                                )
-                                new_reference = self._bounded_label_from_mask(
-                                    merged_meta,
-                                    eligible & reference_raw,
-                                    per_frame_quota=64,
-                                )
-                                merged_meta["is_anchor"] = merged_meta.get("is_anchor", torch.zeros_like(new_anchor)) | new_anchor
-                                merged_meta["is_landmark"] = merged_meta.get("is_landmark", torch.zeros_like(new_landmark)) | new_landmark
-                                merged_meta["is_reference"] = merged_meta.get("is_reference", torch.zeros_like(new_reference)) | new_reference
+                                merged_meta["is_anchor"] = anchor_raw
+                                eligible = self._label_eligible_mask(merged_meta)
+
+                                if not bool(structure_ready_now):
+                                    merged_meta["is_landmark"] = zeros
+                                    merged_meta["is_reference"] = zeros
+                                elif not landmark_enabled:
+                                    merged_meta["is_landmark"] = zeros
+                                    merged_meta["is_reference"] = zeros
+                                elif not reference_enabled:
+                                    landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
+                                    new_landmark = self._bounded_label_from_mask(
+                                        merged_meta,
+                                        eligible & landmark_raw,
+                                        per_frame_quota=128,
+                                    )
+                                    merged_meta["is_landmark"] = merged_meta.get("is_landmark", zeros) | new_landmark
+                                    merged_meta["is_reference"] = zeros
+                                else:
+                                    landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
+                                    reference_raw = self._derive_reference_mask_from_meta(merged_meta)
+                                    new_landmark = self._bounded_label_from_mask(
+                                        merged_meta,
+                                        eligible & landmark_raw,
+                                        per_frame_quota=128,
+                                    )
+                                    new_reference = self._bounded_label_from_mask(
+                                        merged_meta,
+                                        eligible & reference_raw,
+                                        per_frame_quota=64,
+                                    )
+                                    merged_meta["is_landmark"] = merged_meta.get("is_landmark", zeros) | new_landmark
+                                    merged_meta["is_reference"] = merged_meta.get("is_reference", zeros) | new_reference
 
                             merged_meta["geo_role"] = self._compute_primary_geo_role(merged_meta)
 
@@ -6791,7 +6789,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -6804,6 +6802,11 @@ class Aggregator(nn.Module):
                                     float(self.geo_trust_score),
                                     int(self.geo_recovery_frames_left),
                                     int(self.geo_reloc_frames_left),
+                                    int(bool(safe_warmup)),
+                                    int(bool(bootstrap_bank_ready_now)),
+                                    int(bool(structure_ready_now)),
+                                    int(bool((geo_policy or {}).get("use_anchor_labels", False))),
+                                    int(self.geo_last_policy_inputs.get("anchor_count_raw", 0) or 0),
                                     int(frame0_in_cache),
                                     int(ref_in_cache),
                                     int(landmark_in_cache),
