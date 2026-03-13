@@ -351,7 +351,7 @@ class Aggregator(nn.Module):
         self.geo_prune_start_ratio = float(min(max(geo_prune_start_ratio, 0.0), 1.0))
         self.geo_reloc_hard_frames = max(1, int(geo_reloc_hard_frames))
         self.geo_bootstrap_until = max(0, int(geo_bootstrap_until))
-        self.geo_legacy_selector_until = max(int(self.geo_bootstrap_until), int(geo_legacy_selector_until))
+        self.geo_legacy_selector_until = max(int(self.geo_bootstrap_until), int(geo_legacy_selector_until))  # deprecated: retained for backward config compatibility; not used in current logic
         self.geo_legacy_hard_recent_frames = max(1, int(geo_legacy_hard_recent_frames))
         self.geo_legacy_recent_window = max(1, int(geo_legacy_recent_window))
         self.geo_legacy_soft_recent_frames = max(1, int(geo_legacy_soft_recent_frames))
@@ -360,8 +360,8 @@ class Aggregator(nn.Module):
         self.geo_early_stabilize_frames = max(0, int(geo_early_stabilize_frames))
         self.geo_early_recent_frames = max(1, int(geo_early_recent_frames))
         self.geo_early_budget_floor = max(0, int(geo_early_budget_floor))
-        self.geo_cap_ramp_start = max(0, int(geo_cap_ramp_start))
-        self.geo_cap_ramp_end = max(int(self.geo_cap_ramp_start) + 1, int(geo_cap_ramp_end))
+        self.geo_cap_ramp_start = max(0, int(geo_cap_ramp_start))  # deprecated: retained for backward config compatibility; not used in current logic
+        self.geo_cap_ramp_end = max(int(self.geo_cap_ramp_start) + 1, int(geo_cap_ramp_end))  # deprecated: retained for backward config compatibility; not used in current logic
         self.geo_anchor_enable_after = max(0, int(geo_anchor_enable_after))
         self.geo_landmark_enable_after = max(int(self.geo_bootstrap_frames), int(geo_landmark_enable_after))
         self.geo_reference_enable_after = max(int(self.geo_landmark_enable_after), int(geo_reference_enable_after))
@@ -3847,6 +3847,8 @@ class Aggregator(nn.Module):
             f"policy_view_source={str(inp.get('policy_view_source', 'none'))} "
             f"selector_view_source={str(inp.get('selector_view_source', 'none'))} "
             f"policy_mode={str(policy.get('mode', 'legacy'))} "
+            f"effective_mode={str(inp.get('effective_mode', 'legacy'))} "
+            f"selector_exec_mode={str(inp.get('effective_mode', 'legacy'))} "
             f"observation_frame={int(inp.get('observation_frame', -1))} selector_diag_frame={int(inp.get('selector_diag_frame', -1))} "
             f"total_tokens={int(inp.get('total_tokens', 0) or 0)} max_past_tokens={inp.get('max_past_tokens', None)} "
             f"raw_ref_budget={int(inp.get('raw_ref_budget', 0) or 0)} base_ref_layer_budget={int(inp.get('base_ref_layer_budget', 0) or 0)} final_ref_budget={int(inp.get('final_ref_budget', 0) or 0)} "
@@ -6489,7 +6491,9 @@ class Aggregator(nn.Module):
             policy_mode = str((geo_policy or {}).get("mode", "legacy"))
             ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
             ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
-            if ongoing_reloc or policy_mode == "recovery":
+            if ongoing_reloc:
+                effective_mode = "reloc"
+            elif policy_mode == "recovery":
                 effective_mode = "recovery"
             elif (policy_mode == "current") and (not bool(structure_ready_now)):
                 effective_mode = "legacy"
@@ -6526,8 +6530,33 @@ class Aggregator(nn.Module):
                         policy=geo_policy,
                     )
                     geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
-                elif mode_now == "current":
+                elif mode_now in {"current", "recovery"}:
                     geo_reloc_active = False
+                    recovery_selector = bool(mode_now == "recovery" or int(self.geo_recovery_frames_left) > 0)
+                    selector_policy = copy.deepcopy(geo_policy or {})
+                    if recovery_selector:
+                        selector_policy["use_cap"] = False
+                        selector_policy["local_budget_ratio"] = max(
+                            float(selector_policy.get("local_budget_ratio", self.geo_local_budget_ratio)),
+                            0.70,
+                        )
+                        selector_policy["stable_read_budget_ratio"] = max(
+                            float(selector_policy.get("stable_read_budget_ratio", self.geo_stable_read_budget_ratio)),
+                            0.30,
+                        )
+                        selector_policy["hard_recent_frames"] = max(
+                            int(selector_policy.get("hard_recent_frames", self.geo_hard_recent_frames)),
+                            8,
+                        )
+                        selector_policy["recent_window"] = max(
+                            int(selector_policy.get("recent_window", self.geo_legacy_recent_window)),
+                            16,
+                        )
+                        selector_policy["soft_recent_window"] = max(
+                            int(selector_policy.get("soft_recent_window", self.geo_legacy_soft_recent_frames)),
+                            20,
+                        )
+
                     geo_shared_keep_idx = self._select_geo_active_indices(
                         meta=ref_meta,
                         topk_per_voxel=geo_topk_per_voxel,
@@ -6538,11 +6567,11 @@ class Aggregator(nn.Module):
                         trigger_view=policy_view,
                         use_view_pruning=bool(selector_use_view_pruning),
                         max_past_tokens=ref_past_budget,
-                        enable_reference_logic=bool(geo_policy["use_reference_labels"]),
-                        enable_landmark_logic=bool(geo_policy["use_landmark_labels"]),
-                        enable_stable_logic=bool(geo_policy["use_reference_labels"]),
-                        enable_reanchor_logic=bool(geo_policy["use_reloc"]),
-                        policy=geo_policy,
+                        enable_reference_logic=bool(selector_policy.get("use_reference_labels", False) or recovery_selector),
+                        enable_landmark_logic=bool(selector_policy.get("use_landmark_labels", False) or recovery_selector),
+                        enable_stable_logic=bool(selector_policy.get("use_reference_labels", False) or recovery_selector),
+                        enable_reanchor_logic=bool(selector_policy.get("use_reloc", False) or recovery_selector),
+                        policy=selector_policy,
                     )
                     protected_ref = torch.nonzero(self._hard_protected_mask(ref_meta), as_tuple=False).view(-1)
                     if geo_shared_keep_idx is None or geo_shared_keep_idx.numel() == 0:
@@ -6553,7 +6582,7 @@ class Aggregator(nn.Module):
                             sorted=True,
                         )
                     geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
-                else:
+                elif mode_now == "reloc":
                     geo_reloc_active = True
                     geo_shared_identity_keep = self._build_reloc_identity_keep(
                         meta=ref_meta,
@@ -6561,6 +6590,8 @@ class Aggregator(nn.Module):
                         recent_frames=max(1, int(geo_recent_frames)),
                         policy=geo_policy,
                     )
+                else:
+                    raise RuntimeError(f"Unknown effective_mode: {mode_now}")
             else:
                 self._queue_geo_console_log(
                     current_frame_idx=max(-1, int(past_frame_idx)),
