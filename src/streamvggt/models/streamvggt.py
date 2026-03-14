@@ -207,6 +207,28 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if use_geo_kv_prune and geo_state is not None:
             expected_next_from_geo = int(getattr(self.aggregator, "geo_max_frame_idx", -1)) + 1
 
+        has_past_kv = bool(
+            past_key_values is not None
+            and any(kv is not None for kv in past_key_values)
+        )
+        has_past_kv_camera = bool(
+            past_key_values_camera is not None
+            and any(kv is not None for kv in past_key_values_camera)
+        )
+        is_resuming_from_cache = bool(has_past_kv or has_past_kv_camera)
+
+        has_explicit_resume_source = bool(
+            (frame_start_idx is not None)
+            or (expected_next_from_roll is not None)
+            or (expected_next_from_geo is not None)
+        )
+        if is_resuming_from_cache and (not has_explicit_resume_source):
+            raise ValueError(
+                "Resuming with cached KV requires an explicit frame index source. "
+                "Provide one of: frame_start_idx, rolling_state['next_frame_idx'], "
+                "or geo_state with a valid next frame."
+            )
+
         if frame_start_idx is not None:
             frame_start_idx = int(frame_start_idx)
             if expected_next_from_roll is not None and expected_next_from_roll != frame_start_idx:
@@ -502,6 +524,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 "prev_world_to_cam_cpu": prev_world_to_cam_cpu,
                 "prev_conf_mean": prev_conf_mean,
                 "next_frame_idx": next_frame_idx,
+                "base_frame_idx_used": int(base_frame_idx),
+            },
+            "resume_source_info": {
+                "next_frame_idx": next_frame_idx,
+                "base_frame_idx_used": int(base_frame_idx),
+                "has_geo_state": bool(use_geo_kv_prune and geo_state is not None),
+                "has_rolling_state": bool(rolling_state is not None),
+                "used_frame_start_idx": bool(frame_start_idx is not None),
             },
         }
 
