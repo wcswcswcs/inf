@@ -151,6 +151,46 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 return kv[0].device
         return None
 
+    @staticmethod
+    def _has_any_kv(kv_list) -> bool:
+        return bool(
+            kv_list is not None
+            and any(kv is not None for kv in kv_list)
+        )
+
+    def _clear_loaded_geo_token_cache_state(self):
+        self.aggregator.geo_cached_landmark_identity_keep = torch.empty((0,), dtype=torch.long)
+        self.aggregator.geo_pending_console_log = None
+
+        for layer_idx in range(self.aggregator.depth):
+            self.aggregator.geo_token_meta[layer_idx] = {
+                "frame_idx": torch.empty(0, dtype=torch.long),
+                "is_special": torch.empty(0, dtype=torch.bool),
+                "is_keyframe": torch.empty(0, dtype=torch.bool),
+                "local_patch_idx": torch.empty(0, dtype=torch.long),
+                "identity_local": torch.empty(0, dtype=torch.long),
+                "global_id": torch.empty(0, dtype=torch.long),
+                "is_anchor": torch.empty(0, dtype=torch.bool),
+                "is_landmark": torch.empty(0, dtype=torch.bool),
+                "is_reference": torch.empty(0, dtype=torch.bool),
+                "geo_role": torch.empty(0, dtype=torch.long),
+            }
+
+    def _validate_geo_kv_alignment(self, past_key_values):
+        for layer_idx in range(self.aggregator.depth):
+            kv = None if past_key_values is None else past_key_values[layer_idx]
+            kv_len = 0 if kv is None else int(kv[0].shape[2])
+
+            layer_meta = self.aggregator.geo_token_meta[layer_idx]
+            frame_idx_meta = layer_meta.get("frame_idx", torch.empty((0,), dtype=torch.long))
+            meta_len = int(frame_idx_meta.numel())
+
+            if meta_len != kv_len:
+                raise ValueError(
+                    f"Inconsistent geo resume state at layer {layer_idx}: "
+                    f"geo_token_meta has {meta_len} tokens but past_key_values has {kv_len}."
+                )
+
     @torch.inference_mode()
     def inference(
         self, 
@@ -181,6 +221,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             past_key_values = [None] * self.aggregator.depth
         if past_key_values_camera is None:
             past_key_values_camera = [None] * self.camera_head.trunk_depth
+        has_past_kv = self._has_any_kv(past_key_values)
+        has_past_kv_camera = self._has_any_kv(past_key_values_camera)
+        is_resuming_from_cache = bool(has_past_kv or has_past_kv_camera)
+
         if total_budget is None:
             total_budget = self.total_budget
         if use_geo_kv_prune:
@@ -190,6 +234,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 last_reliable_view = None
             else:
                 self.aggregator.load_geo_cache_state(geo_state)
+                if has_past_kv:
+                    self._validate_geo_kv_alignment(past_key_values)
+                else:
+                    self._clear_loaded_geo_token_cache_state()
         if rolling_state is None:
             prev_world_to_cam_cpu = None
             prev_conf_mean = None
@@ -215,16 +263,6 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         expected_next_from_geo = None
         if use_geo_kv_prune and geo_state is not None:
             expected_next_from_geo = int(getattr(self.aggregator, "geo_max_frame_idx", -1)) + 1
-
-        has_past_kv = bool(
-            past_key_values is not None
-            and any(kv is not None for kv in past_key_values)
-        )
-        has_past_kv_camera = bool(
-            past_key_values_camera is not None
-            and any(kv is not None for kv in past_key_values_camera)
-        )
-        is_resuming_from_cache = bool(has_past_kv or has_past_kv_camera)
 
         if use_geo_kv_prune and has_past_kv and geo_state is None:
             raise ValueError(
@@ -551,6 +589,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 "base_frame_idx_used": int(base_frame_idx),
                 "has_geo_state": bool(use_geo_kv_prune),
                 "input_had_geo_state": bool(use_geo_kv_prune and geo_state is not None),
+                "geo_resume_mode": (
+                    "full"
+                    if (use_geo_kv_prune and has_past_kv)
+                    else "map_only"
+                    if use_geo_kv_prune
+                    else "disabled"
+                ),
                 "has_rolling_state": bool(rolling_state is not None),
                 "used_frame_start_idx": bool(frame_start_idx is not None),
             },
