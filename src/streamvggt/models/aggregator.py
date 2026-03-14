@@ -3060,9 +3060,10 @@ class Aggregator(nn.Module):
         frame_idx = meta["frame_idx"]
         if frame_idx.numel() == 0:
             return torch.empty(0, dtype=torch.bool)
-        # Do not globally hard-protect historical special tokens. They are
-        # bounded later in _cap_keep_with_protection with explicit quotas.
-        return torch.zeros_like(frame_idx, dtype=torch.bool)
+        local_idx = meta.get("local_patch_idx", torch.full_like(frame_idx, -1))
+        frame0_patch = (frame_idx == 0) & (local_idx >= 0)
+        # Keep frame-0 patch backbone hard-protected across geo modes.
+        return frame0_patch
 
     @staticmethod
     def _ordered_add(
@@ -5037,12 +5038,18 @@ class Aggregator(nn.Module):
 
     def _geo_raw_structure_ready(self) -> bool:
         thr = self._geo_effective_bootstrap_thresholds()
-        return bool(
+        bank_ok = bool(
             len(self.geo_voxel_bank) >= int(thr["voxels"])
             and len(self.geo_stable_anchor_voxels) >= int(thr["stable_anchors"])
             and len(self.geo_reference_bank) >= int(thr["refs"])
             and float(self.geo_ref_overlap_ema) >= float(thr["ref_overlap"])
-            and float(self.geo_selector_visible_ratio_ema) >= float(thr["visible_ratio"])
+        )
+        if not bank_ok:
+            return False
+        if len(self.geo_reference_bank) >= max(128, int(2 * int(thr["refs"]))):
+            return True
+        return bool(
+            float(self.geo_selector_visible_ratio_ema) >= float(thr["visible_ratio"])
         )
 
     def _update_geo_structure_ready_streak(self, frame_idx: int) -> bool:
@@ -5089,26 +5096,7 @@ class Aggregator(nn.Module):
         frame0_mask = (frame_idx == 0) & (~is_special) & (local_idx >= 0)
         frame0_idx = torch.nonzero(frame0_mask, as_tuple=False).flatten()
         if frame0_idx.numel() > 0:
-            frame0_quota = min(int(self.geo_frame0_backbone_quota), int(frame0_idx.numel()))
-            frame0_local = local_idx.index_select(0, frame0_idx).long()
-            frame0_meta = self.geo_frame_meta.get(0)
-            if frame0_meta is not None and frame0_meta.get("conf") is not None and frame0_meta["conf"].numel() > 0:
-                valid = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
-                frame0_idx = frame0_idx[valid]
-                frame0_local = frame0_local[valid]
-                if frame0_idx.numel() > 0 and frame0_quota > 0:
-                    conf0 = frame0_meta["conf"].index_select(0, frame0_local).to(torch.float32)
-                    frame0_keep = self._select_frame0_patch_diverse(
-                        frame0_idx,
-                        frame0_local,
-                        conf0,
-                        quota=frame0_quota,
-                        full_patch_count=int(frame0_meta["conf"].shape[0]),
-                        grid_n=4,
-                    )
-                    keep.update(int(v) for v in frame0_keep.tolist())
-            elif frame0_idx.numel() > 0:
-                keep.update(int(v) for v in frame0_idx[-frame0_quota:].tolist())
+            keep.update(int(v) for v in frame0_idx.tolist())
 
         ref_idx = torch.nonzero(is_reference & (~is_special), as_tuple=False).flatten()
         if ref_idx.numel() > 0:
@@ -6139,6 +6127,39 @@ class Aggregator(nn.Module):
             hash_valid = hash_all[valid_global]
         grouped_idx = self._group_topk_by_hash(hash_valid, score_valid, idx_valid, topk_per_voxel=max(1, int(topk_per_voxel)))
 
+        plain_visible_mask = (
+            ~is_special.index_select(0, idx_all)
+            & ~(geo_role.index_select(0, idx_all) == 3)
+            & ~(geo_role.index_select(0, idx_all) == 4)
+            & visible_all
+        )
+        plain_visible_idx = idx_all[plain_visible_mask]
+        plain_visible_score = score_all[plain_visible_mask]
+        plain_visible_hash = hash_all[plain_visible_mask]
+        plain_visible_grouped = self._group_topk_by_hash(
+            plain_visible_hash,
+            plain_visible_score,
+            plain_visible_idx,
+            topk_per_voxel=max(1, int(topk_per_voxel)),
+        )
+        if plain_visible_grouped.numel() > 0:
+            if max_past_tokens is not None:
+                plain_visible_quota = max(256, int(0.12 * int(max_past_tokens)))
+            else:
+                plain_visible_quota = 512
+            if plain_visible_grouped.numel() > int(plain_visible_quota):
+                pv_score = plain_visible_score
+                top = torch.topk(pv_score, k=int(plain_visible_quota), largest=True).indices
+                plain_visible_keep = plain_visible_idx.index_select(0, top)
+            else:
+                plain_visible_keep = plain_visible_grouped
+            for t in plain_visible_keep.tolist():
+                token = int(t)
+                if token in selected_global:
+                    continue
+                self._ordered_add(selected, selected_order, [token])
+                selected_global.add(token)
+
         if grouped_idx.numel() > 0:
             if max_past_tokens is not None:
                 selected_base = len(selected)
@@ -6861,13 +6882,15 @@ class Aggregator(nn.Module):
                             else:
                                 merged_meta["is_anchor"] = anchor_raw
                                 eligible = self._label_eligible_mask(merged_meta)
+                                prev_landmark = merged_meta.get("is_landmark", zeros)
+                                prev_reference = merged_meta.get("is_reference", zeros)
 
                                 if not bool(structure_ready_now):
-                                    merged_meta["is_landmark"] = zeros
-                                    merged_meta["is_reference"] = zeros
+                                    merged_meta["is_landmark"] = prev_landmark
+                                    merged_meta["is_reference"] = prev_reference
                                 elif not landmark_enabled:
-                                    merged_meta["is_landmark"] = zeros
-                                    merged_meta["is_reference"] = zeros
+                                    merged_meta["is_landmark"] = prev_landmark
+                                    merged_meta["is_reference"] = prev_reference
                                 elif not reference_enabled:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
                                     new_landmark = self._bounded_label_from_mask(
@@ -6875,8 +6898,8 @@ class Aggregator(nn.Module):
                                         eligible & landmark_raw,
                                         per_frame_quota=128,
                                     )
-                                    merged_meta["is_landmark"] = merged_meta.get("is_landmark", zeros) | new_landmark
-                                    merged_meta["is_reference"] = zeros
+                                    merged_meta["is_landmark"] = prev_landmark | new_landmark
+                                    merged_meta["is_reference"] = prev_reference
                                 else:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
                                     reference_raw = self._derive_reference_mask_from_meta(merged_meta)
@@ -6890,8 +6913,8 @@ class Aggregator(nn.Module):
                                         eligible & reference_raw,
                                         per_frame_quota=64,
                                     )
-                                    merged_meta["is_landmark"] = merged_meta.get("is_landmark", zeros) | new_landmark
-                                    merged_meta["is_reference"] = merged_meta.get("is_reference", zeros) | new_reference
+                                    merged_meta["is_landmark"] = prev_landmark | new_landmark
+                                    merged_meta["is_reference"] = prev_reference | new_reference
 
                             merged_meta["geo_role"] = self._compute_primary_geo_role(merged_meta)
 
