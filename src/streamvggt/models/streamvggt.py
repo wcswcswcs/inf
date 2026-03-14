@@ -142,6 +142,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 ))
         return out
 
+    @staticmethod
+    def _kv_list_device(kv_list):
+        if kv_list is None:
+            return None
+        for kv in kv_list:
+            if kv is not None:
+                return kv[0].device
+        return None
+
     @torch.inference_mode()
     def inference(
         self, 
@@ -216,6 +225,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             and any(kv is not None for kv in past_key_values_camera)
         )
         is_resuming_from_cache = bool(has_past_kv or has_past_kv_camera)
+
+        if use_geo_kv_prune and has_past_kv and geo_state is None:
+            raise ValueError(
+                "Resuming geo KV pruning with past_key_values requires geo_state. "
+                "Provide geo_state together with cached aggregator KV."
+            )
 
         has_explicit_resume_source = bool(
             (frame_start_idx is not None)
@@ -326,7 +341,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             need_track = (self.track_head is not None) and (query_points is not None)
 
             camera_cache_for_step = past_key_values_camera
-            if offload_camera_cache_to_cpu and camera_cache_for_step is not None:
+            camera_cache_device = self._kv_list_device(camera_cache_for_step)
+            if (
+                camera_cache_for_step is not None
+                and camera_cache_device is not None
+                and camera_cache_device != model_device
+            ):
                 camera_cache_for_step = self._kv_list_to_device(camera_cache_for_step, model_device)
 
             pose_enc = None
@@ -529,7 +549,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             "resume_source_info": {
                 "next_frame_idx": next_frame_idx,
                 "base_frame_idx_used": int(base_frame_idx),
-                "has_geo_state": bool(use_geo_kv_prune and geo_state is not None),
+                "has_geo_state": bool(use_geo_kv_prune),
+                "input_had_geo_state": bool(use_geo_kv_prune and geo_state is not None),
                 "has_rolling_state": bool(rolling_state is not None),
                 "used_frame_start_idx": bool(frame_start_idx is not None),
             },
