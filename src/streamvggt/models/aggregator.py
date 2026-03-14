@@ -1627,6 +1627,7 @@ class Aggregator(nn.Module):
             or selector_ready_overlap < 8.0
             or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
         )
+        ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
         ongoing_reloc = bool(
             int(self.geo_reloc_frames_left) > 0
             or str(self.geo_reloc_state) != "off"
@@ -1643,7 +1644,8 @@ class Aggregator(nn.Module):
             "reference_growth_ready": bool(reference_growth_ready),
             "landmark_label_ready": bool(landmark_label_ready),
             "reference_label_ready": bool(reference_label_ready),
-            "use_recovery": bool((selector_mode == "recovery") or landmark_label_ready or int(self.geo_recovery_frames_left) > 0),
+            "use_recovery": bool((selector_mode == "recovery") or ongoing_recovery),
+            "ongoing_recovery": bool(ongoing_recovery),
             "allow_reloc_trigger": bool(allow_reloc_trigger),
             "use_reloc": bool(ongoing_reloc or (allow_reloc_trigger and reloc_signal)),
             "use_cap": bool(reference_label_ready),
@@ -2589,10 +2591,6 @@ class Aggregator(nn.Module):
             self.geo_trust_score = 1.0
             recovery_frames_next = 0
             low_trust = False
-            recovery_mode = False
-            allow_new_voxels = True
-            allow_promote_landmark = bool(policy.get("allow_landmark_growth", False)) and bool(bootstrap_bank_ready)
-            allow_promote_reference = False
         else:
             if residuals:
                 med = float(torch.tensor(residuals, dtype=torch.float32).median().item())
@@ -2615,26 +2613,25 @@ class Aggregator(nn.Module):
             elif recovery_frames_next > 0:
                 recovery_frames_next = max(0, int(recovery_frames_next) - 1)
 
-            recovery_mode = bool(policy["use_recovery"] and recovery_frames_next > 0)
-            allow_new_voxels = (not recovery_mode) and (not low_trust)
-            allow_promote_landmark = (
-                bool(policy.get("allow_landmark_growth", False))
-                and bool(bootstrap_bank_ready)
-                and (not recovery_mode)
-            )
-            allow_promote_reference = (
-                bool(policy.get("allow_reference_growth", False))
-                and bool(bootstrap_bank_ready)
-                and (not recovery_mode)
-                and (float(self.geo_trust_score) >= float(self.geo_selection_low_trust_threshold))
-                and bool(promote_reference_ready)
-            )
-
-        if bool(policy["use_recovery"]) or int(self.geo_recovery_frames_left) > 0:
-            self.geo_recovery_frames_left = int(recovery_frames_next)
-        else:
+        if tiny_bootstrap:
             self.geo_recovery_frames_left = 0
-        recovery_mode = bool((bool(policy["use_recovery"]) or int(self.geo_recovery_frames_left) > 0) and self.geo_recovery_frames_left > 0)
+        else:
+            self.geo_recovery_frames_left = max(0, int(recovery_frames_next))
+        recovery_mode = bool(int(self.geo_recovery_frames_left) > 0)
+
+        allow_new_voxels = (not recovery_mode) and (not low_trust)
+        allow_promote_landmark = (
+            bool(policy.get("allow_landmark_growth", False))
+            and bool(bootstrap_bank_ready)
+            and (not recovery_mode)
+        )
+        allow_promote_reference = (
+            bool(policy.get("allow_reference_growth", False))
+            and bool(bootstrap_bank_ready)
+            and (not recovery_mode)
+            and (float(self.geo_trust_score) >= float(self.geo_selection_low_trust_threshold))
+            and bool(promote_reference_ready)
+        )
 
         allow_reloc_trigger = bool(policy.get("allow_reloc_trigger", policy.get("use_reloc", False)))
         ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
@@ -3930,6 +3927,7 @@ class Aggregator(nn.Module):
             f"reloc_gate_open={bool(inp.get('reloc_gate_open', inp.get('allow_reloc_trigger', policy.get('allow_reloc_trigger', False))))} "
             f"use_reloc={bool(inp.get('use_reloc', policy.get('use_reloc', False)))} "
             f"ongoing_recovery={bool(inp.get('ongoing_recovery', int(self.geo_recovery_frames_left) > 0))} "
+            f"recovery_timer_active={bool(inp.get('recovery_timer_active', int(self.geo_recovery_frames_left) > 0))} "
             f"ongoing_reloc={bool(inp.get('ongoing_reloc', int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != 'off'))} "
             f"recovery_selector={bool(inp.get('recovery_selector', False))} "
             f"allow_reference_refresh_only={bool(inp.get('allow_reference_refresh_only', False))} "
@@ -6549,6 +6547,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["reloc_gate_open"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
             self.geo_last_policy_inputs["use_reloc"] = bool((geo_policy or {}).get("use_reloc", False))
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(int(self.geo_recovery_frames_left) > 0)
+            self.geo_last_policy_inputs["recovery_timer_active"] = bool(int(self.geo_recovery_frames_left) > 0)
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
 
             policy_mode = str((geo_policy or {}).get("mode", "legacy"))
@@ -6565,6 +6564,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["policy_mode"] = str(policy_mode)
             self.geo_last_policy_inputs["effective_mode"] = str(effective_mode)
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(ongoing_recovery)
+            self.geo_last_policy_inputs["recovery_timer_active"] = bool(int(self.geo_recovery_frames_left) > 0)
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(ongoing_reloc)
             self.geo_last_policy_inputs["allow_reference_refresh_only"] = bool(
                 last_obs is not None and float(last_obs.get("allow_reference_refresh_only", 0.0)) > 0.5
