@@ -5046,10 +5046,15 @@ class Aggregator(nn.Module):
         )
         if not bank_ok:
             return False
-        if len(self.geo_reference_bank) >= max(128, int(2 * int(thr["refs"]))):
+        mature_ref_bank = len(self.geo_reference_bank) >= max(64, int(2 * int(thr["refs"])))
+        if mature_ref_bank:
             return True
+
+        visible_thr_enter = float(thr["visible_ratio"])
+        visible_thr_exit = min(visible_thr_enter, 0.15)
+        visible_thr = visible_thr_exit if self._geo_structure_ready() else visible_thr_enter
         return bool(
-            float(self.geo_selector_visible_ratio_ema) >= float(thr["visible_ratio"])
+            float(self.geo_selector_visible_ratio_ema) >= float(visible_thr)
         )
 
     def _update_geo_structure_ready_streak(self, frame_idx: int) -> bool:
@@ -5098,27 +5103,44 @@ class Aggregator(nn.Module):
         if frame0_idx.numel() > 0:
             keep.update(int(v) for v in frame0_idx.tolist())
 
+        mode_now = str((policy or {}).get("mode", "legacy"))
+        plain_visible_reserve = 0
+        if max_past_tokens is not None and mode_now in {"current", "recovery"}:
+            plain_visible_reserve = max(256, int(0.12 * int(max_past_tokens)))
+
+        special_count = int(is_special.sum().item())
+        frame0_count = int(frame0_idx.numel())
+        remaining_geo_budget = None
+        if max_past_tokens is not None:
+            remaining_geo_budget = max(
+                0,
+                int(max_past_tokens) - special_count - frame0_count - plain_visible_reserve,
+            )
+
+        base_ref_quota = int(self.geo_reference_hard_quota)
+        base_anchor_quota = int(self.geo_anchor_hard_quota)
+        base_key_quota = int(self.geo_keyframe_hard_quota)
+        if remaining_geo_budget is not None:
+            ref_quota = min(base_ref_quota, max(0, int(0.45 * remaining_geo_budget)))
+            anchor_quota = min(base_anchor_quota, max(0, int(0.35 * remaining_geo_budget)))
+            key_quota = min(base_key_quota, max(0, int(0.20 * remaining_geo_budget)))
+        else:
+            ref_quota = base_ref_quota
+            anchor_quota = base_anchor_quota
+            key_quota = base_key_quota
+
         ref_idx = torch.nonzero(is_reference & (~is_special), as_tuple=False).flatten()
-        if ref_idx.numel() > 0:
-            ref_quota = int(self.geo_reference_hard_quota)
-            if max_past_tokens is not None:
-                ref_quota = min(ref_quota, max(1, int(0.4 * int(max_past_tokens))))
+        if ref_idx.numel() > 0 and int(ref_quota) > 0:
             ref_keep = self._take_recent_quota(ref_idx, frame_idx=frame_idx, quota=ref_quota)
             keep.update(int(v) for v in ref_keep.tolist())
 
         anchor_idx = torch.nonzero(is_anchor & (~is_special) & (~is_reference), as_tuple=False).flatten()
-        if anchor_idx.numel() > 0:
-            anchor_quota = int(self.geo_anchor_hard_quota)
-            if max_past_tokens is not None:
-                anchor_quota = min(anchor_quota, max(1, int(0.4 * int(max_past_tokens))))
+        if anchor_idx.numel() > 0 and int(anchor_quota) > 0:
             anchor_keep = self._take_recent_quota(anchor_idx, frame_idx=frame_idx, quota=anchor_quota)
             keep.update(int(v) for v in anchor_keep.tolist())
 
         key_idx = torch.nonzero(is_keyframe & (~is_special) & (~is_reference) & (~is_anchor), as_tuple=False).flatten()
-        if key_idx.numel() > 0:
-            key_quota = int(self.geo_keyframe_hard_quota)
-            if max_past_tokens is not None:
-                key_quota = min(key_quota, max(1, int(0.2 * int(max_past_tokens))))
+        if key_idx.numel() > 0 and int(key_quota) > 0:
             key_keep = self._select_keyframe_tokens_stratified(meta, key_idx, quota=key_quota)
             keep.update(int(v) for v in key_keep.tolist())
 
@@ -6142,15 +6164,18 @@ class Aggregator(nn.Module):
             plain_visible_idx,
             topk_per_voxel=max(1, int(topk_per_voxel)),
         )
+        plain_visible_reserved_count = 0
         if plain_visible_grouped.numel() > 0:
             if max_past_tokens is not None:
                 plain_visible_quota = max(256, int(0.12 * int(max_past_tokens)))
             else:
                 plain_visible_quota = 512
             if plain_visible_grouped.numel() > int(plain_visible_quota):
-                pv_score = plain_visible_score
-                top = torch.topk(pv_score, k=int(plain_visible_quota), largest=True).indices
-                plain_visible_keep = plain_visible_idx.index_select(0, top)
+                grouped_mask = torch.isin(plain_visible_idx, plain_visible_grouped)
+                grouped_plain_idx = plain_visible_idx[grouped_mask]
+                grouped_plain_score = plain_visible_score[grouped_mask]
+                top = torch.topk(grouped_plain_score, k=int(plain_visible_quota), largest=True).indices
+                plain_visible_keep = grouped_plain_idx.index_select(0, top)
             else:
                 plain_visible_keep = plain_visible_grouped
             for t in plain_visible_keep.tolist():
@@ -6159,6 +6184,8 @@ class Aggregator(nn.Module):
                     continue
                 self._ordered_add(selected, selected_order, [token])
                 selected_global.add(token)
+                plain_visible_reserved_count += 1
+        self.geo_last_policy_inputs["keep_plain_visible_reserved"] = int(plain_visible_reserved_count)
 
         if grouped_idx.numel() > 0:
             if max_past_tokens is not None:
@@ -6880,7 +6907,14 @@ class Aggregator(nn.Module):
                                 merged_meta["is_landmark"] = zeros
                                 merged_meta["is_reference"] = zeros
                             else:
-                                merged_meta["is_anchor"] = anchor_raw
+                                prev_anchor = merged_meta.get("is_anchor", zeros)
+                                anchor_quota = 512 if not bool(structure_ready_now) else 256
+                                new_anchor = self._bounded_label_from_mask(
+                                    merged_meta,
+                                    anchor_raw,
+                                    per_frame_quota=int(anchor_quota),
+                                )
+                                merged_meta["is_anchor"] = prev_anchor | new_anchor
                                 eligible = self._label_eligible_mask(merged_meta)
                                 prev_landmark = merged_meta.get("is_landmark", zeros)
                                 prev_reference = merged_meta.get("is_reference", zeros)
@@ -6960,7 +6994,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_visible_reserved=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -6982,6 +7016,7 @@ class Aggregator(nn.Module):
                                     int(ref_in_cache),
                                     int(landmark_in_cache),
                                     int(anchor_in_cache),
+                                    int(self.geo_last_policy_inputs.get("keep_plain_visible_reserved", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
                                 )
                             assert int(merged_meta["frame_idx"].numel()) == int(new_kv[0].shape[2]), "geo meta/KV length mismatch"
