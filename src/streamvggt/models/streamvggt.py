@@ -176,6 +176,26 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 "geo_role": torch.empty(0, dtype=torch.long),
             }
 
+        # clear selector-local continuity signals tied to token-aligned KV cache
+        self.aggregator.geo_last_selector_diag = {
+            "frame_idx": -1,
+            "stable_visible_overlap": 0.0,
+            "stable_visible_ratio": 0.0,
+            "visible_total": 0.0,
+            "selected_total": 0.0,
+        }
+        self.aggregator.geo_selector_overlap_ema = 0.0
+        self.aggregator.geo_selector_visible_ratio_ema = 0.0
+        self.aggregator.geo_handover_ready_streak = 0
+        self.aggregator.geo_handover_unready_streak = 0
+        self.aggregator.geo_recovery_enter_streak = 0
+        self.aggregator.geo_recovery_exit_streak = 0
+
+        # logging/debug state tied to old selector continuity
+        self.aggregator.geo_last_policy_inputs = {}
+        self.aggregator.geo_last_policy_metrics = {}
+        self.aggregator.geo_last_commit_guard_frame = -1
+
     def _validate_geo_kv_alignment(self, past_key_values):
         for layer_idx in range(self.aggregator.depth):
             kv = None if past_key_values is None else past_key_values[layer_idx]
@@ -596,6 +616,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     if use_geo_kv_prune
                     else "disabled"
                 ),
+                "geo_selector_state_reset": bool(use_geo_kv_prune and geo_state is not None and (not has_past_kv)),
                 "has_rolling_state": bool(rolling_state is not None),
                 "used_frame_start_idx": bool(frame_start_idx is not None),
             },
