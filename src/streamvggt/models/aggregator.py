@@ -2074,7 +2074,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 32 if not self._geo_structure_ready() else 16
+        anchor_ttl = 24 if not self._geo_structure_ready() else 12
         self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
@@ -3944,6 +3944,8 @@ class Aggregator(nn.Module):
             f"fast_path_allow_fill={bool(inp.get('fast_path_allow_fill', False))} "
             f"selector_diag_updated={bool(inp.get('selector_diag_updated', True))} "
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
+            f"current_recovery_ref_before_frame0={bool(inp.get('current_recovery_ref_before_frame0', False))} "
+            f"extra_frame0_soft_promotion_enabled={bool(inp.get('extra_frame0_soft_promotion_enabled', False))} "
             f"frame0_hard_capped_diverse={int(inp.get('frame0_hard_capped_diverse', 0) or 0)} "
             f"keep_plain_patch_hard_floor={int(inp.get('keep_plain_patch_hard_floor', 0) or 0)} "
             f"hard_cap_unique_budget={bool(inp.get('hard_cap_unique_budget', False))} "
@@ -5510,6 +5512,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
         frame0_priority_after_plain = bool(mode_now in {"current", "recovery"})
         self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(frame0_priority_after_plain)
+        self.geo_last_policy_inputs["current_recovery_ref_before_frame0"] = bool(frame0_priority_after_plain)
 
         if frame0_priority_after_plain:
             plain_avail = _exclude_picked(plain_floor, picked_ids)
@@ -5519,6 +5522,13 @@ class Aggregator(nn.Module):
                     picked_parts.append(chosen_plain)
                     picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_plain], dim=0))
                     remaining -= int(chosen_plain.numel())
+            ref_avail = _exclude_picked(part_ref, picked_ids)
+            if remaining > 0 and ref_avail.numel() > 0:
+                chosen_ref = _take_recent_quota(ref_avail, remaining)
+                if chosen_ref.numel() > 0:
+                    picked_parts.append(chosen_ref)
+                    picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_ref], dim=0))
+                    remaining -= int(chosen_ref.numel())
             frame0_avail = _exclude_picked(part_frame0, picked_ids)
             if remaining > 0 and frame0_avail.numel() > 0:
                 chosen_frame0 = self._cap_frame0_hard_subset(meta, frame0_avail, quota=remaining)
@@ -5527,6 +5537,7 @@ class Aggregator(nn.Module):
                     picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_frame0], dim=0))
                     remaining -= int(chosen_frame0.numel())
                     self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
+            trailing_parts = [part_anchor, part_key]
         else:
             frame0_avail = _exclude_picked(part_frame0, picked_ids)
             if remaining > 0 and frame0_avail.numel() > 0:
@@ -5543,8 +5554,9 @@ class Aggregator(nn.Module):
                     picked_parts.append(chosen_plain)
                     picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_plain], dim=0))
                     remaining -= int(chosen_plain.numel())
+            trailing_parts = [part_ref, part_anchor, part_key]
 
-        for part in [part_ref, part_anchor, part_key]:
+        for part in trailing_parts:
             if remaining <= 0:
                 break
             part_avail = _exclude_picked(part, picked_ids)
@@ -5705,8 +5717,12 @@ class Aggregator(nn.Module):
         frame0_special_idx = torch.nonzero(frame0_mask & is_special, as_tuple=False).flatten().tolist()
         self._ordered_add(selected, selected_order, frame0_special_idx)
 
+        mode_now = str((policy or {}).get("mode", "legacy"))
+        extra_frame0_soft_promotion_enabled = bool(mode_now == "legacy")
+        self.geo_last_policy_inputs["extra_frame0_soft_promotion_enabled"] = bool(extra_frame0_soft_promotion_enabled)
+
         frame0_patch_idx = torch.nonzero(frame0_mask & (~is_special) & (local_idx >= 0), as_tuple=False).flatten()
-        if frame0_patch_idx.numel() > 0:
+        if frame0_patch_idx.numel() > 0 and extra_frame0_soft_promotion_enabled:
             frame0_local = local_idx[frame0_patch_idx].long()
             # try conf-guided selection if metadata for frame0 exists
             frame0_meta = self.geo_frame_meta.get(0)
@@ -5716,12 +5732,12 @@ class Aggregator(nn.Module):
                 frame0_local = frame0_local[in_range]
                 if frame0_patch_idx.numel() > 0:
                     conf0 = frame0_meta["conf"].index_select(0, frame0_local).to(torch.float32)
-                    k0 = min(int(policy["frame0_patch_cap"]) if policy is not None else int(self.geo_frame0_patch_cap), int(frame0_patch_idx.numel()))
+                    k0 = min(int((policy or {}).get("frame0_patch_cap", self.geo_frame0_patch_cap)), int(frame0_patch_idx.numel()))
                     frame0_keep = self._select_frame0_patch_diverse(
                         frame0_patch_idx,
                         frame0_local,
                         conf0,
-                        quota=k0,
+                        quota=int(k0),
                         full_patch_count=int(frame0_meta["conf"].shape[0]),
                         grid_n=4,
                     )
@@ -7327,7 +7343,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7363,6 +7379,8 @@ class Aggregator(nn.Module):
                                     int(bool(self.geo_last_policy_inputs.get("fast_path_allow_fill", False))),
                                     int(bool(self.geo_last_policy_inputs.get("selector_diag_updated", True))),
                                     int(bool(self.geo_last_policy_inputs.get("frame0_priority_after_plain", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("current_recovery_ref_before_frame0", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("extra_frame0_soft_promotion_enabled", False))),
                                     int(bool(self.geo_last_policy_inputs.get("hard_cap_unique_budget", False))),
                                     int(self.geo_last_policy_inputs.get("frame0_quota_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("anchor_ttl_effective", 0) or 0),
