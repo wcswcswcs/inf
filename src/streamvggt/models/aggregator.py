@@ -2338,6 +2338,7 @@ class Aggregator(nn.Module):
             budget=b,
             recent_frames=max(1, int(recent_frames)),
             priority_keep_idx=keep,
+            policy=policy,
         )
 
         return keep
@@ -3925,6 +3926,9 @@ class Aggregator(nn.Module):
             f"exec_policy_mode={str(inp.get('exec_policy_mode', inp.get('effective_mode', 'legacy')))} "
             f"exec_use_cap={bool(inp.get('exec_use_cap', False))} "
             f"layer_cap_policy_mode={str(inp.get('layer_cap_policy_mode', inp.get('exec_policy_mode', 'legacy')))} "
+            f"early_budget_floor_applied={bool(inp.get('early_budget_floor_applied', False))} "
+            f"frame0_hard_capped_diverse={int(inp.get('frame0_hard_capped_diverse', 0) or 0)} "
+            f"keep_plain_patch_hard_floor={int(inp.get('keep_plain_patch_hard_floor', 0) or 0)} "
             f"keep_plain_patch_reserved={int(inp.get('keep_plain_patch_reserved', 0) or 0)} "
             f"keep_plain_patch_final={int(inp.get('keep_plain_patch_final', 0) or 0)} "
             f"frame0_hard_kept={int(inp.get('frame0_hard_kept', 0) or 0)} "
@@ -4790,6 +4794,7 @@ class Aggregator(nn.Module):
             reanchor_overlap_avg=float(diag["reanchor_overlap_avg"]),
             diag_payload=diag,
             allow_fill=False,
+            policy=policy,
         )
 
     def _finalize_geo_keep(
@@ -4816,6 +4821,7 @@ class Aggregator(nn.Module):
         diag_payload: Optional[Dict[str, Any]] = None,
         allow_fill: bool = True,
         priority_keep_idx: Optional[torch.Tensor] = None,
+        policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         total_tokens = int(meta["frame_idx"].numel()) if meta.get("frame_idx") is not None else 0
         if selected_order is not None:
@@ -4843,6 +4849,7 @@ class Aggregator(nn.Module):
                         budget=max(0, int(max_past_tokens)),
                         recent_frames=recent_frames_eff,
                         priority_keep_idx=priority_keep_idx if priority_keep_idx is not None else keep,
+                        policy=policy,
                     )
                 else:
                     keep = self._cap_keep_with_protection(
@@ -5255,6 +5262,7 @@ class Aggregator(nn.Module):
         budget: Optional[int],
         recent_frames: int,
         priority_keep_idx: Optional[torch.Tensor] = None,
+        policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         meta_len = int(meta["frame_idx"].numel())
         if budget is None:
@@ -5264,6 +5272,8 @@ class Aggregator(nn.Module):
                 kv_len=meta_len,
             )
         b = max(0, int(budget))
+        self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(0)
+        self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
         keep = self._sanitize_keep_idx_preserve_order(
             keep_idx,
             meta_len=meta_len,
@@ -5277,10 +5287,25 @@ class Aggregator(nn.Module):
         if keep.numel() <= b:
             return keep
         if hard.numel() >= b:
+            plain_floor_idx = torch.empty((0,), dtype=torch.long)
+            if priority_keep_idx is not None and policy is not None:
+                mode_now = str(policy.get("mode", "legacy"))
+                if mode_now in {"current", "recovery"}:
+                    priority = self._sanitize_keep_idx_preserve_order(
+                        priority_keep_idx.detach().cpu().long(),
+                        meta_len=meta_len,
+                        kv_len=meta_len,
+                    )
+                    geo_role_all = meta.get("geo_role", self._compute_primary_geo_role(meta))
+                    is_special_all = meta.get("is_special", torch.zeros((meta_len,), dtype=torch.bool))
+                    plain_mask = (~is_special_all.index_select(0, priority)) & (geo_role_all.index_select(0, priority) == 0)
+                    plain_floor_idx = priority[plain_mask & (~torch.isin(priority, hard))]
             return self._cap_hard_backbone_only(
                 meta=meta,
                 hard_idx=hard,
                 budget=b,
+                plain_floor_idx=plain_floor_idx,
+                policy=policy,
             )
 
         selected = set(int(v) for v in hard.tolist())
@@ -5317,8 +5342,50 @@ class Aggregator(nn.Module):
                 meta=meta,
                 hard_idx=out,
                 budget=b,
+                policy=policy,
             )
         return out
+
+    def _cap_frame0_hard_subset(
+        self,
+        meta: Dict[str, torch.Tensor],
+        frame0_idx: torch.Tensor,
+        quota: int,
+    ) -> torch.Tensor:
+        if frame0_idx is None or frame0_idx.numel() == 0 or int(quota) <= 0:
+            return torch.empty((0,), dtype=torch.long)
+
+        frame0_idx = frame0_idx.detach().cpu().long()
+        if frame0_idx.numel() <= int(quota):
+            return frame0_idx
+
+        local_idx_all = meta.get(
+            "local_patch_idx",
+            torch.full((int(meta["frame_idx"].numel()),), -1, dtype=torch.long),
+        )
+        frame0_meta = self.geo_frame_meta.get(0)
+
+        if (
+            frame0_meta is not None
+            and frame0_meta.get("conf") is not None
+            and frame0_meta["conf"].numel() > 0
+        ):
+            frame0_local = local_idx_all.index_select(0, frame0_idx).long()
+            valid = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
+            frame0_idx_valid = frame0_idx[valid]
+            frame0_local_valid = frame0_local[valid]
+            if frame0_idx_valid.numel() > 0:
+                conf0 = frame0_meta["conf"].index_select(0, frame0_local_valid).to(torch.float32)
+                return self._select_frame0_patch_diverse(
+                    frame0_idx_valid,
+                    frame0_local_valid,
+                    conf0,
+                    quota=int(quota),
+                    full_patch_count=int(frame0_meta["conf"].shape[0]),
+                    grid_n=4,
+                )
+
+        return frame0_idx[: int(quota)]
 
     def _cap_hard_backbone_only(
         self,
@@ -5326,6 +5393,8 @@ class Aggregator(nn.Module):
         meta: Dict[str, torch.Tensor],
         hard_idx: torch.Tensor,
         budget: int,
+        plain_floor_idx: Optional[torch.Tensor] = None,
+        policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
         Cap already-hard-protected indices using strict backbone priority only.
@@ -5379,6 +5448,13 @@ class Aggregator(nn.Module):
         part_anchor = hard[anchor_keep]
         part_key = hard[key_keep]
 
+        mode_now = str((policy or {}).get("mode", "legacy"))
+        plain_floor = torch.empty((0,), dtype=torch.long)
+        if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery"}:
+            plain_floor_quota = max(64, int(0.08 * int(b)))
+            plain_floor = plain_floor_idx[: min(int(plain_floor_idx.numel()), int(plain_floor_quota))]
+        self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(plain_floor.numel())
+
         def _take_recent_quota(idx_tensor: torch.Tensor, quota: int) -> torch.Tensor:
             if quota <= 0 or idx_tensor.numel() == 0:
                 return torch.empty((0,), dtype=torch.long)
@@ -5390,7 +5466,27 @@ class Aggregator(nn.Module):
 
         remaining = b
         picked: List[torch.Tensor] = []
-        for part in [part_special, part_frame0, part_ref, part_anchor, part_key]:
+
+        chosen_special = _take_recent_quota(part_special, remaining)
+        if chosen_special.numel() > 0:
+            picked.append(chosen_special)
+            remaining -= int(chosen_special.numel())
+
+        self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
+        if remaining > 0:
+            chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
+            if chosen_frame0.numel() > 0:
+                picked.append(chosen_frame0)
+                remaining -= int(chosen_frame0.numel())
+                self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
+
+        if remaining > 0 and plain_floor.numel() > 0:
+            chosen_plain = plain_floor[:remaining]
+            if chosen_plain.numel() > 0:
+                picked.append(chosen_plain)
+                remaining -= int(chosen_plain.numel())
+
+        for part in [part_ref, part_anchor, part_key]:
             if remaining <= 0:
                 break
             chosen = _take_recent_quota(part, remaining)
@@ -5450,6 +5546,7 @@ class Aggregator(nn.Module):
             budget=int(b),
             recent_frames=int(recent_frames),
             priority_keep_idx=priority_keep_idx,
+            policy=policy,
         )
 
         return self._sanitize_keep_idx_preserve_order(
@@ -5514,6 +5611,7 @@ class Aggregator(nn.Module):
                 fast_path=2,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
+                policy=policy,
             )
 
         hard_keep = self._build_hard_backbone_keep(
@@ -5628,6 +5726,7 @@ class Aggregator(nn.Module):
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
+                policy=policy,
             )
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
@@ -5745,6 +5844,7 @@ class Aggregator(nn.Module):
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
+                policy=policy,
             )
 
         world_to_cam = current_view["world_to_cam"]
@@ -5804,6 +5904,7 @@ class Aggregator(nn.Module):
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
+                policy=policy,
             )
 
         # Acceleration guard 1: restrict scoring to recent old frames only.
@@ -5957,6 +6058,7 @@ class Aggregator(nn.Module):
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
+                policy=policy,
             )
 
         idx_all = torch.cat(gather_idx, dim=0)
@@ -6467,6 +6569,7 @@ class Aggregator(nn.Module):
             reanchor_overlap_avg=float(reanchor_overlap_avg),
             diag_payload=diag_payload,
             priority_keep_idx=priority_for_cap,
+            policy=policy,
         )
     def __build_patch_embed__(
         self,
@@ -6921,7 +7024,16 @@ class Aggregator(nn.Module):
                     if use_cache:
                         layer_idx = global_idx
                         raw_layer_budget = int(current_budgets[layer_idx].item())
-                        if use_geo_kv_prune and effective_mode == "legacy":
+                        apply_early_floor = bool(
+                            use_geo_kv_prune
+                            and (effective_mode == "legacy")
+                            and (
+                                bool(safe_warmup)
+                                or int(past_frame_idx) <= int(self.geo_early_stabilize_frames)
+                            )
+                        )
+                        self.geo_last_policy_inputs["early_budget_floor_applied"] = bool(apply_early_floor)
+                        if apply_early_floor:
                             raw_layer_budget = max(raw_layer_budget, int(self.geo_early_budget_floor))
                         if use_geo_kv_prune and effective_mode != "legacy":
                             layer_budget = self._scheduled_layer_budget(raw_layer_budget, int(past_frame_idx), policy=exec_policy)
@@ -7121,6 +7233,7 @@ class Aggregator(nn.Module):
                                     budget=int(layer_budget),
                                     recent_frames=int(geo_recent_frames),
                                     priority_keep_idx=priority_cap_idx,
+                                    policy=exec_policy,
                                 )
                                 cap_keep = self._sanitize_keep_idx_preserve_order(
                                     cap_keep,
@@ -7141,7 +7254,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7168,6 +7281,9 @@ class Aggregator(nn.Module):
                                     int(self.geo_last_policy_inputs.get("keep_plain_patch_reserved", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("keep_plain_patch_final", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("frame0_hard_kept", 0) or 0),
+                                    int(self.geo_last_policy_inputs.get("keep_plain_patch_hard_floor", 0) or 0),
+                                    int(self.geo_last_policy_inputs.get("frame0_hard_capped_diverse", 0) or 0),
+                                    int(bool(self.geo_last_policy_inputs.get("early_budget_floor_applied", False))),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
                                 )
                             assert int(merged_meta["frame_idx"].numel()) == int(new_kv[0].shape[2]), "geo meta/KV length mismatch"
