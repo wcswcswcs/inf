@@ -2064,7 +2064,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 128
+        anchor_ttl = 64
         landmark_ttl = 256
         reference_ttl = 256
         if "is_anchor" in meta and meta["is_anchor"].numel() == n:
@@ -3367,6 +3367,7 @@ class Aggregator(nn.Module):
         identity_keep: torch.Tensor,
         budget: int,
         recent_frames: int,
+        policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
         Apply strict hard-cap in identity space, then keep original identity order.
@@ -3387,7 +3388,7 @@ class Aggregator(nn.Module):
             budget=int(budget),
             recent_frames=int(recent_frames),
             current_frame_idx=int(meta["frame_idx"].max().item()) if meta["frame_idx"].numel() > 0 else -1,
-            policy=None,
+            policy=policy,
             priority_keep_idx=idx,
         )
         if idx.numel() == 0:
@@ -3923,6 +3924,7 @@ class Aggregator(nn.Module):
             f"structure_ready={bool(inp.get('structure_ready', policy.get('structure_ready', False)))} "
             f"exec_policy_mode={str(inp.get('exec_policy_mode', inp.get('effective_mode', 'legacy')))} "
             f"exec_use_cap={bool(inp.get('exec_use_cap', False))} "
+            f"layer_cap_policy_mode={str(inp.get('layer_cap_policy_mode', inp.get('exec_policy_mode', 'legacy')))} "
             f"keep_plain_patch_reserved={int(inp.get('keep_plain_patch_reserved', 0) or 0)} "
             f"keep_plain_patch_final={int(inp.get('keep_plain_patch_final', 0) or 0)} "
             f"frame0_hard_kept={int(inp.get('frame0_hard_kept', 0) or 0)} "
@@ -5147,9 +5149,32 @@ class Aggregator(nn.Module):
             else:
                 frame0_quota = min(
                     int(frame0_idx.numel()),
-                    max(512, int(0.18 * int(max_past_tokens))),
+                    min(512, max(128, int(0.10 * int(max_past_tokens)))),
                 )
-                frame0_keep = self._take_recent_quota(frame0_idx, frame_idx=frame_idx, quota=int(frame0_quota))
+                frame0_meta = self.geo_frame_meta.get(0)
+                if (
+                    frame0_meta is not None
+                    and frame0_meta.get("conf") is not None
+                    and frame0_meta["conf"].numel() > 0
+                ):
+                    frame0_local = local_idx.index_select(0, frame0_idx).long()
+                    valid = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
+                    frame0_idx_valid = frame0_idx[valid]
+                    frame0_local_valid = frame0_local[valid]
+                    if frame0_idx_valid.numel() > 0:
+                        conf0 = frame0_meta["conf"].index_select(0, frame0_local_valid).to(torch.float32)
+                        frame0_keep = self._select_frame0_patch_diverse(
+                            frame0_idx_valid,
+                            frame0_local_valid,
+                            conf0,
+                            quota=int(frame0_quota),
+                            full_patch_count=int(frame0_meta["conf"].shape[0]),
+                            grid_n=4,
+                        )
+                    else:
+                        frame0_keep = frame0_idx[: int(frame0_quota)]
+                else:
+                    frame0_keep = frame0_idx[: int(frame0_quota)]
             keep.update(int(v) for v in frame0_keep.tolist())
         self.geo_last_policy_inputs["frame0_hard_kept"] = int(frame0_keep.numel())
 
@@ -6717,6 +6742,7 @@ class Aggregator(nn.Module):
                 self.geo_last_policy_inputs["final_ref_layer_budget"] = int(ref_layer_budget)
             self.geo_last_policy_inputs["exec_policy_mode"] = str(exec_policy.get("mode", "legacy"))
             self.geo_last_policy_inputs["exec_use_cap"] = bool(exec_policy.get("use_cap", False))
+            self.geo_last_policy_inputs["layer_cap_policy_mode"] = str(exec_policy.get("mode", "legacy"))
             self.geo_last_policy_inputs["structure_ready_latched"] = bool(self.geo_structure_ready_latched)
             self.geo_last_policy_inputs["structure_unready_streak"] = int(self.geo_structure_unready_streak)
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(ongoing_recovery)
@@ -6873,6 +6899,7 @@ class Aggregator(nn.Module):
                 exec_policy["cap_alpha"] = 0.0
             self.geo_last_policy_inputs["exec_policy_mode"] = str(exec_policy.get("mode", "legacy"))
             self.geo_last_policy_inputs["exec_use_cap"] = bool(exec_policy.get("use_cap", False))
+            self.geo_last_policy_inputs["layer_cap_policy_mode"] = str(exec_policy.get("mode", "legacy"))
             safe_warmup = bool(
                 (effective_mode == "legacy")
                 and (not bool((geo_policy or {}).get("use_anchor_labels", False)))
@@ -6937,6 +6964,7 @@ class Aggregator(nn.Module):
                                     else torch.empty((0,), dtype=torch.long),
                                     budget=max_past_tokens,
                                     recent_frames=geo_recent_frames,
+                                    policy=exec_policy,
                                 )
                                 keep_idx = self._identity_keep_to_index(past_meta, layer_identity_keep)
                             else:
@@ -7113,7 +7141,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7130,6 +7158,7 @@ class Aggregator(nn.Module):
                                     int(bool(bootstrap_bank_ready_now)),
                                     int(bool(structure_ready_now)),
                                     int(bool(self.geo_last_policy_inputs.get("exec_use_cap", False))),
+                                    str(self.geo_last_policy_inputs.get("layer_cap_policy_mode", "legacy")),
                                     int(bool((geo_policy or {}).get("use_anchor_labels", False))),
                                     int(self.geo_last_policy_inputs.get("anchor_count_raw", 0) or 0),
                                     int(frame0_in_cache),
