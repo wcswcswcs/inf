@@ -407,6 +407,8 @@ class Aggregator(nn.Module):
         self.geo_adaptive_map_voxels: set[Tuple[int, int, int]] = set()
         self.geo_bad_stable_quality_streak: int = 0
         self.geo_structure_ready_streak: int = 0
+        self.geo_structure_ready_latched: bool = False
+        self.geo_structure_unready_streak: int = 0
         self.geo_reloc_frames_left: int = 0
         self.geo_reloc_state: str = "off"
         self.geo_reloc_hard_left: int = 0
@@ -539,6 +541,8 @@ class Aggregator(nn.Module):
             "geo_last_bootstrap_log_frame": int(self.geo_last_bootstrap_log_frame),
             "geo_selector_mode": str(self.geo_selector_mode),
             "geo_structure_ready_streak": int(self.geo_structure_ready_streak),
+            "geo_structure_ready_latched": bool(self.geo_structure_ready_latched),
+            "geo_structure_unready_streak": int(self.geo_structure_unready_streak),
             "geo_maturity_ema": float(self.geo_maturity_ema),
             "geo_instability_ema": float(self.geo_instability_ema),
             "geo_pressure_ema": float(self.geo_pressure_ema),
@@ -635,6 +639,8 @@ class Aggregator(nn.Module):
         self.geo_last_bootstrap_log_frame = int(state.get("geo_last_bootstrap_log_frame", -1))
         self.geo_selector_mode = str(state.get("geo_selector_mode", "legacy"))
         self.geo_structure_ready_streak = int(state.get("geo_structure_ready_streak", 0))
+        self.geo_structure_ready_latched = bool(state.get("geo_structure_ready_latched", False))
+        self.geo_structure_unready_streak = int(state.get("geo_structure_unready_streak", 0))
         _ = state.get("geo_current_selector_latched", None)
         _ = state.get("geo_current_selector_ready_streak", None)
         _ = state.get("geo_current_selector_unready_streak", None)
@@ -3915,6 +3921,9 @@ class Aggregator(nn.Module):
             f"safe_warmup={bool(inp.get('safe_warmup', False))} "
             f"bootstrap_bank_ready={bool(inp.get('bootstrap_bank_ready', policy.get('bootstrap_bank_ready', False)))} "
             f"structure_ready={bool(inp.get('structure_ready', policy.get('structure_ready', False)))} "
+            f"exec_policy_mode={str(inp.get('exec_policy_mode', inp.get('effective_mode', 'legacy')))} "
+            f"structure_ready_latched={bool(inp.get('structure_ready_latched', self.geo_structure_ready_latched))} "
+            f"structure_unready_streak={int(inp.get('structure_unready_streak', self.geo_structure_unready_streak) or 0)} "
             f"landmark_growth_ready={bool(inp.get('landmark_growth_ready', policy.get('landmark_growth_ready', False)))} "
             f"reference_growth_ready={bool(inp.get('reference_growth_ready', policy.get('reference_growth_ready', False)))} "
             f"landmark_label_ready={bool(inp.get('landmark_label_ready', policy.get('landmark_label_ready', policy.get('use_landmark_labels', False))))} "
@@ -5062,16 +5071,28 @@ class Aggregator(nn.Module):
         raw_ready = self._geo_raw_structure_ready()
         if int(frame_idx) < int(self.geo_bootstrap_frames):
             self.geo_structure_ready_streak = 0
+            self.geo_structure_unready_streak = 0
+            self.geo_structure_ready_latched = False
             return False
+
         if raw_ready:
             self.geo_structure_ready_streak += 1
+            self.geo_structure_unready_streak = 0
         else:
             self.geo_structure_ready_streak = 0
-        return bool(self.geo_structure_ready_streak >= int(thr["ready_streak"]))
+            self.geo_structure_unready_streak += 1
+
+        if (not self.geo_structure_ready_latched) and self.geo_structure_ready_streak >= int(thr["ready_streak"]):
+            self.geo_structure_ready_latched = True
+
+        exit_streak = max(3, int(thr["ready_streak"]))
+        if self.geo_structure_ready_latched and self.geo_structure_unready_streak >= int(exit_streak):
+            self.geo_structure_ready_latched = False
+
+        return bool(self.geo_structure_ready_latched)
 
     def _geo_structure_ready(self) -> bool:
-        thr = self._geo_effective_bootstrap_thresholds()
-        return bool(self.geo_structure_ready_streak >= int(thr["ready_streak"]))
+        return bool(self.geo_structure_ready_latched)
 
     def _build_hard_backbone_keep(
         self,
@@ -6652,6 +6673,11 @@ class Aggregator(nn.Module):
                 effective_mode = policy_mode
             self.geo_last_policy_inputs["policy_mode"] = str(policy_mode)
             self.geo_last_policy_inputs["effective_mode"] = str(effective_mode)
+            exec_policy = copy.deepcopy(geo_policy or {})
+            exec_policy["mode"] = str(effective_mode)
+            self.geo_last_policy_inputs["exec_policy_mode"] = str(exec_policy.get("mode", "legacy"))
+            self.geo_last_policy_inputs["structure_ready_latched"] = bool(self.geo_structure_ready_latched)
+            self.geo_last_policy_inputs["structure_unready_streak"] = int(self.geo_structure_unready_streak)
             self.geo_last_policy_inputs["ongoing_recovery"] = bool(ongoing_recovery)
             self.geo_last_policy_inputs["recovery_timer_active"] = bool(int(self.geo_recovery_frames_left) > 0)
             self.geo_last_policy_inputs["ongoing_reloc"] = bool(ongoing_reloc)
@@ -6669,7 +6695,7 @@ class Aggregator(nn.Module):
                     ref_meta,
                     current_frame_idx=int(cache_frame_idx),
                     max_past_tokens=ref_past_budget,
-                    policy=geo_policy,
+                    policy=exec_policy,
                 )
                 if mode_now == "legacy":
                     self.geo_last_policy_inputs["recovery_selector"] = bool(False)
@@ -6684,14 +6710,14 @@ class Aggregator(nn.Module):
                         hard_keep=hard_keep_for_bootstrap,
                         use_view_pruning=bool(selector_use_view_pruning),
                         max_past_tokens=ref_past_budget,
-                        policy=geo_policy,
+                        policy=exec_policy,
                     )
                     geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
                 elif mode_now in {"current", "recovery"}:
                     geo_reloc_active = False
                     recovery_selector = bool(mode_now == "recovery" or int(self.geo_recovery_frames_left) > 0)
                     self.geo_last_policy_inputs["recovery_selector"] = bool(recovery_selector)
-                    selector_policy = copy.deepcopy(geo_policy or {})
+                    selector_policy = copy.deepcopy(exec_policy)
                     if recovery_selector:
                         selector_policy["use_cap"] = False
                         selector_policy["local_budget_ratio"] = max(
@@ -6746,7 +6772,7 @@ class Aggregator(nn.Module):
                         meta=ref_meta,
                         max_past_tokens=max(0, int(ref_past_budget)),
                         recent_frames=max(1, int(geo_recent_frames)),
-                        policy=geo_policy,
+                        policy=exec_policy,
                     )
                 else:
                     raise RuntimeError(f"Unknown effective_mode: {mode_now}")
@@ -6799,6 +6825,9 @@ class Aggregator(nn.Module):
         if use_geo_kv_prune:
             geo_policy = copy.deepcopy(geo_policy or self._geo_default_policy(int(past_frame_idx)))
             effective_mode = str(effective_mode or (geo_policy or {}).get("mode", "legacy"))
+            exec_policy = copy.deepcopy(geo_policy)
+            exec_policy["mode"] = str(effective_mode)
+            self.geo_last_policy_inputs["exec_policy_mode"] = str(exec_policy.get("mode", "legacy"))
             safe_warmup = bool(
                 (effective_mode == "legacy")
                 and (not bool((geo_policy or {}).get("use_anchor_labels", False)))
@@ -6845,14 +6874,14 @@ class Aggregator(nn.Module):
                                         budget=max_past_tokens,
                                         recent_frames=max(8, int(geo_recent_frames)),
                                         current_frame_idx=int(past_frame_idx),
-                                        policy=geo_policy,
+                                        policy=exec_policy,
                                     )
                             elif geo_reloc_active:
                                 layer_identity_keep = self._build_reloc_identity_keep(
                                     meta=past_meta,
                                     max_past_tokens=max_past_tokens,
                                     recent_frames=max(1, int(geo_recent_frames)),
-                                    policy=geo_policy,
+                                    policy=exec_policy,
                                 )
                                 keep_idx = self._identity_keep_to_index(past_meta, layer_identity_keep)
                             elif geo_prune_ready:
@@ -6901,7 +6930,7 @@ class Aggregator(nn.Module):
                                 budget=int(max_past_tokens),
                                 recent_frames=int(geo_recent_frames),
                                 current_frame_idx=int(past_frame_idx),
-                                policy=geo_policy,
+                                policy=exec_policy,
                                 priority_keep_idx=keep_idx if keep_idx is not None else pre_keep_all,
                             )
                             debug_pre_keep = pre_keep
@@ -6949,7 +6978,11 @@ class Aggregator(nn.Module):
                                 merged_meta["is_reference"] = zeros
                             else:
                                 prev_anchor = merged_meta.get("is_anchor", zeros)
-                                anchor_quota = 512 if not bool(structure_ready_now) else 256
+                                layer_budget_eff = max(int(P), int(layer_budget))
+                                if not bool(structure_ready_now):
+                                    anchor_quota = max(96, min(256, int(0.05 * layer_budget_eff)))
+                                else:
+                                    anchor_quota = max(64, min(160, int(0.03 * layer_budget_eff)))
                                 new_anchor = self._bounded_label_from_mask(
                                     merged_meta,
                                     anchor_raw,
@@ -7006,7 +7039,7 @@ class Aggregator(nn.Module):
                                     merged_meta,
                                     current_frame_idx=int(past_frame_idx),
                                     max_past_tokens=int(layer_budget),
-                                    policy=geo_policy,
+                                    policy=exec_policy,
                                 )
                                 cap_keep = self._cap_keep_with_hard_protection(
                                     meta=merged_meta,
