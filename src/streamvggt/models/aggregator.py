@@ -6852,7 +6852,7 @@ class Aggregator(nn.Module):
                         if use_geo_kv_prune and effective_mode == "legacy":
                             raw_layer_budget = max(raw_layer_budget, int(self.geo_early_budget_floor))
                         if use_geo_kv_prune and effective_mode != "legacy":
-                            layer_budget = self._scheduled_layer_budget(raw_layer_budget, int(past_frame_idx), policy=geo_policy)
+                            layer_budget = self._scheduled_layer_budget(raw_layer_budget, int(past_frame_idx), policy=exec_policy)
                         else:
                             layer_budget = raw_layer_budget
                         debug_protected = torch.empty((0,), dtype=torch.long)
