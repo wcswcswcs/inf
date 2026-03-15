@@ -2074,7 +2074,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 48 if not self._geo_structure_ready() else 32
+        anchor_ttl = 40 if not self._geo_structure_ready() else 24
         self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
@@ -3941,6 +3941,8 @@ class Aggregator(nn.Module):
             f"shared_ref_early_floor_applied={bool(inp.get('shared_ref_early_floor_applied', False))} "
             f"shared_keep_order_preserved={bool(inp.get('shared_keep_order_preserved', False))} "
             f"allow_fill_effective={bool(inp.get('allow_fill_effective', True))} "
+            f"fast_path_allow_fill={bool(inp.get('fast_path_allow_fill', False))} "
+            f"selector_diag_updated={bool(inp.get('selector_diag_updated', True))} "
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"frame0_hard_capped_diverse={int(inp.get('frame0_hard_capped_diverse', 0) or 0)} "
             f"keep_plain_patch_hard_floor={int(inp.get('keep_plain_patch_hard_floor', 0) or 0)} "
@@ -4838,8 +4840,11 @@ class Aggregator(nn.Module):
         allow_fill: bool = True,
         priority_keep_idx: Optional[torch.Tensor] = None,
         policy: Optional[Dict[str, Any]] = None,
+        update_selector_diag: bool = True,
     ) -> torch.Tensor:
         self.geo_last_policy_inputs["allow_fill_effective"] = bool(allow_fill)
+        self.geo_last_policy_inputs["selector_diag_updated"] = bool(update_selector_diag)
+        self.geo_last_policy_inputs["fast_path_allow_fill"] = bool(allow_fill) if int(fast_path) != 0 else bool(False)
         total_tokens = int(meta["frame_idx"].numel()) if meta.get("frame_idx") is not None else 0
         if selected_order is not None:
             order: List[int] = []
@@ -4907,16 +4912,17 @@ class Aggregator(nn.Module):
         self.geo_cached_landmark_identity_keep = new_cache_identity
         kv_old = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff)
         kv_keep = self._summarize_kv_meta(meta, recent_frames=recent_frames_eff, subset_idx=keep)
-        self._update_geo_selector_diag(
-            current_frame_idx=current_frame_idx,
-            stable_visible_voxel_overlap=int(diag_final["stable_visible_voxel_overlap"]),
-            stable_selected_visible=int(diag_final["stable_selected_visible"]),
-            stable_selected_invisible=int(diag_final["stable_selected_invisible"]),
-            visible_total=int(diag_final["visible_total"]),
-            selected_total=int(keep.numel()),
-            hard_keep_continuity=float(hard_keep_continuity),
-            frame0_pin_ratio=float(min(1.0, max(0.0, frame0_pin_ratio))),
-        )
+        if bool(update_selector_diag):
+            self._update_geo_selector_diag(
+                current_frame_idx=current_frame_idx,
+                stable_visible_voxel_overlap=int(diag_final["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(diag_final["stable_selected_visible"]),
+                stable_selected_invisible=int(diag_final["stable_selected_invisible"]),
+                visible_total=int(diag_final["visible_total"]),
+                selected_total=int(keep.numel()),
+                hard_keep_continuity=float(hard_keep_continuity),
+                frame0_pin_ratio=float(min(1.0, max(0.0, frame0_pin_ratio))),
+            )
         self._queue_geo_console_log(
             current_frame_idx=current_frame_idx,
             total_tokens=total_tokens,
@@ -5642,6 +5648,8 @@ class Aggregator(nn.Module):
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
+                allow_fill=False,
+                update_selector_diag=False,
             )
 
         hard_keep = self._build_hard_backbone_keep(
@@ -5757,6 +5765,8 @@ class Aggregator(nn.Module):
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
+                allow_fill=False,
+                update_selector_diag=False,
             )
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
@@ -5875,6 +5885,8 @@ class Aggregator(nn.Module):
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
+                allow_fill=False,
+                update_selector_diag=False,
             )
 
         world_to_cam = current_view["world_to_cam"]
@@ -5935,6 +5947,8 @@ class Aggregator(nn.Module):
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
+                allow_fill=False,
+                update_selector_diag=False,
             )
 
         # Acceleration guard 1: restrict scoring to recent old frames only.
@@ -6089,6 +6103,8 @@ class Aggregator(nn.Module):
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
+                allow_fill=False,
+                update_selector_diag=False,
             )
 
         idx_all = torch.cat(gather_idx, dim=0)
@@ -7286,7 +7302,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d frame0_priority_after_plain=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7319,6 +7335,8 @@ class Aggregator(nn.Module):
                                     int(bool(self.geo_last_policy_inputs.get("shared_ref_early_floor_applied", False))),
                                     int(bool(self.geo_last_policy_inputs.get("shared_keep_order_preserved", False))),
                                     int(bool(self.geo_last_policy_inputs.get("allow_fill_effective", True))),
+                                    int(bool(self.geo_last_policy_inputs.get("fast_path_allow_fill", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("selector_diag_updated", True))),
                                     int(bool(self.geo_last_policy_inputs.get("frame0_priority_after_plain", False))),
                                     int(self.geo_last_policy_inputs.get("anchor_ttl_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
