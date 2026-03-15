@@ -2074,7 +2074,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 40 if not self._geo_structure_ready() else 24
+        anchor_ttl = 32 if not self._geo_structure_ready() else 16
         self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
@@ -3946,6 +3946,8 @@ class Aggregator(nn.Module):
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"frame0_hard_capped_diverse={int(inp.get('frame0_hard_capped_diverse', 0) or 0)} "
             f"keep_plain_patch_hard_floor={int(inp.get('keep_plain_patch_hard_floor', 0) or 0)} "
+            f"hard_cap_unique_budget={bool(inp.get('hard_cap_unique_budget', False))} "
+            f"frame0_quota_effective={int(inp.get('frame0_quota_effective', 0) or 0)} "
             f"anchor_ttl_effective={int(inp.get('anchor_ttl_effective', 0) or 0)} "
             f"keep_plain_patch_reserved={int(inp.get('keep_plain_patch_reserved', 0) or 0)} "
             f"keep_plain_patch_final={int(inp.get('keep_plain_patch_final', 0) or 0)} "
@@ -5175,11 +5177,12 @@ class Aggregator(nn.Module):
         frame0_keep = frame0_idx
         if frame0_idx.numel() > 0:
             if mode_now == "legacy" or max_past_tokens is None:
+                frame0_quota = int(frame0_idx.numel())
                 frame0_keep = frame0_idx
             else:
                 frame0_quota = min(
                     int(frame0_idx.numel()),
-                    min(384, max(96, int(0.08 * int(max_past_tokens)))),
+                    min(256, max(64, int(0.06 * int(max_past_tokens)))),
                 )
                 frame0_meta = self.geo_frame_meta.get(0)
                 if (
@@ -5207,6 +5210,7 @@ class Aggregator(nn.Module):
                     frame0_keep = frame0_idx[: int(frame0_quota)]
             keep.update(int(v) for v in frame0_keep.tolist())
         self.geo_last_policy_inputs["frame0_hard_kept"] = int(frame0_keep.numel())
+        self.geo_last_policy_inputs["frame0_quota_effective"] = int(frame0_quota) if frame0_idx.numel() > 0 else int(0)
 
         plain_visible_reserve = 0
         if max_past_tokens is not None and mode_now in {"current", "recovery"}:
@@ -5298,6 +5302,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(0)
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
         self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(False)
+        self.geo_last_policy_inputs["hard_cap_unique_budget"] = bool(False)
         keep = self._sanitize_keep_idx_preserve_order(
             keep_idx,
             meta_len=meta_len,
@@ -5485,12 +5490,21 @@ class Aggregator(nn.Module):
             order = torch.argsort(frame_take, descending=True, stable=True)
             return idx_tensor.index_select(0, order[: int(quota)])
 
+        def _exclude_picked(idx_tensor: torch.Tensor, picked_ids: torch.Tensor) -> torch.Tensor:
+            if idx_tensor is None or idx_tensor.numel() == 0:
+                return torch.empty((0,), dtype=torch.long)
+            if picked_ids is None or picked_ids.numel() == 0:
+                return idx_tensor
+            return idx_tensor[~torch.isin(idx_tensor, picked_ids)]
+
         remaining = b
-        picked: List[torch.Tensor] = []
+        picked_parts: List[torch.Tensor] = []
+        picked_ids = torch.empty((0,), dtype=torch.long)
 
         chosen_special = _take_recent_quota(part_special, remaining)
         if chosen_special.numel() > 0:
-            picked.append(chosen_special)
+            picked_parts.append(chosen_special)
+            picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_special], dim=0))
             remaining -= int(chosen_special.numel())
 
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
@@ -5498,41 +5512,52 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(frame0_priority_after_plain)
 
         if frame0_priority_after_plain:
-            if remaining > 0 and plain_floor.numel() > 0:
-                chosen_plain = plain_floor[:remaining]
+            plain_avail = _exclude_picked(plain_floor, picked_ids)
+            if remaining > 0 and plain_avail.numel() > 0:
+                chosen_plain = plain_avail[:remaining]
                 if chosen_plain.numel() > 0:
-                    picked.append(chosen_plain)
+                    picked_parts.append(chosen_plain)
+                    picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_plain], dim=0))
                     remaining -= int(chosen_plain.numel())
-            if remaining > 0:
-                chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
+            frame0_avail = _exclude_picked(part_frame0, picked_ids)
+            if remaining > 0 and frame0_avail.numel() > 0:
+                chosen_frame0 = self._cap_frame0_hard_subset(meta, frame0_avail, quota=remaining)
                 if chosen_frame0.numel() > 0:
-                    picked.append(chosen_frame0)
+                    picked_parts.append(chosen_frame0)
+                    picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_frame0], dim=0))
                     remaining -= int(chosen_frame0.numel())
                     self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
         else:
-            if remaining > 0:
-                chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
+            frame0_avail = _exclude_picked(part_frame0, picked_ids)
+            if remaining > 0 and frame0_avail.numel() > 0:
+                chosen_frame0 = self._cap_frame0_hard_subset(meta, frame0_avail, quota=remaining)
                 if chosen_frame0.numel() > 0:
-                    picked.append(chosen_frame0)
+                    picked_parts.append(chosen_frame0)
+                    picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_frame0], dim=0))
                     remaining -= int(chosen_frame0.numel())
                     self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
-            if remaining > 0 and plain_floor.numel() > 0:
-                chosen_plain = plain_floor[:remaining]
+            plain_avail = _exclude_picked(plain_floor, picked_ids)
+            if remaining > 0 and plain_avail.numel() > 0:
+                chosen_plain = plain_avail[:remaining]
                 if chosen_plain.numel() > 0:
-                    picked.append(chosen_plain)
+                    picked_parts.append(chosen_plain)
+                    picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen_plain], dim=0))
                     remaining -= int(chosen_plain.numel())
 
         for part in [part_ref, part_anchor, part_key]:
             if remaining <= 0:
                 break
-            chosen = _take_recent_quota(part, remaining)
+            part_avail = _exclude_picked(part, picked_ids)
+            chosen = _take_recent_quota(part_avail, remaining)
             if chosen.numel() > 0:
-                picked.append(chosen)
+                picked_parts.append(chosen)
+                picked_ids = self._unique_preserve_order_long(torch.cat([picked_ids, chosen], dim=0))
                 remaining -= int(chosen.numel())
 
-        if not picked:
+        self.geo_last_policy_inputs["hard_cap_unique_budget"] = bool(True)
+        if not picked_parts:
             return torch.empty((0,), dtype=torch.long)
-        return torch.unique(torch.cat(picked, dim=0), sorted=True)
+        return self._unique_preserve_order_long(torch.cat(picked_parts, dim=0))
 
     def _cap_keep_for_geo_mode(
         self,
@@ -7302,7 +7327,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7338,6 +7363,8 @@ class Aggregator(nn.Module):
                                     int(bool(self.geo_last_policy_inputs.get("fast_path_allow_fill", False))),
                                     int(bool(self.geo_last_policy_inputs.get("selector_diag_updated", True))),
                                     int(bool(self.geo_last_policy_inputs.get("frame0_priority_after_plain", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("hard_cap_unique_budget", False))),
+                                    int(self.geo_last_policy_inputs.get("frame0_quota_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("anchor_ttl_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
                                 )
