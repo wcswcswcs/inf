@@ -1961,14 +1961,24 @@ class Aggregator(nn.Module):
         raw_max = int(current_budgets.max().item())
         raw_min = int(current_budgets.min().item())
 
+        apply_early_floor = False
         if not structure_ready:
-            base_ref_layer_budget = max(raw_max, int(self.geo_early_budget_floor))
-            ref_budget_source = "max" if base_ref_layer_budget == raw_max else "floor"
+            apply_early_floor = bool(
+                (int(frame_idx) <= int(self.geo_early_stabilize_frames))
+                or (not bool((geo_policy or {}).get("use_anchor_labels", False)))
+            )
+            if apply_early_floor:
+                base_ref_layer_budget = max(raw_max, int(self.geo_early_budget_floor))
+                ref_budget_source = "floor" if base_ref_layer_budget > raw_max else "max"
+            else:
+                base_ref_layer_budget = int(raw_max)
+                ref_budget_source = "max"
             allow_cap = False
         else:
             base_ref_layer_budget = raw_min
             ref_budget_source = "min"
             allow_cap = bool(geo_policy is not None and bool(geo_policy.get("use_cap", False)))
+        self.geo_last_policy_inputs["shared_ref_early_floor_applied"] = bool(apply_early_floor)
 
         base_ref_past_budget = max(0, int(base_ref_layer_budget) - int(P))
         return int(base_ref_past_budget), int(base_ref_layer_budget), str(ref_budget_source), bool(allow_cap)
@@ -2064,7 +2074,8 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 64
+        anchor_ttl = 64 if not self._geo_structure_ready() else 48
+        self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
         if "is_anchor" in meta and meta["is_anchor"].numel() == n:
@@ -3927,8 +3938,11 @@ class Aggregator(nn.Module):
             f"exec_use_cap={bool(inp.get('exec_use_cap', False))} "
             f"layer_cap_policy_mode={str(inp.get('layer_cap_policy_mode', inp.get('exec_policy_mode', 'legacy')))} "
             f"early_budget_floor_applied={bool(inp.get('early_budget_floor_applied', False))} "
+            f"shared_ref_early_floor_applied={bool(inp.get('shared_ref_early_floor_applied', False))} "
+            f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"frame0_hard_capped_diverse={int(inp.get('frame0_hard_capped_diverse', 0) or 0)} "
             f"keep_plain_patch_hard_floor={int(inp.get('keep_plain_patch_hard_floor', 0) or 0)} "
+            f"anchor_ttl_effective={int(inp.get('anchor_ttl_effective', 0) or 0)} "
             f"keep_plain_patch_reserved={int(inp.get('keep_plain_patch_reserved', 0) or 0)} "
             f"keep_plain_patch_final={int(inp.get('keep_plain_patch_final', 0) or 0)} "
             f"frame0_hard_kept={int(inp.get('frame0_hard_kept', 0) or 0)} "
@@ -5156,7 +5170,7 @@ class Aggregator(nn.Module):
             else:
                 frame0_quota = min(
                     int(frame0_idx.numel()),
-                    min(512, max(128, int(0.10 * int(max_past_tokens)))),
+                    min(384, max(96, int(0.08 * int(max_past_tokens)))),
                 )
                 frame0_meta = self.geo_frame_meta.get(0)
                 if (
@@ -5473,18 +5487,33 @@ class Aggregator(nn.Module):
             remaining -= int(chosen_special.numel())
 
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
-        if remaining > 0:
-            chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
-            if chosen_frame0.numel() > 0:
-                picked.append(chosen_frame0)
-                remaining -= int(chosen_frame0.numel())
-                self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
+        frame0_priority_after_plain = bool(mode_now in {"current", "recovery"})
+        self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(frame0_priority_after_plain)
 
-        if remaining > 0 and plain_floor.numel() > 0:
-            chosen_plain = plain_floor[:remaining]
-            if chosen_plain.numel() > 0:
-                picked.append(chosen_plain)
-                remaining -= int(chosen_plain.numel())
+        if frame0_priority_after_plain:
+            if remaining > 0 and plain_floor.numel() > 0:
+                chosen_plain = plain_floor[:remaining]
+                if chosen_plain.numel() > 0:
+                    picked.append(chosen_plain)
+                    remaining -= int(chosen_plain.numel())
+            if remaining > 0:
+                chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
+                if chosen_frame0.numel() > 0:
+                    picked.append(chosen_frame0)
+                    remaining -= int(chosen_frame0.numel())
+                    self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
+        else:
+            if remaining > 0:
+                chosen_frame0 = self._cap_frame0_hard_subset(meta, part_frame0, quota=remaining)
+                if chosen_frame0.numel() > 0:
+                    picked.append(chosen_frame0)
+                    remaining -= int(chosen_frame0.numel())
+                    self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(chosen_frame0.numel())
+            if remaining > 0 and plain_floor.numel() > 0:
+                chosen_plain = plain_floor[:remaining]
+                if chosen_plain.numel() > 0:
+                    picked.append(chosen_plain)
+                    remaining -= int(chosen_plain.numel())
 
         for part in [part_ref, part_anchor, part_key]:
             if remaining <= 0:
@@ -7254,7 +7283,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d frame0_priority_after_plain=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7284,6 +7313,9 @@ class Aggregator(nn.Module):
                                     int(self.geo_last_policy_inputs.get("keep_plain_patch_hard_floor", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("frame0_hard_capped_diverse", 0) or 0),
                                     int(bool(self.geo_last_policy_inputs.get("early_budget_floor_applied", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("shared_ref_early_floor_applied", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("frame0_priority_after_plain", False))),
+                                    int(self.geo_last_policy_inputs.get("anchor_ttl_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
                                 )
                             assert int(merged_meta["frame_idx"].numel()) == int(new_kv[0].shape[2]), "geo meta/KV length mismatch"
