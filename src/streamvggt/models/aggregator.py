@@ -5288,6 +5288,7 @@ class Aggregator(nn.Module):
         b = max(0, int(budget))
         self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(0)
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
+        self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(False)
         keep = self._sanitize_keep_idx_preserve_order(
             keep_idx,
             meta_len=meta_len,
@@ -5413,11 +5414,8 @@ class Aggregator(nn.Module):
         """
         Cap already-hard-protected indices using strict backbone priority only.
         Priority order:
-          1. special
-          2. frame0 backbone
-          3. reference
-          4. anchor
-          5. keyframe
+          - current/recovery: special -> plain_floor -> frame0 -> reference -> anchor -> keyframe
+          - legacy/other:    special -> frame0 -> plain_floor -> reference -> anchor -> keyframe
         """
         b = max(0, int(budget))
         if b <= 0:
