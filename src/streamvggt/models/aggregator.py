@@ -4039,6 +4039,7 @@ class Aggregator(nn.Module):
             f"invis_ref_quota_effective={int(inp.get('invis_ref_quota_effective', 0) or 0)} "
             f"recent_plain_floor_diverse={bool(inp.get('recent_plain_floor_diverse', False))} "
             f"implicit_recent_plain_floor_used={bool(inp.get('implicit_recent_plain_floor_used', False))} "
+            f"fastpath_recent_plain_floor_added={int(inp.get('fastpath_recent_plain_floor_added', 0) or 0)} "
             f"keep_plain_patch_reserved_prev_is_fastpath_safe={bool(inp.get('keep_plain_patch_reserved_prev_is_fastpath_safe', False))} "
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"current_recovery_ref_before_frame0={bool(inp.get('current_recovery_ref_before_frame0', False))} "
@@ -4972,11 +4973,74 @@ class Aggregator(nn.Module):
         else:
             quota = int(recent_plain_idx.numel())
 
-        if recent_plain_idx.numel() <= int(quota):
-            return recent_plain_idx.detach().cpu().long()
+        recent_plain_frame = frame_idx.index_select(0, recent_plain_idx)
+        uniq_recent_frames = torch.unique(recent_plain_frame).sort(descending=True).values
+        per_frame_quota = max(
+            16,
+            int(math.ceil(float(quota) / float(max(1, uniq_recent_frames.numel())))),
+        )
 
-        order = torch.argsort(frame_idx.index_select(0, recent_plain_idx), descending=True, stable=True)
-        return recent_plain_idx.index_select(0, order[: int(quota)]).detach().cpu().long()
+        picked_parts: List[torch.Tensor] = []
+        for f in uniq_recent_frames.tolist():
+            idx_f = recent_plain_idx[recent_plain_frame == int(f)]
+            if idx_f.numel() == 0:
+                continue
+            local_f = local_idx.index_select(0, idx_f).long()
+            fm = self.geo_frame_meta.get(int(f))
+            if fm is not None and fm.get("conf") is not None and fm["conf"].numel() > 0:
+                valid = (local_f >= 0) & (local_f < fm["conf"].shape[0])
+                idx_f = idx_f[valid]
+                local_f = local_f[valid]
+                if idx_f.numel() == 0:
+                    continue
+                conf_f = fm["conf"].index_select(0, local_f).to(torch.float32)
+                kf = min(int(per_frame_quota), int(idx_f.numel()))
+                picked_parts.append(
+                    self._select_patch_diverse(
+                        idx_f,
+                        local_f,
+                        conf_f,
+                        quota=int(kf),
+                        full_patch_count=int(fm["conf"].shape[0]),
+                        grid_n=max(2, int(self.geo_local_coverage_grid)),
+                    )
+                )
+            else:
+                kf = min(int(per_frame_quota), int(idx_f.numel()))
+                picked_parts.append(idx_f[:kf])
+
+        if not picked_parts:
+            return torch.empty((0,), dtype=torch.long)
+
+        reserve = self._unique_preserve_order_long(torch.cat(picked_parts, dim=0)).detach().cpu().long()
+        if reserve.numel() > int(quota):
+            reserve = reserve[: int(quota)]
+        return reserve
+
+    def _augment_fastpath_with_recent_plain_floor(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        selected_set: set[int],
+        selected_order: List[int],
+        current_frame_idx: int,
+        recent_frames_eff: int,
+        max_past_tokens: Optional[int],
+        policy: Optional[Dict[str, Any]],
+    ) -> torch.Tensor:
+        reserve = self._implicit_recent_plain_floor_idx(
+            meta,
+            current_frame_idx=int(current_frame_idx),
+            recent_frames_eff=int(recent_frames_eff),
+            max_past_tokens=max_past_tokens,
+            policy=policy,
+        )
+        if reserve.numel() > 0:
+            self._ordered_add(selected_set, selected_order, reserve)
+        self.geo_last_policy_inputs["implicit_recent_plain_floor_used"] = bool(reserve.numel() > 0)
+        self.geo_last_policy_inputs["fastpath_recent_plain_floor_added"] = int(reserve.numel())
+        self.geo_last_policy_inputs["keep_plain_patch_reserved_prev_is_fastpath_safe"] = bool(True)
+        return reserve
 
     def _finalize_geo_keep(
         self,
@@ -5835,6 +5899,8 @@ class Aggregator(nn.Module):
         meta["geo_role"] = self._compute_primary_geo_role(meta)
         current_frame_idx = int(frame_idx.max().item()) if frame_idx.numel() > 0 else 0
         structure_ready = self._geo_structure_ready()
+        recent_frames_eff = int(policy["recent_window"]) if policy is not None else int(recent_frames)
+        hard_recent_frames_eff = int(policy["hard_recent_frames"]) if policy is not None else int(self.geo_hard_recent_frames)
         if max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(self.geo_prune_start_ratio)):
             keep_all = torch.arange(total_tokens, dtype=torch.long)
             logger.info(
@@ -5848,10 +5914,21 @@ class Aggregator(nn.Module):
                 current_frame_idx=current_frame_idx,
                 selected_total=int(keep_all.numel()),
             )
+            selected_fast = set(int(v) for v in keep_all.tolist())
+            selected_fast_order = [int(v) for v in keep_all.tolist()]
+            fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+                meta=meta,
+                selected_set=selected_fast,
+                selected_order=selected_fast_order,
+                current_frame_idx=current_frame_idx,
+                recent_frames_eff=recent_frames_eff,
+                max_past_tokens=max_past_tokens,
+                policy=policy,
+            )
             return self._finalize_geo_keep(
                 meta=meta,
-                selected=set(int(v) for v in keep_all.tolist()),
-                selected_order=[int(v) for v in keep_all.tolist()],
+                selected=selected_fast,
+                selected_order=selected_fast_order,
                 current_frame_idx=current_frame_idx,
                 recent_frames_eff=recent_frames,
                 max_past_tokens=max_past_tokens,
@@ -5869,13 +5946,7 @@ class Aggregator(nn.Module):
                 policy=policy,
                 allow_fill=False,
                 update_selector_diag=False,
-                plain_reserved_idx=self._implicit_recent_plain_floor_idx(
-                    meta,
-                    current_frame_idx=current_frame_idx,
-                    recent_frames_eff=recent_frames_eff,
-                    max_past_tokens=max_past_tokens,
-                    policy=policy,
-                ),
+                plain_reserved_idx=fast_plain_reserved,
             )
 
         hard_keep = self._build_hard_backbone_keep(
@@ -5948,8 +6019,6 @@ class Aggregator(nn.Module):
             )
             self._ordered_add(selected, selected_order, keyframe_keep)
 
-        recent_frames_eff = int(policy["recent_window"]) if policy is not None else int(recent_frames)
-        hard_recent_frames_eff = int(policy["hard_recent_frames"]) if policy is not None else int(self.geo_hard_recent_frames)
         recent_min = max(0, current_frame_idx - recent_frames_eff)
         recent_mask = frame_idx >= recent_min
         hard_recent_idx = self._hard_recent_patch_idx(meta, hard_recent_frames_eff)
@@ -5973,6 +6042,15 @@ class Aggregator(nn.Module):
                     recent_frames_eff=recent_frames_eff,
                     policy=policy,
                 ),
+            )
+            fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+                meta=meta,
+                selected_set=selected_fast,
+                selected_order=selected_fast_order,
+                current_frame_idx=current_frame_idx,
+                recent_frames_eff=recent_frames_eff,
+                max_past_tokens=max_past_tokens,
+                policy=policy,
             )
             proxy = self._geo_proxy_selector_diag(
                 current_frame_idx=current_frame_idx,
@@ -6000,13 +6078,7 @@ class Aggregator(nn.Module):
                 policy=policy,
                 allow_fill=False,
                 update_selector_diag=False,
-                plain_reserved_idx=self._implicit_recent_plain_floor_idx(
-                    meta,
-                    current_frame_idx=current_frame_idx,
-                    recent_frames_eff=recent_frames_eff,
-                    max_past_tokens=max_past_tokens,
-                    policy=policy,
-                ),
+                plain_reserved_idx=fast_plain_reserved,
             )
 
         # Build a budgeted local-tracking pool for recent patches (not all recent patches).
@@ -6101,6 +6173,15 @@ class Aggregator(nn.Module):
                     policy=policy,
                 ),
             )
+            fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+                meta=meta,
+                selected_set=selected_fast,
+                selected_order=selected_fast_order,
+                current_frame_idx=current_frame_idx,
+                recent_frames_eff=recent_frames_eff,
+                max_past_tokens=max_past_tokens,
+                policy=policy,
+            )
             proxy = self._geo_proxy_selector_diag(
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
@@ -6127,13 +6208,7 @@ class Aggregator(nn.Module):
                 policy=policy,
                 allow_fill=False,
                 update_selector_diag=False,
-                plain_reserved_idx=self._implicit_recent_plain_floor_idx(
-                    meta,
-                    current_frame_idx=current_frame_idx,
-                    recent_frames_eff=recent_frames_eff,
-                    max_past_tokens=max_past_tokens,
-                    policy=policy,
-                ),
+                plain_reserved_idx=fast_plain_reserved,
             )
 
         world_to_cam = current_view["world_to_cam"]
@@ -6170,6 +6245,15 @@ class Aggregator(nn.Module):
                     policy=policy,
                 ),
             )
+            fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+                meta=meta,
+                selected_set=selected_fast,
+                selected_order=selected_fast_order,
+                current_frame_idx=current_frame_idx,
+                recent_frames_eff=recent_frames_eff,
+                max_past_tokens=max_past_tokens,
+                policy=policy,
+            )
             proxy = self._geo_proxy_selector_diag(
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
@@ -6196,13 +6280,7 @@ class Aggregator(nn.Module):
                 policy=policy,
                 allow_fill=False,
                 update_selector_diag=False,
-                plain_reserved_idx=self._implicit_recent_plain_floor_idx(
-                    meta,
-                    current_frame_idx=current_frame_idx,
-                    recent_frames_eff=recent_frames_eff,
-                    max_past_tokens=max_past_tokens,
-                    policy=policy,
-                ),
+                plain_reserved_idx=fast_plain_reserved,
             )
 
         # Acceleration guard 1: restrict scoring to recent old frames only.
@@ -6333,6 +6411,15 @@ class Aggregator(nn.Module):
                     policy=policy,
                 ),
             )
+            fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+                meta=meta,
+                selected_set=selected_fast,
+                selected_order=selected_fast_order,
+                current_frame_idx=current_frame_idx,
+                recent_frames_eff=recent_frames_eff,
+                max_past_tokens=max_past_tokens,
+                policy=policy,
+            )
             proxy = self._geo_proxy_selector_diag(
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
@@ -6359,13 +6446,7 @@ class Aggregator(nn.Module):
                 policy=policy,
                 allow_fill=False,
                 update_selector_diag=False,
-                plain_reserved_idx=self._implicit_recent_plain_floor_idx(
-                    meta,
-                    current_frame_idx=current_frame_idx,
-                    recent_frames_eff=recent_frames_eff,
-                    max_past_tokens=max_past_tokens,
-                    policy=policy,
-                ),
+                plain_reserved_idx=fast_plain_reserved,
             )
 
         idx_all = torch.cat(gather_idx, dim=0)
@@ -7643,7 +7724,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7691,6 +7772,7 @@ class Aggregator(nn.Module):
                                     int(self.geo_last_policy_inputs.get("invis_ref_quota_effective", 0) or 0),
                                     int(bool(self.geo_last_policy_inputs.get("recent_plain_floor_diverse", False))),
                                     int(bool(self.geo_last_policy_inputs.get("implicit_recent_plain_floor_used", False))),
+                                    int(self.geo_last_policy_inputs.get("fastpath_recent_plain_floor_added", 0) or 0),
                                     int(bool(self.geo_last_policy_inputs.get("keep_plain_patch_reserved_prev_is_fastpath_safe", False))),
                                     int(bool(self.geo_last_policy_inputs.get("hard_cap_unique_budget", False))),
                                     int(self.geo_last_policy_inputs.get("frame0_quota_effective", 0) or 0),
