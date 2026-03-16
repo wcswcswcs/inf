@@ -2159,7 +2159,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 24 if not self._geo_structure_ready() else 12
+        anchor_ttl = 16 if not self._geo_structure_ready() else 8
         self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
@@ -4040,6 +4040,7 @@ class Aggregator(nn.Module):
             f"recent_plain_floor_diverse={bool(inp.get('recent_plain_floor_diverse', False))} "
             f"implicit_recent_plain_floor_used={bool(inp.get('implicit_recent_plain_floor_used', False))} "
             f"fastpath_recent_plain_floor_added={int(inp.get('fastpath_recent_plain_floor_added', 0) or 0)} "
+            f"fastpath_recent_frames_eff={int(inp.get('fastpath_recent_frames_eff', 0) or 0)} "
             f"keep_plain_patch_reserved_prev_is_fastpath_safe={bool(inp.get('keep_plain_patch_reserved_prev_is_fastpath_safe', False))} "
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"current_recovery_ref_before_frame0={bool(inp.get('current_recovery_ref_before_frame0', False))} "
@@ -5039,6 +5040,7 @@ class Aggregator(nn.Module):
             self._ordered_add(selected_set, selected_order, reserve)
         self.geo_last_policy_inputs["implicit_recent_plain_floor_used"] = bool(reserve.numel() > 0)
         self.geo_last_policy_inputs["fastpath_recent_plain_floor_added"] = int(reserve.numel())
+        self.geo_last_policy_inputs["fastpath_recent_frames_eff"] = int(recent_frames_eff)
         self.geo_last_policy_inputs["keep_plain_patch_reserved_prev_is_fastpath_safe"] = bool(True)
         return reserve
 
@@ -5930,7 +5932,7 @@ class Aggregator(nn.Module):
                 selected=selected_fast,
                 selected_order=selected_fast_order,
                 current_frame_idx=current_frame_idx,
-                recent_frames_eff=recent_frames,
+                recent_frames_eff=recent_frames_eff,
                 max_past_tokens=max_past_tokens,
                 candidate_count=0,
                 visible_total=int(proxy["visible_total"]),
@@ -6936,8 +6938,15 @@ class Aggregator(nn.Module):
                 mode_now_soft_ref = str((policy or {}).get("mode", "legacy"))
                 if mode_now_soft_ref in {"current", "recovery"}:
                     obs_stress = float((policy or {}).get("observation_stress", 0.0))
-                    min_visible_ref = 24 if obs_stress < 0.55 else 16
-                    min_invis_ref = 8 if obs_stress < 0.55 else 4
+                    if obs_stress < 0.40:
+                        min_visible_ref = 24
+                        min_invis_ref = 8
+                    elif obs_stress < 0.70:
+                        min_visible_ref = 16
+                        min_invis_ref = 4
+                    else:
+                        min_visible_ref = 8
+                        min_invis_ref = 2
                     visible_ref_quota = max(
                         int(min_visible_ref),
                         int(round(float(self.geo_reference_token_quota) * float(ref_scale))),
@@ -7724,7 +7733,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d fastpath_recent_frames_eff=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7773,6 +7782,7 @@ class Aggregator(nn.Module):
                                     int(bool(self.geo_last_policy_inputs.get("recent_plain_floor_diverse", False))),
                                     int(bool(self.geo_last_policy_inputs.get("implicit_recent_plain_floor_used", False))),
                                     int(self.geo_last_policy_inputs.get("fastpath_recent_plain_floor_added", 0) or 0),
+                                    int(self.geo_last_policy_inputs.get("fastpath_recent_frames_eff", 0) or 0),
                                     int(bool(self.geo_last_policy_inputs.get("keep_plain_patch_reserved_prev_is_fastpath_safe", False))),
                                     int(bool(self.geo_last_policy_inputs.get("hard_cap_unique_budget", False))),
                                     int(self.geo_last_policy_inputs.get("frame0_quota_effective", 0) or 0),
