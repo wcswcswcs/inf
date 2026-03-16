@@ -1615,11 +1615,22 @@ class Aggregator(nn.Module):
             if recovery_exit_streak >= 8:
                 selector_mode = "current"
 
+        prev_budget = max(
+            1,
+            int(self.geo_last_policy_inputs.get("final_ref_budget", 1) or 1),
+        )
         plain_patch_final_prev = int(self.geo_last_policy_inputs.get("keep_plain_patch_final", 0) or 0)
+        keep_plain_patch_reserved_prev = int(self.geo_last_policy_inputs.get("keep_plain_patch_reserved", 0) or 0)
+        plain_ratio_prev = float(plain_patch_final_prev) / float(prev_budget)
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
+
+        plain_stress = min(1.0, max(0.0, (0.45 - plain_ratio_prev) / 0.20))
+        visible_stress = min(1.0, max(0.0, (0.75 - stable_visible_ratio_prev) / 0.25))
+        observation_stress = max(plain_stress, visible_stress)
+
         observation_collapse = bool(
-            plain_patch_final_prev < 256
-            or stable_visible_ratio_prev < 0.55
+            plain_ratio_prev < 0.30
+            or stable_visible_ratio_prev < 0.60
         )
         if selector_mode == "current" and observation_collapse:
             selector_mode = "recovery"
@@ -1648,6 +1659,9 @@ class Aggregator(nn.Module):
             or str(self.geo_reloc_state) != "off"
         )
 
+        base_use_cap = bool(reference_label_ready)
+        base_cap_alpha = 0.0 if (not reference_label_ready) else min(1.0, max(0.0, (maturity - 0.65) / 0.35))
+
         policy = {
             "mode": selector_mode,
             "use_anchor_labels": bool(anchor_ready),
@@ -1663,8 +1677,8 @@ class Aggregator(nn.Module):
             "ongoing_recovery": bool(ongoing_recovery),
             "allow_reloc_trigger": bool(allow_reloc_trigger),
             "use_reloc": bool(ongoing_reloc or (allow_reloc_trigger and reloc_signal)),
-            "use_cap": bool(reference_label_ready),
-            "cap_alpha": 0.0 if not reference_label_ready else min(1.0, max(0.0, (maturity - 0.65) / 0.35)),
+            "use_cap": bool(base_use_cap),
+            "cap_alpha": float(base_cap_alpha),
             "hard_recent_frames": int(max(6, min(24, round(8 + 10 * instability)))),
             "recent_window": int(max(12, min(32, round(12 + 12 * instability)))),
             "soft_recent_window": int(max(16, min(40, round(16 + 12 * instability)))),
@@ -1681,14 +1695,29 @@ class Aggregator(nn.Module):
             "bootstrap_bank_ready": bool(bootstrap_bank_ready),
             "structure_ready": bool(structure_ready),
             "observation_collapse": bool(observation_collapse),
+            "observation_stress": float(observation_stress),
             "plain_patch_final_prev": int(plain_patch_final_prev),
+            "keep_plain_patch_reserved_prev": int(keep_plain_patch_reserved_prev),
+            "plain_ratio_prev": float(plain_ratio_prev),
             "stable_visible_ratio_prev": float(stable_visible_ratio_prev),
+            "prev_budget": int(prev_budget),
         }
-        if observation_collapse:
+        if selector_mode in {"current", "recovery"}:
+            policy["cap_alpha"] = float(policy["cap_alpha"]) * (1.0 - 0.85 * float(observation_stress))
+            policy["local_budget_ratio"] = max(
+                float(policy["local_budget_ratio"]),
+                0.60 + 0.20 * float(observation_stress),
+            )
+            policy["stable_read_budget_ratio"] = max(
+                float(policy["stable_read_budget_ratio"]),
+                0.22 + 0.18 * float(observation_stress),
+            )
+
+        if observation_stress >= 0.85:
             policy["use_cap"] = False
             policy["cap_alpha"] = 0.0
-            policy["local_budget_ratio"] = max(float(policy["local_budget_ratio"]), 0.70)
-            policy["stable_read_budget_ratio"] = max(float(policy["stable_read_budget_ratio"]), 0.30)
+        elif observation_stress >= 0.55:
+            policy["cap_alpha"] = min(float(policy["cap_alpha"]), 0.35)
 
         fsm = {
             "selector_mode_next": selector_mode,
@@ -1752,8 +1781,12 @@ class Aggregator(nn.Module):
             "selector_diag_frame": int(selector_diag.get("frame_idx", -1)) if selector_diag else -1,
             "used_current_view": bool(current_view is not None),
             "observation_collapse": bool(policy.get("observation_collapse", False)),
+            "observation_stress": float(policy.get("observation_stress", 0.0)),
             "plain_patch_final_prev": int(policy.get("plain_patch_final_prev", 0) or 0),
+            "keep_plain_patch_reserved_prev": int(policy.get("keep_plain_patch_reserved_prev", 0) or 0),
+            "plain_ratio_prev": float(policy.get("plain_ratio_prev", 0.0)),
             "stable_visible_ratio_prev": float(policy.get("stable_visible_ratio_prev", 1.0)),
+            "prev_budget": int(policy.get("prev_budget", 0) or 0),
         }
         self.geo_last_policy_metrics = copy.deepcopy(metrics)
         self.geo_last_commit_guard_frame = int(frame_idx)
@@ -2000,6 +2033,16 @@ class Aggregator(nn.Module):
             ref_budget_source = "min"
             allow_cap = bool(geo_policy is not None and bool(geo_policy.get("use_cap", False)))
         self.geo_last_policy_inputs["shared_ref_early_floor_applied"] = bool(apply_early_floor)
+
+        prev_ref_budget = int(self.geo_last_policy_inputs.get("final_ref_budget", raw_max) or raw_max)
+        target_ref_budget = int(base_ref_layer_budget)
+        max_down = max(512, int(0.12 * max(1, prev_ref_budget)))
+        max_up = max(1024, int(0.20 * max(1, prev_ref_budget)))
+        if target_ref_budget < prev_ref_budget:
+            target_ref_budget = max(int(target_ref_budget), int(prev_ref_budget - max_down))
+        else:
+            target_ref_budget = min(int(target_ref_budget), int(prev_ref_budget + max_up))
+        base_ref_layer_budget = int(max(raw_min, min(raw_max, target_ref_budget)))
 
         base_ref_past_budget = max(0, int(base_ref_layer_budget) - int(P))
         return int(base_ref_past_budget), int(base_ref_layer_budget), str(ref_budget_source), bool(allow_cap)
@@ -3964,6 +4007,7 @@ class Aggregator(nn.Module):
             f"allow_fill_effective={bool(inp.get('allow_fill_effective', True))} "
             f"fast_path_allow_fill={bool(inp.get('fast_path_allow_fill', False))} "
             f"selector_diag_updated={bool(inp.get('selector_diag_updated', True))} "
+            f"observation_stress={float(inp.get('observation_stress', 0.0) or 0.0):.4f} "
             f"frame0_priority_after_plain={bool(inp.get('frame0_priority_after_plain', False))} "
             f"current_recovery_ref_before_frame0={bool(inp.get('current_recovery_ref_before_frame0', False))} "
             f"extra_frame0_soft_promotion_enabled={bool(inp.get('extra_frame0_soft_promotion_enabled', False))} "
@@ -6468,7 +6512,7 @@ class Aggregator(nn.Module):
         grouped_idx = self._group_topk_by_hash(hash_valid, score_valid, idx_valid, topk_per_voxel=max(1, int(topk_per_voxel)))
 
         recent_plain_floor_kept = torch.empty((0,), dtype=torch.long)
-        recent_plain_floor_added = 0
+        recent_plain_floor_count = int(recent_plain_floor_kept.numel())
         if mode_now in {"current", "recovery"} and max_past_tokens is not None:
             recent_plain_idx = torch.nonzero(
                 recent_mask
@@ -6478,7 +6522,7 @@ class Aggregator(nn.Module):
                 as_tuple=False,
             ).flatten()
             if recent_plain_idx.numel() > 0:
-                recent_plain_quota = max(128, int(0.04 * int(max_past_tokens)))
+                recent_plain_quota = max(192, int(0.06 * int(max_past_tokens)))
                 recent_plain_quota = min(int(recent_plain_quota), int(recent_plain_idx.numel()))
                 recent_plain_frame = frame_idx.index_select(0, recent_plain_idx)
                 recent_plain_local = local_idx.index_select(0, recent_plain_idx).long()
@@ -6493,13 +6537,13 @@ class Aggregator(nn.Module):
                         recent_plain_score[j] = float(f)
                 top_recent_plain = torch.topk(recent_plain_score, k=int(recent_plain_quota), largest=True).indices
                 recent_plain_floor_kept = recent_plain_idx.index_select(0, top_recent_plain).detach().cpu().long()
+                recent_plain_floor_count = int(recent_plain_floor_kept.numel())
                 for t in recent_plain_floor_kept.tolist():
                     token = int(t)
                     if token in selected_global:
                         continue
                     self._ordered_add(selected, selected_order, [token])
                     selected_global.add(token)
-                    recent_plain_floor_added += 1
 
         role_all_idx = geo_role.index_select(0, idx_all)
         plain_visible_mask = (
@@ -6516,7 +6560,7 @@ class Aggregator(nn.Module):
             plain_visible_idx,
             topk_per_voxel=max(1, int(topk_per_voxel)),
         )
-        plain_patch_reserved_count = int(recent_plain_floor_added)
+        plain_patch_reserved_count = int(recent_plain_floor_count)
         plain_visible_keep_final = torch.empty((0,), dtype=torch.long)
         if plain_visible_grouped.numel() > 0:
             if max_past_tokens is not None:
@@ -6538,7 +6582,6 @@ class Aggregator(nn.Module):
                     continue
                 self._ordered_add(selected, selected_order, [token])
                 selected_global.add(token)
-                plain_patch_reserved_count += 1
         self.geo_last_policy_inputs["keep_plain_patch_reserved"] = int(plain_patch_reserved_count)
         self.geo_last_policy_inputs["keep_plain_patch_final"] = int(plain_visible_keep_final.numel())
 
@@ -6687,6 +6730,7 @@ class Aggregator(nn.Module):
             torch.cat(
                 [
                     hard_keep.detach().cpu().long() if hard_keep is not None else torch.empty((0,), dtype=torch.long),
+                    recent_plain_floor_kept,
                     plain_visible_keep_final,
                     torch.tensor(selected_order, dtype=torch.long),
                 ],
