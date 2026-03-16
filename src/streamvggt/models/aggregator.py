@@ -1615,6 +1615,15 @@ class Aggregator(nn.Module):
             if recovery_exit_streak >= 8:
                 selector_mode = "current"
 
+        plain_patch_final_prev = int(self.geo_last_policy_inputs.get("keep_plain_patch_final", 0) or 0)
+        stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
+        observation_collapse = bool(
+            plain_patch_final_prev < 256
+            or stable_visible_ratio_prev < 0.55
+        )
+        if selector_mode == "current" and observation_collapse:
+            selector_mode = "recovery"
+
         reference_support_ready = bool(
             len(self.geo_reference_bank) >= max(
                 8,
@@ -1671,7 +1680,16 @@ class Aggregator(nn.Module):
             "reloc_phase_open": bool(reloc_phase_open),
             "bootstrap_bank_ready": bool(bootstrap_bank_ready),
             "structure_ready": bool(structure_ready),
+            "observation_collapse": bool(observation_collapse),
+            "plain_patch_final_prev": int(plain_patch_final_prev),
+            "stable_visible_ratio_prev": float(stable_visible_ratio_prev),
         }
+        if observation_collapse:
+            policy["use_cap"] = False
+            policy["cap_alpha"] = 0.0
+            policy["local_budget_ratio"] = max(float(policy["local_budget_ratio"]), 0.70)
+            policy["stable_read_budget_ratio"] = max(float(policy["stable_read_budget_ratio"]), 0.30)
+
         fsm = {
             "selector_mode_next": selector_mode,
             "handover_ready_streak_next": handover_ready_streak,
@@ -1733,6 +1751,9 @@ class Aggregator(nn.Module):
             "observation_frame": int(observation.get("frame_idx", -1)) if observation else -1,
             "selector_diag_frame": int(selector_diag.get("frame_idx", -1)) if selector_diag else -1,
             "used_current_view": bool(current_view is not None),
+            "observation_collapse": bool(policy.get("observation_collapse", False)),
+            "plain_patch_final_prev": int(policy.get("plain_patch_final_prev", 0) or 0),
+            "stable_visible_ratio_prev": float(policy.get("stable_visible_ratio_prev", 1.0)),
         }
         self.geo_last_policy_metrics = copy.deepcopy(metrics)
         self.geo_last_commit_guard_frame = int(frame_idx)
@@ -5705,9 +5726,13 @@ class Aggregator(nn.Module):
         is_landmark = geo_role == 2
         is_reference = geo_role == 4
 
-        # Always keep special tokens.
-        special_idx = torch.nonzero(is_special, as_tuple=False).flatten().tolist()
-        self._ordered_add(selected, selected_order, special_idx)
+        mode_now = str((policy or {}).get("mode", "legacy"))
+
+        # In current/recovery, do NOT re-add all special tokens here.
+        # bounded special has already been handled in _build_hard_backbone_keep().
+        if mode_now == "legacy":
+            special_idx = torch.nonzero(is_special, as_tuple=False).flatten().tolist()
+            self._ordered_add(selected, selected_order, special_idx)
 
         # NOTE: do not unconditionally keep all anchor/reference/landmark tokens.
         # They are selected later with visibility/score-aware bounded quotas.
@@ -5717,7 +5742,6 @@ class Aggregator(nn.Module):
         frame0_special_idx = torch.nonzero(frame0_mask & is_special, as_tuple=False).flatten().tolist()
         self._ordered_add(selected, selected_order, frame0_special_idx)
 
-        mode_now = str((policy or {}).get("mode", "legacy"))
         extra_frame0_soft_promotion_enabled = bool(mode_now == "legacy")
         self.geo_last_policy_inputs["extra_frame0_soft_promotion_enabled"] = bool(extra_frame0_soft_promotion_enabled)
 
@@ -6443,6 +6467,40 @@ class Aggregator(nn.Module):
             hash_valid = hash_all[valid_global]
         grouped_idx = self._group_topk_by_hash(hash_valid, score_valid, idx_valid, topk_per_voxel=max(1, int(topk_per_voxel)))
 
+        recent_plain_floor_kept = torch.empty((0,), dtype=torch.long)
+        recent_plain_floor_added = 0
+        if mode_now in {"current", "recovery"} and max_past_tokens is not None:
+            recent_plain_idx = torch.nonzero(
+                recent_mask
+                & (~is_special)
+                & (geo_role == 0)
+                & (local_idx >= 0),
+                as_tuple=False,
+            ).flatten()
+            if recent_plain_idx.numel() > 0:
+                recent_plain_quota = max(128, int(0.04 * int(max_past_tokens)))
+                recent_plain_quota = min(int(recent_plain_quota), int(recent_plain_idx.numel()))
+                recent_plain_frame = frame_idx.index_select(0, recent_plain_idx)
+                recent_plain_local = local_idx.index_select(0, recent_plain_idx).long()
+                recent_plain_score = torch.empty((recent_plain_idx.numel(),), dtype=torch.float32)
+                for j in range(int(recent_plain_idx.numel())):
+                    f = int(recent_plain_frame[j].item())
+                    lp = int(recent_plain_local[j].item())
+                    fm = self.geo_frame_meta.get(f)
+                    if fm is not None and fm.get("conf") is not None and 0 <= lp < int(fm["conf"].shape[0]):
+                        recent_plain_score[j] = float(fm["conf"][lp].item())
+                    else:
+                        recent_plain_score[j] = float(f)
+                top_recent_plain = torch.topk(recent_plain_score, k=int(recent_plain_quota), largest=True).indices
+                recent_plain_floor_kept = recent_plain_idx.index_select(0, top_recent_plain).detach().cpu().long()
+                for t in recent_plain_floor_kept.tolist():
+                    token = int(t)
+                    if token in selected_global:
+                        continue
+                    self._ordered_add(selected, selected_order, [token])
+                    selected_global.add(token)
+                    recent_plain_floor_added += 1
+
         role_all_idx = geo_role.index_select(0, idx_all)
         plain_visible_mask = (
             ~is_special.index_select(0, idx_all)
@@ -6458,7 +6516,7 @@ class Aggregator(nn.Module):
             plain_visible_idx,
             topk_per_voxel=max(1, int(topk_per_voxel)),
         )
-        plain_patch_reserved_count = 0
+        plain_patch_reserved_count = int(recent_plain_floor_added)
         plain_visible_keep_final = torch.empty((0,), dtype=torch.long)
         if plain_visible_grouped.numel() > 0:
             if max_past_tokens is not None:
