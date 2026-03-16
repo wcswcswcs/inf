@@ -1626,13 +1626,14 @@ class Aggregator(nn.Module):
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
 
         plain_stress = min(1.0, max(0.0, (0.45 - plain_ratio_prev) / 0.20))
-        reserved_stress = min(1.0, max(0.0, (0.08 - reserved_ratio_prev) / 0.08))
+        reserved_target = 0.06
+        reserved_stress = min(1.0, max(0.0, (reserved_target - reserved_ratio_prev) / reserved_target))
         visible_stress = min(1.0, max(0.0, (0.75 - stable_visible_ratio_prev) / 0.25))
         observation_stress = max(plain_stress, reserved_stress, visible_stress)
 
         observation_collapse = bool(
             plain_ratio_prev < 0.30
-            or reserved_ratio_prev < 0.03
+            or reserved_ratio_prev < 0.02
             or stable_visible_ratio_prev < 0.60
         )
         if selector_mode == "current" and observation_collapse:
@@ -1703,6 +1704,7 @@ class Aggregator(nn.Module):
             "keep_plain_patch_reserved_prev": int(keep_plain_patch_reserved_prev),
             "plain_ratio_prev": float(plain_ratio_prev),
             "reserved_ratio_prev": float(reserved_ratio_prev),
+            "reserved_target_effective": float(reserved_target),
             "stable_visible_ratio_prev": float(stable_visible_ratio_prev),
             "prev_budget": int(prev_budget),
         }
@@ -1721,7 +1723,7 @@ class Aggregator(nn.Module):
                 float(policy["anchor_quota_ratio"]) * (1.0 - 0.50 * float(observation_stress)),
             )
             policy["frame0_hard_scale"] = float(max(0.50, 1.0 - 0.50 * float(observation_stress)))
-            policy["reference_hard_scale"] = float(max(0.55, 1.0 - 0.45 * float(observation_stress)))
+            policy["reference_hard_scale"] = float(max(0.40, 1.0 - 0.60 * float(observation_stress)))
         else:
             policy["frame0_hard_scale"] = 1.0
             policy["reference_hard_scale"] = 1.0
@@ -1799,6 +1801,7 @@ class Aggregator(nn.Module):
             "keep_plain_patch_reserved_prev": int(policy.get("keep_plain_patch_reserved_prev", 0) or 0),
             "plain_ratio_prev": float(policy.get("plain_ratio_prev", 0.0)),
             "reserved_ratio_prev": float(policy.get("reserved_ratio_prev", 0.0)),
+            "reserved_target_effective": float(policy.get("reserved_target_effective", 0.06)),
             "stable_visible_ratio_prev": float(policy.get("stable_visible_ratio_prev", 1.0)),
             "prev_budget": int(policy.get("prev_budget", 0) or 0),
             "frame0_hard_scale": float(policy.get("frame0_hard_scale", 1.0)),
@@ -2159,7 +2162,7 @@ class Aggregator(nn.Module):
             return
         frame_idx = meta["frame_idx"]
         age = int(current_frame_idx) - frame_idx
-        anchor_ttl = 16 if not self._geo_structure_ready() else 8
+        anchor_ttl = 12 if not self._geo_structure_ready() else 6
         self.geo_last_policy_inputs["anchor_ttl_effective"] = int(anchor_ttl)
         landmark_ttl = 256
         reference_ttl = 256
@@ -4030,6 +4033,7 @@ class Aggregator(nn.Module):
             f"selector_diag_updated={bool(inp.get('selector_diag_updated', True))} "
             f"observation_stress={float(inp.get('observation_stress', 0.0) or 0.0):.4f} "
             f"reserved_ratio_prev={float(inp.get('reserved_ratio_prev', 0.0) or 0.0):.4f} "
+            f"reserved_target_effective={float(inp.get('reserved_target_effective', 0.06) or 0.06):.4f} "
             f"keep_plain_patch_reserved_requested={int(inp.get('keep_plain_patch_reserved_requested', 0) or 0)} "
             f"frame0_hard_scale={float(inp.get('frame0_hard_scale', 1.0) or 1.0):.4f} "
             f"reference_hard_scale={float(inp.get('reference_hard_scale', 1.0) or 1.0):.4f} "
@@ -6942,11 +6946,11 @@ class Aggregator(nn.Module):
                         min_visible_ref = 24
                         min_invis_ref = 8
                     elif obs_stress < 0.70:
-                        min_visible_ref = 16
+                        min_visible_ref = 12
                         min_invis_ref = 4
                     else:
-                        min_visible_ref = 8
-                        min_invis_ref = 2
+                        min_visible_ref = 4
+                        min_invis_ref = 1
                     visible_ref_quota = max(
                         int(min_visible_ref),
                         int(round(float(self.geo_reference_token_quota) * float(ref_scale))),
@@ -7733,7 +7737,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d fastpath_recent_frames_eff=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f reserved_target_effective=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d fastpath_recent_frames_eff=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -7773,6 +7777,7 @@ class Aggregator(nn.Module):
                                     int(bool(self.geo_last_policy_inputs.get("extra_frame0_soft_promotion_enabled", False))),
                                     int(self.geo_last_policy_inputs.get("keep_plain_patch_reserved_requested", 0) or 0),
                                     float(self.geo_last_policy_inputs.get("reserved_ratio_prev", 0.0) or 0.0),
+                                    float(self.geo_last_policy_inputs.get("reserved_target_effective", 0.06) or 0.06),
                                     float(self.geo_last_policy_inputs.get("frame0_hard_scale", 1.0) or 1.0),
                                     float(self.geo_last_policy_inputs.get("reference_hard_scale", 1.0) or 1.0),
                                     int(self.geo_last_policy_inputs.get("shared_ref_budget_upper", 0) or 0),
