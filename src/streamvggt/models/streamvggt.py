@@ -142,6 +142,75 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 ))
         return out
 
+    @staticmethod
+    def _kv_list_device(kv_list):
+        if kv_list is None:
+            return None
+        for kv in kv_list:
+            if kv is not None:
+                return kv[0].device
+        return None
+
+    @staticmethod
+    def _has_any_kv(kv_list) -> bool:
+        return bool(
+            kv_list is not None
+            and any(kv is not None for kv in kv_list)
+        )
+
+    def _clear_loaded_geo_token_cache_state(self):
+        self.aggregator.geo_cached_landmark_identity_keep = torch.empty((0,), dtype=torch.long)
+        self.aggregator.geo_pending_console_log = None
+
+        for layer_idx in range(self.aggregator.depth):
+            self.aggregator.geo_token_meta[layer_idx] = {
+                "frame_idx": torch.empty(0, dtype=torch.long),
+                "is_special": torch.empty(0, dtype=torch.bool),
+                "is_keyframe": torch.empty(0, dtype=torch.bool),
+                "local_patch_idx": torch.empty(0, dtype=torch.long),
+                "identity_local": torch.empty(0, dtype=torch.long),
+                "global_id": torch.empty(0, dtype=torch.long),
+                "is_anchor": torch.empty(0, dtype=torch.bool),
+                "is_landmark": torch.empty(0, dtype=torch.bool),
+                "is_reference": torch.empty(0, dtype=torch.bool),
+                "geo_role": torch.empty(0, dtype=torch.long),
+            }
+
+        # clear selector-local continuity signals tied to token-aligned KV cache
+        self.aggregator.geo_last_selector_diag = {
+            "frame_idx": -1,
+            "stable_visible_overlap": 0.0,
+            "stable_visible_ratio": 0.0,
+            "visible_total": 0.0,
+            "selected_total": 0.0,
+        }
+        self.aggregator.geo_selector_overlap_ema = 0.0
+        self.aggregator.geo_selector_visible_ratio_ema = 0.0
+        self.aggregator.geo_handover_ready_streak = 0
+        self.aggregator.geo_handover_unready_streak = 0
+        self.aggregator.geo_recovery_enter_streak = 0
+        self.aggregator.geo_recovery_exit_streak = 0
+
+        # logging/debug state tied to old selector continuity
+        self.aggregator.geo_last_policy_inputs = {}
+        self.aggregator.geo_last_policy_metrics = {}
+        self.aggregator.geo_last_commit_guard_frame = -1
+
+    def _validate_geo_kv_alignment(self, past_key_values):
+        for layer_idx in range(self.aggregator.depth):
+            kv = None if past_key_values is None else past_key_values[layer_idx]
+            kv_len = 0 if kv is None else int(kv[0].shape[2])
+
+            layer_meta = self.aggregator.geo_token_meta[layer_idx]
+            frame_idx_meta = layer_meta.get("frame_idx", torch.empty((0,), dtype=torch.long))
+            meta_len = int(frame_idx_meta.numel())
+
+            if meta_len != kv_len:
+                raise ValueError(
+                    f"Inconsistent geo resume state at layer {layer_idx}: "
+                    f"geo_token_meta has {meta_len} tokens but past_key_values has {kv_len}."
+                )
+
     @torch.inference_mode()
     def inference(
         self, 
@@ -166,11 +235,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         memory_diagnostics: bool = False,
         memory_log_interval: int = 1,
         offload_camera_cache_to_cpu: bool = False,
+        frame_start_idx: Optional[int] = None,
     ):
         if past_key_values is None:
             past_key_values = [None] * self.aggregator.depth
         if past_key_values_camera is None:
             past_key_values_camera = [None] * self.camera_head.trunk_depth
+        has_past_kv = self._has_any_kv(past_key_values)
+        has_past_kv_camera = self._has_any_kv(past_key_values_camera)
+        is_resuming_from_cache = bool(has_past_kv or has_past_kv_camera)
+
         if total_budget is None:
             total_budget = self.total_budget
         if use_geo_kv_prune:
@@ -180,6 +254,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 last_reliable_view = None
             else:
                 self.aggregator.load_geo_cache_state(geo_state)
+                if has_past_kv:
+                    self._validate_geo_kv_alignment(past_key_values)
+                else:
+                    self._clear_loaded_geo_token_cache_state()
         if rolling_state is None:
             prev_world_to_cam_cpu = None
             prev_conf_mean = None
@@ -198,8 +276,65 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         log_interval = max(1, int(memory_log_interval))
 
         total_frames = len(frames)
+        expected_next_from_roll = None
+        if rolling_state is not None and rolling_state.get("next_frame_idx", None) is not None:
+            expected_next_from_roll = int(rolling_state["next_frame_idx"])
+
+        expected_next_from_geo = None
+        if use_geo_kv_prune and geo_state is not None:
+            expected_next_from_geo = int(getattr(self.aggregator, "geo_max_frame_idx", -1)) + 1
+
+        if use_geo_kv_prune and has_past_kv and geo_state is None:
+            raise ValueError(
+                "Resuming geo KV pruning with past_key_values requires geo_state. "
+                "Provide geo_state together with cached aggregator KV."
+            )
+
+        has_explicit_resume_source = bool(
+            (frame_start_idx is not None)
+            or (expected_next_from_roll is not None)
+            or (expected_next_from_geo is not None)
+        )
+        if is_resuming_from_cache and (not has_explicit_resume_source):
+            raise ValueError(
+                "Resuming with cached KV requires an explicit frame index source. "
+                "Provide one of: frame_start_idx, rolling_state['next_frame_idx'], "
+                "or geo_state with a valid next frame."
+            )
+
+        if frame_start_idx is not None:
+            frame_start_idx = int(frame_start_idx)
+            if expected_next_from_roll is not None and expected_next_from_roll != frame_start_idx:
+                raise ValueError(
+                    f"Inconsistent resume state: frame_start_idx={frame_start_idx} "
+                    f"but rolling_state.next_frame_idx={expected_next_from_roll}"
+                )
+            if expected_next_from_geo is not None and expected_next_from_geo != frame_start_idx:
+                raise ValueError(
+                    f"Inconsistent resume state: frame_start_idx={frame_start_idx} "
+                    f"but geo_state implies next_frame_idx={expected_next_from_geo}"
+                )
+            base_frame_idx = frame_start_idx
+        else:
+            if (
+                expected_next_from_roll is not None
+                and expected_next_from_geo is not None
+                and expected_next_from_roll != expected_next_from_geo
+            ):
+                raise ValueError(
+                    f"Inconsistent resume state: rolling_state.next_frame_idx={expected_next_from_roll} "
+                    f"but geo_state implies next_frame_idx={expected_next_from_geo}"
+                )
+            if expected_next_from_roll is not None:
+                base_frame_idx = expected_next_from_roll
+            elif expected_next_from_geo is not None:
+                base_frame_idx = expected_next_from_geo
+            else:
+                base_frame_idx = 0
+
         no_progress_log_interval = 50
         for i, frame in enumerate(frame_iter):
+            frame_idx_abs = int(base_frame_idx + i)
             if not show_progress and (
                 ((i + 1) % no_progress_log_interval == 0)
                 or (i == 0)
@@ -216,7 +351,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             if use_geo_kv_prune:
                 policy = self.aggregator._geo_peek_effective_policy_for_inference(
                     past_key_values=past_key_values,
-                    past_frame_idx=i,
+                    past_frame_idx=frame_idx_abs,
                     total_budget=total_budget,
                     current_view=policy_view,
                     geo_recent_frames=geo_recent_frames,
@@ -237,7 +372,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 images, 
                 past_key_values=past_key_values,
                 use_cache=True, 
-                past_frame_idx=i,
+                past_frame_idx=frame_idx_abs,
                 total_budget=total_budget,
                 use_geo_kv_prune=use_geo_kv_prune,
                 geo_topk_per_voxel=geo_topk_per_voxel,
@@ -264,7 +399,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             need_track = (self.track_head is not None) and (query_points is not None)
 
             camera_cache_for_step = past_key_values_camera
-            if offload_camera_cache_to_cpu and camera_cache_for_step is not None:
+            camera_cache_device = self._kv_list_device(camera_cache_for_step)
+            if (
+                camera_cache_for_step is not None
+                and camera_cache_device is not None
+                and camera_cache_device != model_device
+            ):
                 camera_cache_for_step = self._kv_list_to_device(camera_cache_for_step, model_device)
 
             pose_enc = None
@@ -337,7 +477,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     conf_drop = 0.0 if prev_conf_mean is None else max(0.0, float(prev_conf_mean - conf_mean))
 
                     geo_meta_stats = self.aggregator.update_geo_frame_metadata(
-                        frame_idx=i,
+                        frame_idx=frame_idx_abs,
                         pts3d=pts3d.detach(),
                         conf=pts3d_conf.detach(),
                         world_to_cam=world_to_cam_cpu,
@@ -377,7 +517,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
             res_cpu = None
             if needs_cpu_export:
-                res_cpu = {}
+                res_cpu = {
+                    "frame_idx_abs": int(frame_idx_abs),
+                }
                 if pts3d is not None:
                     res_cpu["pts3d_in_other_view"] = pts3d.detach().cpu()
                     res_cpu["conf"] = pts3d_conf.detach().cpu() if pts3d_conf is not None else None
@@ -448,15 +590,35 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 del new_camera_cache
             del images
 
+        next_frame_idx = int(base_frame_idx + total_frames)
         final_state = {
             "past_key_values": past_key_values,
             "past_key_values_camera": past_key_values_camera,
             "geo_state": self.aggregator.export_geo_cache_state() if use_geo_kv_prune else None,
             "current_view": current_view,
             "last_reliable_view": last_reliable_view,
+            "next_frame_idx": next_frame_idx,
             "rolling_state": {
                 "prev_world_to_cam_cpu": prev_world_to_cam_cpu,
                 "prev_conf_mean": prev_conf_mean,
+                "next_frame_idx": next_frame_idx,
+                "base_frame_idx_used": int(base_frame_idx),
+            },
+            "resume_source_info": {
+                "next_frame_idx": next_frame_idx,
+                "base_frame_idx_used": int(base_frame_idx),
+                "has_geo_state": bool(use_geo_kv_prune),
+                "input_had_geo_state": bool(use_geo_kv_prune and geo_state is not None),
+                "geo_resume_mode": (
+                    "full"
+                    if (use_geo_kv_prune and has_past_kv)
+                    else "map_only"
+                    if use_geo_kv_prune
+                    else "disabled"
+                ),
+                "geo_selector_state_reset": bool(use_geo_kv_prune and geo_state is not None and (not has_past_kv)),
+                "has_rolling_state": bool(rolling_state is not None),
+                "used_frame_start_idx": bool(frame_start_idx is not None),
             },
         }
 
