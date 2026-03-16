@@ -4447,38 +4447,14 @@ class Aggregator(nn.Module):
         full_patch_count: int,
         grid_n: int = 4,
     ) -> torch.Tensor:
-        if frame0_patch_idx.numel() == 0 or int(quota) <= 0:
-            return torch.empty((0,), dtype=torch.long)
-
-        patch_n = max(1, int(full_patch_count))
-        side = max(1, int(round(float(patch_n) ** 0.5)))
-        bin_h = max(1, side // max(1, int(grid_n)))
-        bin_w = max(1, side // max(1, int(grid_n)))
-
-        best_per_cell: Dict[Tuple[int, int], Tuple[float, int]] = {}
-        g = max(1, int(grid_n))
-        for j in range(int(frame0_patch_idx.numel())):
-            lp = int(frame0_local[j].item())
-            y = lp // side
-            x = lp % side
-            cell = (min(g - 1, y // bin_h), min(g - 1, x // bin_w))
-            sc = float(frame0_conf[j].item())
-            gid = int(frame0_patch_idx[j].item())
-            prev = best_per_cell.get(cell)
-            if prev is None or sc > prev[0]:
-                best_per_cell[cell] = (sc, gid)
-
-        chosen: List[int] = [v[1] for v in best_per_cell.values()]
-        if len(chosen) < int(quota):
-            order = torch.argsort(frame0_conf, descending=True)
-            for k in order.tolist():
-                gid = int(frame0_patch_idx[int(k)].item())
-                if gid not in chosen:
-                    chosen.append(gid)
-                if len(chosen) >= int(quota):
-                    break
-
-        return torch.unique(torch.tensor(chosen[: int(quota)], dtype=torch.long), sorted=True)
+        return self._select_patch_diverse(
+            frame0_patch_idx,
+            frame0_local,
+            frame0_conf,
+            quota=int(quota),
+            full_patch_count=int(full_patch_count),
+            grid_n=int(grid_n),
+        )
 
     def _select_geo_active_indices_legacy_early_core(
         self,
