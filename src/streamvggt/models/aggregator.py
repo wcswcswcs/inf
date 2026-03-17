@@ -1640,7 +1640,7 @@ class Aggregator(nn.Module):
         reserved_ratio_prev = float(keep_plain_patch_reserved_prev) / float(prev_budget)
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
         visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
-        stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0)) if isinstance(self.geo_last_selector_diag, dict) else 0
+        stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_overlap", self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0))) if isinstance(self.geo_last_selector_diag, dict) else 0
 
         plain_stress = min(1.0, max(0.0, (0.45 - plain_ratio_prev) / 0.20))
         reserved_target = 0.06
@@ -1743,6 +1743,10 @@ class Aggregator(nn.Module):
             "prev_budget": int(prev_budget),
         }
         if legacy_observation_break:
+            policy["legacy_break_force_recent_plain"] = True
+            policy["legacy_break_anchor_scale"] = 0.25
+            policy["legacy_break_frame0_scale"] = 0.50
+            policy["legacy_break_recent_plain_ratio"] = 0.12
             policy["use_cap"] = False
             policy["cap_alpha"] = 0.0
             policy["local_budget_ratio"] = max(float(policy["local_budget_ratio"]), 0.80)
@@ -1751,6 +1755,11 @@ class Aggregator(nn.Module):
             policy["recent_window"] = max(int(policy["recent_window"]), 24)
             policy["soft_recent_window"] = max(int(policy["soft_recent_window"]), 28)
             policy["anchor_quota_ratio"] = min(float(policy["anchor_quota_ratio"]), 0.03)
+        else:
+            policy["legacy_break_force_recent_plain"] = False
+            policy["legacy_break_anchor_scale"] = 1.0
+            policy["legacy_break_frame0_scale"] = 1.0
+            policy["legacy_break_recent_plain_ratio"] = 0.08
 
         if selector_mode in {"current", "recovery"}:
             policy["cap_alpha"] = float(policy["cap_alpha"]) * (1.0 - 0.85 * float(observation_stress))
@@ -4062,6 +4071,10 @@ class Aggregator(nn.Module):
         policy = self.geo_last_committed_policy or self._geo_default_policy(int(current_frame_idx))
         inp = self.geo_last_policy_inputs if isinstance(self.geo_last_policy_inputs, dict) else {}
         met = self.geo_last_policy_metrics if isinstance(self.geo_last_policy_metrics, dict) else {}
+        bootstrap_voxel_count_live = int(len(self.geo_voxel_bank))
+        bootstrap_stable_anchor_count_live = int(len(self.geo_stable_anchor_voxels))
+        bootstrap_keyframe_count_live = int(len(self.geo_keyframes))
+        bootstrap_ready_recomputed_live = bool(self._geo_bootstrap_bank_ready(int(current_frame_idx)))
         print(
             f"[geo_policy] preview_policy_frame={int(inp.get('preview_policy_frame', -1))} "
             f"commit_policy_frame={int(inp.get('commit_policy_frame', self.geo_last_policy_frame))} "
@@ -4080,10 +4093,10 @@ class Aggregator(nn.Module):
             f"use_anchor_labels={bool(inp.get('use_anchor_labels', policy.get('use_anchor_labels', False)))} "
             f"safe_warmup={bool(inp.get('safe_warmup', False))} "
             f"bootstrap_bank_ready={bool(inp.get('bootstrap_bank_ready', policy.get('bootstrap_bank_ready', False)))} "
-            f"bootstrap_voxel_count={int(inp.get('bootstrap_voxel_count', 0) or 0)} "
-            f"bootstrap_stable_anchor_count={int(inp.get('bootstrap_stable_anchor_count', 0) or 0)} "
-            f"bootstrap_keyframe_count={int(inp.get('bootstrap_keyframe_count', 0) or 0)} "
-            f"bootstrap_ready_recomputed={bool(inp.get('bootstrap_ready_recomputed', False))} "
+            f"bootstrap_voxel_count={int(bootstrap_voxel_count_live)} "
+            f"bootstrap_stable_anchor_count={int(bootstrap_stable_anchor_count_live)} "
+            f"bootstrap_keyframe_count={int(bootstrap_keyframe_count_live)} "
+            f"bootstrap_ready_recomputed={bool(bootstrap_ready_recomputed_live)} "
             f"structure_ready={bool(inp.get('structure_ready', policy.get('structure_ready', False)))} "
             f"exec_policy_mode={str(inp.get('exec_policy_mode', inp.get('effective_mode', 'legacy')))} "
             f"exec_use_cap={bool(inp.get('exec_use_cap', False))} "
@@ -4097,6 +4110,10 @@ class Aggregator(nn.Module):
             f"selector_diag_proxy_backfill={bool(inp.get('selector_diag_proxy_backfill', False))} "
             f"selector_diag_true_visible_total={int(inp.get('selector_diag_true_visible_total', 0) or 0)} "
             f"legacy_observation_break={bool(inp.get('legacy_observation_break', policy.get('legacy_observation_break', False)))} "
+            f"legacy_break_force_recent_plain={bool(inp.get('legacy_break_force_recent_plain', False))} "
+            f"legacy_break_anchor_scale={float(inp.get('legacy_break_anchor_scale', 1.0) or 1.0):.4f} "
+            f"legacy_break_frame0_scale={float(inp.get('legacy_break_frame0_scale', 1.0) or 1.0):.4f} "
+            f"legacy_break_recent_plain_ratio={float(inp.get('legacy_break_recent_plain_ratio', 0.08) or 0.08):.4f} "
             f"observation_stress={float(inp.get('observation_stress', 0.0) or 0.0):.4f} "
             f"reserved_ratio_prev={float(inp.get('reserved_ratio_prev', 0.0) or 0.0):.4f} "
             f"reserved_target_effective={float(inp.get('reserved_target_effective', 0.06) or 0.06):.4f} "
@@ -4614,14 +4631,17 @@ class Aggregator(nn.Module):
 
         frame0_patch = torch.nonzero((frame_idx == 0) & (~is_special) & (local_idx >= 0), as_tuple=False).flatten()
         if frame0_patch.numel() > 0:
-            q0 = min(int(policy["frame0_patch_cap"]) if policy is not None else int(self.geo_frame0_patch_cap), int(frame0_patch.numel()))
+            frame0_patch_cap = int((policy or {}).get("frame0_patch_cap", self.geo_frame0_patch_cap))
+            if bool((policy or {}).get("legacy_observation_break", False)):
+                frame0_patch_cap = max(128, int(round(float(frame0_patch_cap) * float((policy or {}).get("legacy_break_frame0_scale", 0.50)))))
+            q0 = min(int(frame0_patch_cap), int(frame0_patch.numel()))
             frame0_meta = self.geo_frame_meta.get(0)
             if frame0_meta is not None and frame0_meta.get("conf") is not None and frame0_meta["conf"].numel() > 0:
                 frame0_local = local_idx.index_select(0, frame0_patch).long()
                 valid = (frame0_local >= 0) & (frame0_local < frame0_meta["conf"].shape[0])
                 frame0_patch = frame0_patch[valid]
                 frame0_local = frame0_local[valid]
-                q0 = min(int(policy["frame0_patch_cap"]) if policy is not None else int(self.geo_frame0_patch_cap), int(frame0_patch.numel()))
+                q0 = min(int(frame0_patch_cap), int(frame0_patch.numel()))
                 if q0 > 0 and frame0_patch.numel() > 0:
                     conf0 = frame0_meta["conf"].index_select(0, frame0_local).to(torch.float32)
                     frame0_keep = self._select_frame0_patch_diverse(
@@ -4647,6 +4667,8 @@ class Aggregator(nn.Module):
                 anchor_quota = min(256, max(64, int((float(policy["anchor_quota_ratio"]) if policy is not None else 0.05) * int(max_past_tokens))))
             else:
                 anchor_quota = 256
+            if bool((policy or {}).get("legacy_observation_break", False)):
+                anchor_quota = max(64, int(round(float(anchor_quota) * float((policy or {}).get("legacy_break_anchor_scale", 0.25)))))
             anchor_keep = self._take_recent_quota(anchor_idx, frame_idx=frame_idx, quota=int(anchor_quota))
             self._ordered_add(selected, selected_order, anchor_keep)
 
@@ -5079,10 +5101,17 @@ class Aggregator(nn.Module):
         if recent_plain_idx.numel() == 0:
             return torch.empty((0,), dtype=torch.long)
 
-        if max_past_tokens is not None:
-            quota = max(256, int(0.08 * int(max_past_tokens)))
+        if bool((policy or {}).get("legacy_break_force_recent_plain", False)):
+            ratio = float((policy or {}).get("legacy_break_recent_plain_ratio", 0.12))
+            if max_past_tokens is not None:
+                quota = max(512, int(ratio * int(max_past_tokens)))
+            else:
+                quota = int(recent_plain_idx.numel())
         else:
-            quota = int(recent_plain_idx.numel())
+            if max_past_tokens is not None:
+                quota = max(256, int(0.08 * int(max_past_tokens)))
+            else:
+                quota = int(recent_plain_idx.numel())
 
         recent_plain_frame = frame_idx.index_select(0, recent_plain_idx)
         uniq_recent_frames = torch.unique(recent_plain_frame).sort(descending=True).values
@@ -7578,6 +7607,10 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["reloc_phase_open"] = bool((geo_policy or {}).get("reloc_phase_open", False))
             self.geo_last_policy_inputs["use_recovery"] = bool((geo_policy or {}).get("use_recovery", False))
             self.geo_last_policy_inputs["legacy_observation_break"] = bool((geo_policy or {}).get("legacy_observation_break", False))
+            self.geo_last_policy_inputs["legacy_break_force_recent_plain"] = bool((geo_policy or {}).get("legacy_break_force_recent_plain", False))
+            self.geo_last_policy_inputs["legacy_break_anchor_scale"] = float((geo_policy or {}).get("legacy_break_anchor_scale", 1.0) or 1.0)
+            self.geo_last_policy_inputs["legacy_break_frame0_scale"] = float((geo_policy or {}).get("legacy_break_frame0_scale", 1.0) or 1.0)
+            self.geo_last_policy_inputs["legacy_break_recent_plain_ratio"] = float((geo_policy or {}).get("legacy_break_recent_plain_ratio", 0.08) or 0.08)
             self.geo_last_policy_inputs["allow_reloc_trigger"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
             self.geo_last_policy_inputs["reloc_gate_open"] = bool((geo_policy or {}).get("allow_reloc_trigger", False))
             self.geo_last_policy_inputs["use_reloc"] = bool((geo_policy or {}).get("use_reloc", False))
@@ -7623,6 +7656,12 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["bootstrap_bank_ready"] = bool(bootstrap_bank_ready_now)
             self.geo_last_policy_inputs["recovery_selector"] = bool(False)
             self.geo_last_policy_inputs["shared_keep_order_preserved"] = bool(False)
+            self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = None
+            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = None
+            self.geo_last_policy_inputs["frame_keep_budget_min"] = None
+            self.geo_last_policy_inputs["frame_keep_plain_patch_final_last"] = None
+            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_last"] = None
+            self.geo_last_policy_inputs["frame_keep_budget_last"] = None
 
             if ref_meta is not None:
                 mode_now = str(effective_mode)
@@ -7775,12 +7814,6 @@ class Aggregator(nn.Module):
             )
             self.geo_last_policy_inputs["use_anchor_labels"] = bool((geo_policy or {}).get("use_anchor_labels", False))
             self.geo_last_policy_inputs["safe_warmup"] = bool(safe_warmup)
-            self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = None
-            self.geo_last_policy_inputs["frame_keep_budget_min"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_final_last"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_last"] = None
-            self.geo_last_policy_inputs["frame_keep_budget_last"] = None
             enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
             enable_reference_logic = bool(geo_policy["use_reference_labels"])
             enable_stable_logic = bool(geo_policy["use_reference_labels"])
