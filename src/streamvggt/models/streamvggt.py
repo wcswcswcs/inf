@@ -226,7 +226,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         cache_results: bool = True,
         total_budget=None,
         use_geo_kv_prune: bool = False,
-        geo_voxel_size: float = 0.2,
+        geo_voxel_size: float = 0.15,
         geo_topk_per_voxel: int = 4,
         geo_recent_frames: int = 2,
         geo_near: float = 0.05,
@@ -358,10 +358,24 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
                 prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
+                selector_diag = getattr(self.aggregator, "geo_last_selector_diag", None) or {}
+                stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
+                stable_visible_overlap = int(
+                    selector_diag.get(
+                        "stable_visible_overlap",
+                        selector_diag.get("stable_visible_voxel_overlap", 0),
+                    )
+                )
+                policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
                 if (
                     prefer_last_reliable_view
                     and last_reliable_view is not None
-                    and self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
+                    and (
+                        self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
+                        or stable_visible_ratio < 0.72
+                        or stable_visible_overlap < 320
+                        or policy_runtime_bad
+                    )
                 ):
                     selector_view = last_reliable_view
                     selector_view_source = "last_reliable_view"
