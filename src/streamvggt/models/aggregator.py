@@ -7814,12 +7814,6 @@ class Aggregator(nn.Module):
             )
             self.geo_last_policy_inputs["use_anchor_labels"] = bool((geo_policy or {}).get("use_anchor_labels", False))
             self.geo_last_policy_inputs["safe_warmup"] = bool(safe_warmup)
-            self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = None
-            self.geo_last_policy_inputs["frame_keep_budget_min"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_final_last"] = None
-            self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_last"] = None
-            self.geo_last_policy_inputs["frame_keep_budget_last"] = None
             enable_landmark_logic = bool(geo_policy["use_landmark_labels"])
             enable_reference_logic = bool(geo_policy["use_reference_labels"])
             enable_stable_logic = bool(geo_policy["use_reference_labels"])
