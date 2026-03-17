@@ -1639,7 +1639,7 @@ class Aggregator(nn.Module):
         plain_ratio_prev = float(plain_patch_final_prev) / float(prev_budget)
         reserved_ratio_prev = float(keep_plain_patch_reserved_prev) / float(prev_budget)
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
-        visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", 0)) if isinstance(self.geo_last_selector_diag, dict) else 0
+        visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
         stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0)) if isinstance(self.geo_last_selector_diag, dict) else 0
 
         plain_stress = min(1.0, max(0.0, (0.45 - plain_ratio_prev) / 0.20))
