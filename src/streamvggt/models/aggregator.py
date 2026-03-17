@@ -4785,6 +4785,11 @@ class Aggregator(nn.Module):
             max_past_tokens=max_past_tokens,
             policy=policy,
         )
+        priority_keep_idx = (
+            torch.tensor(diag.get("selected_order", []), dtype=torch.long)
+            if diag.get("selected_order")
+            else torch.empty((0,), dtype=torch.long)
+        )
         return self._finalize_geo_keep(
             meta=meta,
             selected=selected,
@@ -4805,6 +4810,9 @@ class Aggregator(nn.Module):
             reanchor_added=int(diag["reanchor_added"]),
             reanchor_overlap_avg=float(diag["reanchor_overlap_avg"]),
             diag_payload=diag,
+            allow_fill=False,
+            policy=policy,
+            priority_keep_idx=priority_keep_idx,
         )
 
     def _recompute_selector_diag_from_final_keep(
