@@ -367,9 +367,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                 )
                 policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
+                selector_fallback_ready = bool(
+                    self.aggregator._geo_structure_ready()
+                    or self.aggregator._geo_prestructure_reference_ready()
+                )
                 if (
                     prefer_last_reliable_view
                     and last_reliable_view is not None
+                    and selector_fallback_ready
                     and (
                         self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
                         or stable_visible_ratio < 0.72
