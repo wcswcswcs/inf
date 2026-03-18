@@ -1769,7 +1769,6 @@ class Aggregator(nn.Module):
             "legacy_break_gate_open": bool(legacy_break_gate_open),
             "selector_overlap_threshold": float(320.0),
             "selector_visible_threshold": float(0.72),
-            "immature_ref_structure": bool((not structure_ready) and len(self.geo_reference_bank) < 32),
             "prev_budget": int(prev_budget),
         }
         if legacy_observation_break:
@@ -1791,7 +1790,7 @@ class Aggregator(nn.Module):
             policy["legacy_break_frame0_scale"] = 1.0
             policy["legacy_break_recent_plain_ratio"] = 0.08
 
-        if selector_mode in {"current", "recovery", "reloc"}:
+        if selector_mode in {"current", "recovery"}:
             policy["cap_alpha"] = float(policy["cap_alpha"]) * (1.0 - 0.85 * float(observation_stress))
             policy["local_budget_ratio"] = max(
                 float(policy["local_budget_ratio"]),
@@ -5261,7 +5260,7 @@ class Aggregator(nn.Module):
             return torch.empty((0,), dtype=torch.long)
 
         mode_now = str((policy or {}).get("mode", "legacy"))
-        if mode_now not in {"current", "recovery", "reloc"}:
+        if mode_now not in {"current", "recovery"}:
             return torch.empty((0,), dtype=torch.long)
 
         frame_idx = meta["frame_idx"]
@@ -5823,7 +5822,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["frame0_quota_effective"] = int(frame0_quota) if frame0_idx.numel() > 0 else int(0)
 
         plain_visible_reserve = 0
-        if max_past_tokens is not None and mode_now in {"current", "recovery", "reloc"}:
+        if max_past_tokens is not None and mode_now in {"current", "recovery"}:
             plain_visible_reserve = max(256, int(0.12 * int(max_past_tokens)))
 
         special_count = int(bounded_special.numel())
@@ -5847,7 +5846,7 @@ class Aggregator(nn.Module):
             anchor_quota = base_anchor_quota
             key_quota = base_key_quota
 
-        if mode_now in {"current", "recovery", "reloc"}:
+        if mode_now in {"current", "recovery"}:
             ref_scale = float((policy or {}).get("reference_hard_scale", 1.0))
             ref_quota = max(48, int(round(float(ref_quota) * float(ref_scale))))
 
@@ -5933,7 +5932,7 @@ class Aggregator(nn.Module):
             plain_floor_idx = torch.empty((0,), dtype=torch.long)
             if priority_keep_idx is not None and policy is not None:
                 mode_now = str(policy.get("mode", "legacy"))
-                if mode_now in {"current", "recovery", "reloc"}:
+                if mode_now in {"current", "recovery"}:
                     priority = self._sanitize_keep_idx_preserve_order(
                         priority_keep_idx.detach().cpu().long(),
                         meta_len=meta_len,
@@ -6090,7 +6089,7 @@ class Aggregator(nn.Module):
 
         mode_now = str((policy or {}).get("mode", "legacy"))
         plain_floor = torch.empty((0,), dtype=torch.long)
-        if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery", "reloc"}:
+        if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery"}:
             plain_floor_quota = max(64, int(0.08 * int(b)))
             plain_floor = plain_floor_idx[: min(int(plain_floor_idx.numel()), int(plain_floor_quota))]
         self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(plain_floor.numel())
@@ -6122,7 +6121,7 @@ class Aggregator(nn.Module):
             remaining -= int(chosen_special.numel())
 
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
-        frame0_priority_after_plain = bool(mode_now in {"current", "recovery", "reloc"})
+        frame0_priority_after_plain = bool(mode_now in {"current", "recovery"})
         self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(frame0_priority_after_plain)
         self.geo_last_policy_inputs["current_recovery_ref_before_frame0"] = bool(frame0_priority_after_plain)
 
