@@ -5725,7 +5725,6 @@ class Aggregator(nn.Module):
             int(frame_idx) >= 48
             and int(frame_idx) < 192
         )
-
     def _geo_prestructure_reference_ready(self) -> bool:
         ref_overlap_ema = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
         return bool(
