@@ -561,7 +561,6 @@ def _align_pred_to_gt(pred_pts: np.ndarray, gt_pts: np.ndarray, align_mode: str,
     if align_mode == "none":
         return pred_pts, {"align_mode": align_mode, "scale": 1.0, "rotation": np.eye(3).tolist(), "translation": [0.0, 0.0, 0.0]}
 
-    estimate_scale = align_mode == "sim3"
     aligned = pred_pts.astype(np.float64)
     gt_tree = cKDTree(gt_pts)
 
@@ -569,10 +568,22 @@ def _align_pred_to_gt(pred_pts: np.ndarray, gt_pts: np.ndarray, align_mode: str,
     total_r = np.eye(3, dtype=np.float64)
     total_t = np.zeros(3, dtype=np.float64)
 
+    # Align behavior with mv_recon launch:
+    # - rigid: point-to-point ICP (SE3, no scale)
+    # - sim3: one scale alignment first, then rigid ICP refinement
+    if align_mode == "sim3":
+        _, nn_idx0 = gt_tree.query(aligned, k=1, workers=-1)
+        matched_gt0 = gt_pts[nn_idx0].astype(np.float64)
+        s0, r0, t0 = _umeyama_alignment(aligned, matched_gt0, estimate_scale=True)
+        aligned = _apply_similarity(aligned, s0, r0, t0)
+        total_t = s0 * (r0 @ total_t) + t0
+        total_r = r0 @ total_r
+        total_scale = s0 * total_scale
+
     for _ in range(max(1, icp_iters)):
         _, nn_idx = gt_tree.query(aligned, k=1, workers=-1)
         matched_gt = gt_pts[nn_idx].astype(np.float64)
-        s, r, t = _umeyama_alignment(aligned, matched_gt, estimate_scale=estimate_scale)
+        s, r, t = _umeyama_alignment(aligned, matched_gt, estimate_scale=False)
         aligned = _apply_similarity(aligned, s, r, t)
 
         total_t = s * (r @ total_t) + t
