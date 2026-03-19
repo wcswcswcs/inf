@@ -1686,11 +1686,20 @@ class Aggregator(nn.Module):
             or stable_visible_ratio_prev < 0.60
         )
 
-        visible_count_collapse = bool(int(visible_total_prev) < 6000)
-        visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.70)
-        stable_overlap_collapse = bool(int(stable_overlap_prev) < 320)
+        if int(frame_idx) < int(self.geo_reference_enable_after):
+            visible_count_collapse = bool(int(visible_total_prev) < 7200)
+            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.78)
+            stable_overlap_collapse = bool(int(stable_overlap_prev) < 384)
+        else:
+            visible_count_collapse = bool(int(visible_total_prev) < 6000)
+            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.70)
+            stable_overlap_collapse = bool(int(stable_overlap_prev) < 320)
         late_bootstrap = bool(int(frame_idx) >= int(self.geo_bootstrap_frames) + 64)
-        legacy_break_gate_open = bool(reference_phase_open or late_bootstrap)
+        legacy_break_gate_open = bool(
+            reference_phase_open
+            or late_bootstrap
+            or (early_assist_active and int(frame_idx) >= 64)
+        )
         legacy_observation_break = bool(
             selector_mode == "legacy"
             and legacy_break_gate_open
@@ -1788,9 +1797,12 @@ class Aggregator(nn.Module):
         }
         if legacy_observation_break:
             policy["legacy_break_force_recent_plain"] = True
-            policy["legacy_break_anchor_scale"] = 0.20
-            policy["legacy_break_frame0_scale"] = 0.50
-            policy["legacy_break_recent_plain_ratio"] = 0.16
+            policy["legacy_break_anchor_scale"] = 0.90 if (early_assist_active and int(frame_idx) < int(self.geo_reference_enable_after)) else 0.20
+            policy["legacy_break_frame0_scale"] = 0.95 if (early_assist_active and int(frame_idx) < int(self.geo_reference_enable_after)) else 0.50
+            policy["legacy_break_recent_plain_ratio"] = max(
+                float(policy.get("legacy_break_recent_plain_ratio", 0.08)),
+                0.12 if (early_assist_active and int(frame_idx) < int(self.geo_reference_enable_after)) else 0.16,
+            )
             policy["use_cap"] = False
             policy["cap_alpha"] = 0.0
             policy["local_budget_ratio"] = max(float(policy["local_budget_ratio"]), 0.80)
@@ -2663,9 +2675,9 @@ class Aggregator(nn.Module):
         if ongoing_after_decay and reloc_release_ready:
             self.geo_reloc_good_streak = int(self.geo_reloc_good_streak) + 1
             self.geo_last_policy_inputs["reloc_release_ready"] = bool(True)
-            if int(self.geo_reloc_good_streak) >= 3:
-                self.geo_reloc_frames_left = max(0, int(self.geo_reloc_frames_left) - 2)
-            if int(self.geo_reloc_good_streak) >= 5:
+            if int(self.geo_reloc_good_streak) >= 2:
+                self.geo_reloc_frames_left = max(0, int(self.geo_reloc_frames_left) - 4)
+            if int(self.geo_reloc_good_streak) >= 4:
                 self.geo_reloc_state = "off"
                 self.geo_reloc_frames_left = 0
                 self.geo_reloc_hard_left = 0
@@ -2674,6 +2686,7 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["reloc_release_ready"] = bool(False)
             if int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off":
                 self.geo_reloc_good_streak = 0
+        self.geo_last_policy_inputs["geo_reloc_good_streak"] = int(self.geo_reloc_good_streak)
 
     def _refresh_cached_keyframe_flags(self, frame_idx: int):
         frozen = self.geo_keyframe_frozen_local.get(int(frame_idx))
@@ -4580,8 +4593,8 @@ class Aggregator(nn.Module):
             base_budget = int(max_past_tokens)
             q_ref = max(512, int(base_budget * 0.18))
             q_land = max(256, int(base_budget * 0.10))
-            q_recent_plain = max(512, int(base_budget * 0.12))
-            q_anchor = max(64, int(base_budget * 0.08))
+            q_recent_plain = max(1024, int(base_budget * 0.16))
+            q_anchor = max(64, int(base_budget * 0.05))
             q_key = max(256, int(base_budget * 0.08))
             q_recent = max(256, int(base_budget * 0.06))
         else:
@@ -5848,8 +5861,9 @@ class Aggregator(nn.Module):
         mode_now = str((policy or {}).get("mode", "legacy"))
         structure_mature = bool(
             self._geo_structure_ready()
-            and len(self.geo_reference_bank) >= 32
-            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
+            and len(self.geo_reference_bank) >= 64
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 12.0
+            and not bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
         )
         self.geo_last_policy_inputs["structure_mature"] = bool(structure_mature)
 
@@ -5870,6 +5884,7 @@ class Aggregator(nn.Module):
                     int(frame0_idx.numel()),
                     max(512, int(round(float(base_frame0_quota) * float(frame0_hard_scale)))),
                 )
+                frame0_quota = max(int(frame0_quota), min(int(frame0_idx.numel()), 384))
             else:
                 frame0_hard_scale = float((policy or {}).get("frame0_hard_scale", 1.0))
                 base_frame0_quota = min(
@@ -6174,9 +6189,10 @@ class Aggregator(nn.Module):
         mode_now = str((policy or {}).get("mode", "legacy"))
         plain_floor = torch.empty((0,), dtype=torch.long)
         if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery", "reloc"}:
-            plain_floor_quota = max(64, int(0.08 * int(b)))
+            plain_floor_quota = max(192, int(0.10 * int(b)))
             plain_floor = plain_floor_idx[: min(int(plain_floor_idx.numel()), int(plain_floor_quota))]
         self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(plain_floor.numel())
+        self.geo_last_policy_inputs["recent_plain_floor_kept_final"] = int(0)
 
         def _take_recent_quota(idx_tensor: torch.Tensor, quota: int) -> torch.Tensor:
             if quota <= 0 or idx_tensor.numel() == 0:
@@ -6264,7 +6280,10 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["hard_cap_unique_budget"] = bool(True)
         if not picked_parts:
             return torch.empty((0,), dtype=torch.long)
-        return self._unique_preserve_order_long(torch.cat(picked_parts, dim=0))
+        out_final = self._unique_preserve_order_long(torch.cat(picked_parts, dim=0))
+        if plain_floor.numel() > 0:
+            self.geo_last_policy_inputs["recent_plain_floor_kept_final"] = int(torch.isin(plain_floor, out_final).sum().item())
+        return out_final
 
     def _cap_keep_for_geo_mode(
         self,
@@ -6355,19 +6374,25 @@ class Aggregator(nn.Module):
         early_assist = self._geo_early_assist_active(int(current_frame_idx))
         prestructure_ref_ready = self._geo_prestructure_reference_ready()
         if early_assist:
-            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.78)
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.64)
         if mode_now == "recovery":
-            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.72)
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.58)
         if mode_now == "reloc":
-            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.68)
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.54)
         if prestructure_ref_ready:
-            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.70)
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.56)
         if bool((policy or {}).get("allow_reference_refresh_only", False)):
-            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.66)
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.52)
+        force_real_prune = bool(
+            mode_now in {"recovery", "reloc"}
+            or bool((policy or {}).get("legacy_observation_break", False))
+            or float((policy or {}).get("observation_stress", 0.0)) >= 0.55
+        )
         self.geo_last_policy_inputs["early_assist_active"] = bool(early_assist)
         self.geo_last_policy_inputs["prestructure_ref_ready"] = bool(prestructure_ref_ready)
+        self.geo_last_policy_inputs["force_real_prune"] = bool(force_real_prune)
         self.geo_last_policy_inputs["prune_start_ratio_eff"] = float(prune_start_ratio_eff)
-        if max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff)):
+        if (not force_real_prune) and max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff)):
             keep_all = torch.arange(total_tokens, dtype=torch.long)
             logger.info(
                 "[geo_keep] total_tokens=%d budget=%d selected=%d selected_ratio=%.4f skip_prune=1 prune_start_ratio_eff=%.4f",
@@ -7845,9 +7870,15 @@ class Aggregator(nn.Module):
                 self.geo_reloc_release_streak = 0
             self.geo_last_policy_inputs["reloc_release_ready"] = bool(reloc_release_ready)
             self.geo_last_policy_inputs["geo_reloc_release_streak"] = int(self.geo_reloc_release_streak)
-            if ongoing_reloc and (not reloc_release_ready):
+            current_release_ready = bool(
+                reloc_release_ready
+                and soft_current_ready_now
+                and bool(structure_ready_now)
+            )
+            self.geo_last_policy_inputs["current_release_ready"] = bool(current_release_ready)
+            if ongoing_reloc and (not current_release_ready):
                 effective_mode = "reloc"
-            elif ongoing_reloc and int(self.geo_reloc_release_streak) >= 3 and bool(soft_current_ready_now):
+            elif current_release_ready:
                 effective_mode = "current"
             elif policy_mode == "recovery" or ongoing_recovery:
                 effective_mode = "recovery"
@@ -8214,13 +8245,14 @@ class Aggregator(nn.Module):
 
                                 prestructure_ref_ready = self._geo_prestructure_reference_ready()
                                 soft_bootstrap_ready_now = bool((geo_policy or {}).get("soft_bootstrap_ready", False))
+                                prestructure_soft_label_ready = bool(
+                                    soft_bootstrap_ready_now
+                                    and prestructure_ref_ready
+                                    and len(self.geo_reference_bank) >= 32
+                                )
                                 soft_label_ready_now = bool(
                                     structure_ready_now
-                                    or (
-                                        soft_bootstrap_ready_now
-                                        and prestructure_ref_ready
-                                        and len(self.geo_reference_bank) >= 32
-                                    )
+                                    or prestructure_soft_label_ready
                                 )
                                 landmark_enabled_eff = bool(landmark_enabled)
                                 reference_enabled_eff = bool(reference_enabled)
@@ -8231,6 +8263,7 @@ class Aggregator(nn.Module):
                                         and prestructure_ref_ready
                                     )
                                 self.geo_last_policy_inputs["soft_label_ready_now"] = bool(soft_label_ready_now)
+                                self.geo_last_policy_inputs["prestructure_soft_label_ready"] = bool(prestructure_soft_label_ready)
                                 self.geo_last_policy_inputs["landmark_enabled_eff"] = bool(landmark_enabled_eff)
                                 self.geo_last_policy_inputs["reference_enabled_eff"] = bool(reference_enabled_eff)
                                 if not bool(soft_label_ready_now):
@@ -8241,7 +8274,7 @@ class Aggregator(nn.Module):
                                     merged_meta["is_reference"] = prev_reference
                                 elif not reference_enabled_eff:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
-                                    landmark_quota = 128 if bool(structure_ready_now) else 64
+                                    landmark_quota = 128 if bool(structure_ready_now) else (48 if prestructure_soft_label_ready else 64)
                                     if int(self.geo_reloc_frames_left) > 0 or int(self.geo_recovery_frames_left) > 0:
                                         landmark_quota = max(int(landmark_quota), 128)
                                     new_landmark = self._bounded_label_from_mask(
@@ -8254,8 +8287,8 @@ class Aggregator(nn.Module):
                                 else:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
                                     reference_raw = self._derive_reference_mask_from_meta(merged_meta)
-                                    landmark_quota = 128 if bool(structure_ready_now) else 64
-                                    reference_quota = 64 if bool(structure_ready_now) else 32
+                                    landmark_quota = 128 if bool(structure_ready_now) else (48 if prestructure_soft_label_ready else 64)
+                                    reference_quota = 64 if bool(structure_ready_now) else (16 if prestructure_soft_label_ready else 32)
                                     if int(self.geo_reloc_frames_left) > 0 or int(self.geo_recovery_frames_left) > 0:
                                         landmark_quota = max(int(landmark_quota), 128)
                                         reference_quota = max(int(reference_quota), 64)
