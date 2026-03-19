@@ -413,6 +413,7 @@ class Aggregator(nn.Module):
         self.geo_reloc_state: str = "off"
         self.geo_reloc_hard_left: int = 0
         self.geo_reloc_good_streak: int = 0
+        self.geo_reloc_release_streak: int = 0
         # Legacy positional cache is intentionally disabled; continuity uses identity cache only.
         self.geo_cached_landmark_keep: torch.Tensor = torch.empty((0,), dtype=torch.long)
         self.geo_cached_landmark_identity_keep: torch.Tensor = torch.empty((0,), dtype=torch.long)
@@ -530,6 +531,7 @@ class Aggregator(nn.Module):
             "geo_reloc_frames_left": int(self.geo_reloc_frames_left),
             "geo_reloc_hard_left": int(self.geo_reloc_hard_left),
             "geo_reloc_good_streak": int(self.geo_reloc_good_streak),
+            "geo_reloc_release_streak": int(self.geo_reloc_release_streak),
             "geo_trust_score": float(self.geo_trust_score),
             "geo_anchor_version": int(self.geo_anchor_version),
             "geo_frame_anchor_version": copy.deepcopy(self.geo_frame_anchor_version),
@@ -620,6 +622,7 @@ class Aggregator(nn.Module):
         self.geo_reloc_frames_left = int(state.get("geo_reloc_frames_left", 0))
         self.geo_reloc_hard_left = int(state.get("geo_reloc_hard_left", 0))
         self.geo_reloc_good_streak = int(state.get("geo_reloc_good_streak", 0))
+        self.geo_reloc_release_streak = int(state.get("geo_reloc_release_streak", 0))
         self.geo_trust_score = float(state.get("geo_trust_score", 1.0))
         self.geo_anchor_version = int(state.get("geo_anchor_version", 0))
         self.geo_frame_anchor_version = copy.deepcopy(state.get("geo_frame_anchor_version", {}))
@@ -1552,9 +1555,16 @@ class Aggregator(nn.Module):
         matched_ema = float(metrics["matched_ema"])
         selector_overlap_ema = float(metrics["selector_overlap_ema"])
 
+        early_assist_active = self._geo_early_assist_active(int(frame_idx))
         anchor_phase_open = int(frame_idx) >= int(self.geo_anchor_enable_after)
-        landmark_phase_open = int(frame_idx) >= int(self.geo_landmark_enable_after)
-        reference_phase_open = int(frame_idx) >= int(self.geo_reference_enable_after)
+        landmark_phase_open = (
+            int(frame_idx) >= int(self.geo_landmark_enable_after)
+            or (bool(early_assist_active) and int(frame_idx) >= 64)
+        )
+        reference_phase_open = (
+            int(frame_idx) >= int(self.geo_reference_enable_after)
+            or (bool(early_assist_active) and int(frame_idx) >= 128)
+        )
         reloc_phase_open = int(frame_idx) >= int(self.geo_reloc_enable_after)
 
         bootstrap_bank_ready = self._geo_bootstrap_bank_ready(int(frame_idx))
@@ -1569,6 +1579,11 @@ class Aggregator(nn.Module):
             and maturity >= 0.45
             and matched_ema >= 0.12
         )
+        if bool(early_assist_active) and int(frame_idx) >= 64 and bool(bootstrap_bank_ready or soft_bootstrap_ready):
+            landmark_growth_ready = bool(
+                landmark_growth_ready
+                or matched_ema >= 0.08
+            )
         selector_ready_overlap = max(float(selector_overlap_ema), float(metrics["ref_overlap_ema"]))
         reference_growth_ready = bool(
             reference_phase_open
@@ -1580,6 +1595,8 @@ class Aggregator(nn.Module):
             )
             and selector_ready_overlap >= 8.0
         )
+        if int(frame_idx) < 128:
+            reference_growth_ready = False
 
         landmark_label_ready = bool(landmark_phase_open and structure_ready and landmark_growth_ready)
         reference_label_ready = bool(reference_phase_open and structure_ready and reference_growth_ready)
@@ -1687,13 +1704,9 @@ class Aggregator(nn.Module):
         if selector_mode == "current" and observation_collapse:
             selector_mode = "recovery"
 
+        prestructure_ref_ready = self._geo_prestructure_reference_ready()
         reference_support_ready = bool(
-            len(self.geo_reference_bank) >= max(
-                8,
-                min(16, int(self._geo_effective_bootstrap_thresholds()["refs"])),
-            )
-            or len(self.geo_stable_anchor_voxels) >= 64
-            or len(self.geo_landmark_voxels) >= 128
+            self._geo_structure_ready() or prestructure_ref_ready
         )
         allow_reloc_trigger = bool(
             reloc_phase_open
@@ -1751,9 +1764,11 @@ class Aggregator(nn.Module):
             "landmark_phase_open": bool(landmark_phase_open),
             "reference_phase_open": bool(reference_phase_open),
             "reloc_phase_open": bool(reloc_phase_open),
+            "early_assist_active": bool(early_assist_active),
             "bootstrap_bank_ready": bool(bootstrap_bank_ready),
             "soft_bootstrap_ready": bool(soft_bootstrap_ready),
             "structure_ready": bool(structure_ready),
+            "prestructure_ref_ready": bool(prestructure_ref_ready),
             "soft_current_ready": bool(soft_current_ready),
             "observation_collapse": bool(observation_collapse),
             "observation_stress": float(observation_stress),
@@ -2581,14 +2596,14 @@ class Aggregator(nn.Module):
 
         runtime_map_ready = bool(self._update_geo_runtime_ready(frame_idx) if runtime_map_ready is None else runtime_map_ready)
         structure_ready = self._geo_structure_ready()
-        soft_bootstrap_ready = self._geo_soft_bootstrap_ready(frame_idx)
+        prestructure_ref_ready = self._geo_prestructure_reference_ready()
         selector_diag = self._geo_get_last_selector_diag() or {}
         stable_vis_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
         stable_overlap = int(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0)))
         visible_total = int(selector_diag.get("visible_total", 0))
         prestructure_bad_runtime = bool(
             int(frame_idx) >= int(self.geo_bootstrap_frames) + 32
-            and (soft_bootstrap_ready or len(self.geo_stable_anchor_voxels) >= 192)
+            and prestructure_ref_ready
             and (
                 stable_vis_ratio < 0.70
                 or stable_overlap < 320
@@ -2637,11 +2652,28 @@ class Aggregator(nn.Module):
         if policy is not None:
             policy["diag_bad_runtime"] = bool(bad_runtime)
 
-        if bool(allow_reloc_trigger) and bad_runtime and str(self.geo_reloc_state) == "off":
+        can_start_new_reloc = bool(structure_ready or prestructure_ref_ready)
+        if bool(allow_reloc_trigger) and can_start_new_reloc and bad_runtime and str(self.geo_reloc_state) == "off":
             self.geo_reloc_state = "hard"
             self.geo_reloc_hard_left = int(self.geo_reloc_hard_frames)
             self.geo_reloc_frames_left = int(self.geo_reloc_frames)
             self.geo_reloc_good_streak = 0
+
+        reloc_release_ready = self._geo_reloc_release_ready()
+        if ongoing_after_decay and reloc_release_ready:
+            self.geo_reloc_good_streak = int(self.geo_reloc_good_streak) + 1
+            self.geo_last_policy_inputs["reloc_release_ready"] = bool(True)
+            if int(self.geo_reloc_good_streak) >= 3:
+                self.geo_reloc_frames_left = max(0, int(self.geo_reloc_frames_left) - 2)
+            if int(self.geo_reloc_good_streak) >= 5:
+                self.geo_reloc_state = "off"
+                self.geo_reloc_frames_left = 0
+                self.geo_reloc_hard_left = 0
+                self.geo_reloc_good_streak = 0
+        else:
+            self.geo_last_policy_inputs["reloc_release_ready"] = bool(False)
+            if int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off":
+                self.geo_reloc_good_streak = 0
 
     def _refresh_cached_keyframe_flags(self, frame_idx: int):
         frozen = self.geo_keyframe_frozen_local.get(int(frame_idx))
@@ -2850,11 +2882,23 @@ class Aggregator(nn.Module):
             self.geo_reloc_good_streak = 0
 
         repair_mode = bool(recovery_mode) or bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
+        ref_in_cache_prev = int(self.geo_last_policy_inputs.get("ref_in_cache", 0) or 0)
+        healthy_refresh_only = bool(
+            self._geo_structure_ready()
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 6.0
+            and ref_in_cache_prev >= 256
+        )
         allow_reference_refresh_only = bool(
             repair_mode
             and bool(self.geo_recovery_reference_refresh)
             and bool(bootstrap_or_soft)
             and bool(promote_reference_ready)
+            and healthy_refresh_only
+        )
+        post_bootstrap_growth = bool(
+            bootstrap_or_soft
+            and len(self.geo_stable_anchor_voxels) >= 256
+            and len(self.geo_keyframes) >= 8
         )
         if repair_mode:
             allow_new_voxels = True
@@ -2883,6 +2927,16 @@ class Aggregator(nn.Module):
                 recovery_landmark_quota = max(int(recovery_landmark_quota), int(seed_landmark_quota))
             allow_promote_landmark = bool(allow_promote_landmark or (bool(promote_reference_ready) and bool(policy.get("allow_landmark_growth", False))))
             allow_promote_reference = bool(allow_promote_reference or (bool(promote_reference_ready) and bool(policy.get("allow_reference_growth", False))))
+        if post_bootstrap_growth and (not structure_ready):
+            if len(self.geo_reference_bank) < 64:
+                recovery_reference_quota = max(int(recovery_reference_quota or 0), 32)
+                allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)))
+            if len(self.geo_landmark_voxels) < 512:
+                recovery_landmark_quota = max(int(recovery_landmark_quota or 0), 96)
+                allow_promote_landmark = bool(allow_promote_landmark or bool(policy.get("allow_landmark_growth", False)))
+        if allow_reference_refresh_only and len(self.geo_reference_bank) < 64:
+            allow_reference_refresh_only = False
+            allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)) or bool(bootstrap_or_soft))
         high_conf_thr = max(float(self.geo_stable_anchor_min_conf), 1.1)
         stable_or_ref_set = set(self.geo_stable_anchor_voxels)
         stable_or_ref_set.update(self.geo_reference_voxels)
@@ -3131,6 +3185,7 @@ class Aggregator(nn.Module):
             "allow_reference_refresh_only": float(1.0 if allow_reference_refresh_only else 0.0),
             "seed_reference_quota": float(seed_reference_quota),
             "seed_landmark_quota": float(seed_landmark_quota),
+            "post_bootstrap_growth": float(1.0 if post_bootstrap_growth else 0.0),
         }
 
         bootstrap_voxel_count = int(len(self.geo_voxel_bank))
@@ -3145,6 +3200,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["seed_reference_quota"] = int(seed_reference_quota)
         self.geo_last_policy_inputs["seed_landmark_quota"] = int(seed_landmark_quota)
         self.geo_last_policy_inputs["diag_bad_runtime"] = bool((policy or {}).get("diag_bad_runtime", False))
+        self.geo_last_policy_inputs["post_bootstrap_growth"] = bool(post_bootstrap_growth)
 
         if self._should_log_geo_bootstrap(int(frame_idx)):
             logger.info(
@@ -3170,6 +3226,7 @@ class Aggregator(nn.Module):
             "allow_reference_refresh_only": float(1.0 if allow_reference_refresh_only else 0.0),
             "seed_reference_quota": float(seed_reference_quota),
             "seed_landmark_quota": float(seed_landmark_quota),
+            "post_bootstrap_growth": float(1.0 if post_bootstrap_growth else 0.0),
         }
 
     @staticmethod
@@ -4520,18 +4577,20 @@ class Aggregator(nn.Module):
             selected_mask[out] = True
 
         if policy is not None:
-            local_ratio = max(float(self.geo_reloc_local_budget_ratio), float(policy["local_budget_ratio"]))
-            stable_ratio = max(float(self.geo_reloc_stable_read_budget_ratio), float(policy["stable_read_budget_ratio"]))
             base_budget = int(max_past_tokens)
-            q_ref = max(256, int(base_budget * stable_ratio))
-            q_land = max(128, int(base_budget * stable_ratio * 0.5))
-            q_anchor = max(128, int(base_budget * local_ratio * 0.5))
-            q_key = max(256, int(base_budget * local_ratio))
-            q_recent = max(128, int(base_budget * local_ratio * 0.5))
+            q_ref = max(512, int(base_budget * 0.18))
+            q_land = max(256, int(base_budget * 0.10))
+            q_recent_plain = max(512, int(base_budget * 0.12))
+            q_anchor = max(64, int(base_budget * 0.08))
+            q_key = max(256, int(base_budget * 0.08))
+            q_recent = max(256, int(base_budget * 0.06))
         else:
-            q_ref, q_land, q_anchor, q_key, q_recent = 2048, 1024, 1024, 2048, 512
+            q_ref, q_land, q_recent_plain, q_anchor, q_key, q_recent = 2048, 1024, 1024, 512, 1024, 512
+        is_plain_recent = (~is_special) & (geo_role == 0) & recent_mask
+        self.geo_last_policy_inputs["reloc_q_recent_plain"] = int(q_recent_plain)
         _pick(is_reference, q_ref)
         _pick(is_landmark, q_land)
+        _pick(is_plain_recent, q_recent_plain)
         _pick(is_anchor, q_anchor)
         _pick(is_keyframe, q_key)
         _pick(recent_mask & (~is_special), q_recent)
@@ -5240,7 +5299,7 @@ class Aggregator(nn.Module):
             return torch.empty((0,), dtype=torch.long)
 
         mode_now = str((policy or {}).get("mode", "legacy"))
-        if mode_now not in {"current", "recovery"}:
+        if mode_now not in {"current", "recovery", "reloc"}:
             return torch.empty((0,), dtype=torch.long)
 
         frame_idx = meta["frame_idx"]
@@ -5661,6 +5720,27 @@ class Aggregator(nn.Module):
             or len(self.geo_landmark_voxels) >= 64
         )
 
+    def _geo_early_assist_active(self, frame_idx: int) -> bool:
+        return bool(
+            int(frame_idx) >= 48
+            and int(frame_idx) < 192
+        )
+    def _geo_prestructure_reference_ready(self) -> bool:
+        ref_overlap_ema = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
+        return bool(
+            len(self.geo_reference_bank) >= 16
+            and ref_overlap_ema >= 4.0
+        )
+
+    def _geo_reloc_release_ready(self) -> bool:
+        return bool(
+            self._geo_structure_ready()
+            and len(self.geo_reference_bank) >= 32
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
+            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.55
+            and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.15
+        )
+
     def _geo_bootstrap_bank_ready(self, frame_idx: int) -> bool:
         thr = self._geo_effective_bootstrap_thresholds()
         if int(frame_idx) < int(self.geo_bootstrap_frames):
@@ -5711,7 +5791,17 @@ class Aggregator(nn.Module):
         if (not self.geo_structure_ready_latched) and self.geo_structure_ready_streak >= int(thr["ready_streak"]):
             self.geo_structure_ready_latched = True
 
-        exit_streak = max(3, int(thr["ready_streak"]))
+        mature_structure = bool(
+            len(self.geo_reference_bank) >= 32
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
+            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.55
+        )
+        if mature_structure:
+            exit_streak = 12
+        else:
+            exit_streak = max(6, 2 * int(thr["ready_streak"]))
+        self.geo_last_policy_inputs["mature_structure"] = bool(mature_structure)
+        self.geo_last_policy_inputs["structure_exit_streak_effective"] = int(exit_streak)
         if self.geo_structure_ready_latched and self.geo_structure_unready_streak >= int(exit_streak):
             self.geo_structure_ready_latched = False
 
@@ -5756,6 +5846,12 @@ class Aggregator(nn.Module):
             keep.update(int(v) for v in bounded_special.tolist())
 
         mode_now = str((policy or {}).get("mode", "legacy"))
+        structure_mature = bool(
+            self._geo_structure_ready()
+            and len(self.geo_reference_bank) >= 32
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
+        )
+        self.geo_last_policy_inputs["structure_mature"] = bool(structure_mature)
 
         frame0_mask = (frame_idx == 0) & (~is_special) & (local_idx >= 0)
         frame0_idx = torch.nonzero(frame0_mask, as_tuple=False).flatten()
@@ -5764,11 +5860,21 @@ class Aggregator(nn.Module):
             if mode_now == "legacy" or max_past_tokens is None:
                 frame0_quota = int(frame0_idx.numel())
                 frame0_keep = frame0_idx
+            elif not structure_mature:
+                frame0_hard_scale = max(float((policy or {}).get("frame0_hard_scale", 1.0)), 0.85)
+                base_frame0_quota = min(
+                    int(frame0_idx.numel()),
+                    max(768, int(0.18 * int(max_past_tokens))),
+                )
+                frame0_quota = min(
+                    int(frame0_idx.numel()),
+                    max(512, int(round(float(base_frame0_quota) * float(frame0_hard_scale)))),
+                )
             else:
                 frame0_hard_scale = float((policy or {}).get("frame0_hard_scale", 1.0))
                 base_frame0_quota = min(
                     int(frame0_idx.numel()),
-                    min(256, max(64, int(0.06 * int(max_past_tokens)))),
+                    min(384, max(96, int(0.08 * int(max_past_tokens)))),
                 )
                 frame0_quota = max(48, int(round(float(base_frame0_quota) * float(frame0_hard_scale))))
                 frame0_meta = self.geo_frame_meta.get(0)
@@ -5800,7 +5906,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["frame0_quota_effective"] = int(frame0_quota) if frame0_idx.numel() > 0 else int(0)
 
         plain_visible_reserve = 0
-        if max_past_tokens is not None and mode_now in {"current", "recovery"}:
+        if max_past_tokens is not None and mode_now in {"current", "recovery", "reloc"}:
             plain_visible_reserve = max(256, int(0.12 * int(max_past_tokens)))
 
         special_count = int(bounded_special.numel())
@@ -5910,7 +6016,7 @@ class Aggregator(nn.Module):
             plain_floor_idx = torch.empty((0,), dtype=torch.long)
             if priority_keep_idx is not None and policy is not None:
                 mode_now = str(policy.get("mode", "legacy"))
-                if mode_now in {"current", "recovery"}:
+                if mode_now in {"current", "recovery", "reloc"}:
                     priority = self._sanitize_keep_idx_preserve_order(
                         priority_keep_idx.detach().cpu().long(),
                         meta_len=meta_len,
@@ -6067,7 +6173,7 @@ class Aggregator(nn.Module):
 
         mode_now = str((policy or {}).get("mode", "legacy"))
         plain_floor = torch.empty((0,), dtype=torch.long)
-        if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery"}:
+        if plain_floor_idx is not None and plain_floor_idx.numel() > 0 and mode_now in {"current", "recovery", "reloc"}:
             plain_floor_quota = max(64, int(0.08 * int(b)))
             plain_floor = plain_floor_idx[: min(int(plain_floor_idx.numel()), int(plain_floor_quota))]
         self.geo_last_policy_inputs["keep_plain_patch_hard_floor"] = int(plain_floor.numel())
@@ -6099,7 +6205,7 @@ class Aggregator(nn.Module):
             remaining -= int(chosen_special.numel())
 
         self.geo_last_policy_inputs["frame0_hard_capped_diverse"] = int(0)
-        frame0_priority_after_plain = bool(mode_now in {"current", "recovery"})
+        frame0_priority_after_plain = bool(mode_now in {"current", "recovery", "reloc"})
         self.geo_last_policy_inputs["frame0_priority_after_plain"] = bool(frame0_priority_after_plain)
         self.geo_last_policy_inputs["current_recovery_ref_before_frame0"] = bool(frame0_priority_after_plain)
 
@@ -6244,14 +6350,32 @@ class Aggregator(nn.Module):
         structure_ready = self._geo_structure_ready()
         recent_frames_eff = int(policy["recent_window"]) if policy is not None else int(recent_frames)
         hard_recent_frames_eff = int(policy["hard_recent_frames"]) if policy is not None else int(self.geo_hard_recent_frames)
-        if max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(self.geo_prune_start_ratio)):
+        prune_start_ratio_eff = float(self.geo_prune_start_ratio)
+        mode_now = str((policy or {}).get("mode", "legacy"))
+        early_assist = self._geo_early_assist_active(int(current_frame_idx))
+        prestructure_ref_ready = self._geo_prestructure_reference_ready()
+        if early_assist:
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.78)
+        if mode_now == "recovery":
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.72)
+        if mode_now == "reloc":
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.68)
+        if prestructure_ref_ready:
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.70)
+        if bool((policy or {}).get("allow_reference_refresh_only", False)):
+            prune_start_ratio_eff = min(prune_start_ratio_eff, 0.66)
+        self.geo_last_policy_inputs["early_assist_active"] = bool(early_assist)
+        self.geo_last_policy_inputs["prestructure_ref_ready"] = bool(prestructure_ref_ready)
+        self.geo_last_policy_inputs["prune_start_ratio_eff"] = float(prune_start_ratio_eff)
+        if max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff)):
             keep_all = torch.arange(total_tokens, dtype=torch.long)
             logger.info(
-                "[geo_keep] total_tokens=%d budget=%d selected=%d selected_ratio=%.4f skip_prune=1",
+                "[geo_keep] total_tokens=%d budget=%d selected=%d selected_ratio=%.4f skip_prune=1 prune_start_ratio_eff=%.4f",
                 int(total_tokens),
                 int(max_past_tokens),
                 int(keep_all.numel()),
                 float(keep_all.numel()) / float(max(1, total_tokens)),
+                float(prune_start_ratio_eff),
             )
             proxy = self._geo_proxy_selector_diag(
                 current_frame_idx=current_frame_idx,
@@ -7148,7 +7272,7 @@ class Aggregator(nn.Module):
 
         recent_plain_floor_kept = torch.empty((0,), dtype=torch.long)
         recent_plain_floor_count = int(recent_plain_floor_kept.numel())
-        if mode_now in {"current", "recovery"} and max_past_tokens is not None:
+        if mode_now in {"current", "recovery", "reloc"} and max_past_tokens is not None:
             recent_plain_idx = torch.nonzero(
                 recent_mask
                 & (~is_special)
@@ -7161,6 +7285,8 @@ class Aggregator(nn.Module):
                 recent_plain_ratio = 0.06 + 0.04 * float(obs_stress)
                 self.geo_last_policy_inputs["recent_plain_ratio_effective"] = float(recent_plain_ratio)
                 recent_plain_quota = max(192, int(recent_plain_ratio * int(max_past_tokens)))
+                if mode_now == "reloc":
+                    recent_plain_quota = max(int(recent_plain_quota), 192)
                 recent_plain_frame = frame_idx.index_select(0, recent_plain_idx)
                 uniq_recent_frames = torch.unique(recent_plain_frame).sort(descending=True).values
                 per_frame_quota = max(
@@ -7687,12 +7813,14 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["selector_mode"] = str((geo_policy or {}).get("mode", "legacy"))
             self.geo_last_policy_inputs["landmark_growth_ready"] = bool((geo_policy or {}).get("landmark_growth_ready", False))
             self.geo_last_policy_inputs["reference_growth_ready"] = bool((geo_policy or {}).get("reference_growth_ready", False))
+            self.geo_last_policy_inputs["early_assist_active"] = bool((geo_policy or {}).get("early_assist_active", False))
             self.geo_last_policy_inputs["landmark_label_ready"] = bool((geo_policy or {}).get("landmark_label_ready", (geo_policy or {}).get("use_landmark_labels", False)))
             self.geo_last_policy_inputs["reference_label_ready"] = bool((geo_policy or {}).get("reference_label_ready", (geo_policy or {}).get("use_reference_labels", False)))
             self.geo_last_policy_inputs["anchor_phase_open"] = bool((geo_policy or {}).get("anchor_phase_open", False))
             self.geo_last_policy_inputs["landmark_phase_open"] = bool((geo_policy or {}).get("landmark_phase_open", False))
             self.geo_last_policy_inputs["reference_phase_open"] = bool((geo_policy or {}).get("reference_phase_open", False))
             self.geo_last_policy_inputs["reloc_phase_open"] = bool((geo_policy or {}).get("reloc_phase_open", False))
+            self.geo_last_policy_inputs["prestructure_ref_ready"] = bool((geo_policy or {}).get("prestructure_ref_ready", False))
             self.geo_last_policy_inputs["use_recovery"] = bool((geo_policy or {}).get("use_recovery", False))
             self.geo_last_policy_inputs["legacy_observation_break"] = bool((geo_policy or {}).get("legacy_observation_break", False))
             self.geo_last_policy_inputs["legacy_break_force_recent_plain"] = bool((geo_policy or {}).get("legacy_break_force_recent_plain", False))
@@ -7710,8 +7838,17 @@ class Aggregator(nn.Module):
             ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
             ongoing_reloc = bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
             soft_current_ready_now = self._geo_soft_current_ready(int(past_frame_idx))
-            if ongoing_reloc:
+            reloc_release_ready = self._geo_reloc_release_ready()
+            if reloc_release_ready:
+                self.geo_reloc_release_streak = int(self.geo_reloc_release_streak) + 1
+            else:
+                self.geo_reloc_release_streak = 0
+            self.geo_last_policy_inputs["reloc_release_ready"] = bool(reloc_release_ready)
+            self.geo_last_policy_inputs["geo_reloc_release_streak"] = int(self.geo_reloc_release_streak)
+            if ongoing_reloc and (not reloc_release_ready):
                 effective_mode = "reloc"
+            elif ongoing_reloc and int(self.geo_reloc_release_streak) >= 3 and bool(soft_current_ready_now):
+                effective_mode = "current"
             elif policy_mode == "recovery" or ongoing_recovery:
                 effective_mode = "recovery"
             elif (policy_mode == "current") and (not bool(soft_current_ready_now)):
@@ -8052,6 +8189,7 @@ class Aggregator(nn.Module):
                             zeros = torch.zeros((n_meta,), dtype=torch.bool)
                             anchor_raw = self._derive_anchor_mask_from_meta(merged_meta)
                             self.geo_last_policy_inputs["anchor_count_raw"] = int(anchor_raw.sum().item())
+                            self.geo_last_policy_inputs["soft_label_ready_now"] = bool(False)
 
                             if not anchor_enabled:
                                 merged_meta["is_anchor"] = zeros
@@ -8074,33 +8212,62 @@ class Aggregator(nn.Module):
                                 prev_landmark = merged_meta.get("is_landmark", zeros)
                                 prev_reference = merged_meta.get("is_reference", zeros)
 
-                                if not bool(structure_ready_now):
+                                prestructure_ref_ready = self._geo_prestructure_reference_ready()
+                                soft_bootstrap_ready_now = bool((geo_policy or {}).get("soft_bootstrap_ready", False))
+                                soft_label_ready_now = bool(
+                                    structure_ready_now
+                                    or (
+                                        soft_bootstrap_ready_now
+                                        and prestructure_ref_ready
+                                        and len(self.geo_reference_bank) >= 32
+                                    )
+                                )
+                                landmark_enabled_eff = bool(landmark_enabled)
+                                reference_enabled_eff = bool(reference_enabled)
+                                if (not bool(structure_ready_now)) and bool(soft_label_ready_now):
+                                    landmark_enabled_eff = True
+                                    reference_enabled_eff = bool(
+                                        len(self.geo_reference_bank) >= 32
+                                        and prestructure_ref_ready
+                                    )
+                                self.geo_last_policy_inputs["soft_label_ready_now"] = bool(soft_label_ready_now)
+                                self.geo_last_policy_inputs["landmark_enabled_eff"] = bool(landmark_enabled_eff)
+                                self.geo_last_policy_inputs["reference_enabled_eff"] = bool(reference_enabled_eff)
+                                if not bool(soft_label_ready_now):
                                     merged_meta["is_landmark"] = prev_landmark
                                     merged_meta["is_reference"] = prev_reference
-                                elif not landmark_enabled:
+                                elif not landmark_enabled_eff:
                                     merged_meta["is_landmark"] = prev_landmark
                                     merged_meta["is_reference"] = prev_reference
-                                elif not reference_enabled:
+                                elif not reference_enabled_eff:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
+                                    landmark_quota = 128 if bool(structure_ready_now) else 64
+                                    if int(self.geo_reloc_frames_left) > 0 or int(self.geo_recovery_frames_left) > 0:
+                                        landmark_quota = max(int(landmark_quota), 128)
                                     new_landmark = self._bounded_label_from_mask(
                                         merged_meta,
                                         eligible & landmark_raw,
-                                        per_frame_quota=128,
+                                        per_frame_quota=int(landmark_quota),
                                     )
                                     merged_meta["is_landmark"] = prev_landmark | new_landmark
                                     merged_meta["is_reference"] = prev_reference
                                 else:
                                     landmark_raw = self._derive_landmark_mask_from_meta(merged_meta)
                                     reference_raw = self._derive_reference_mask_from_meta(merged_meta)
+                                    landmark_quota = 128 if bool(structure_ready_now) else 64
+                                    reference_quota = 64 if bool(structure_ready_now) else 32
+                                    if int(self.geo_reloc_frames_left) > 0 or int(self.geo_recovery_frames_left) > 0:
+                                        landmark_quota = max(int(landmark_quota), 128)
+                                        reference_quota = max(int(reference_quota), 64)
                                     new_landmark = self._bounded_label_from_mask(
                                         merged_meta,
                                         eligible & landmark_raw,
-                                        per_frame_quota=128,
+                                        per_frame_quota=int(landmark_quota),
                                     )
                                     new_reference = self._bounded_label_from_mask(
                                         merged_meta,
                                         eligible & reference_raw,
-                                        per_frame_quota=64,
+                                        per_frame_quota=int(reference_quota),
                                     )
                                     merged_meta["is_landmark"] = prev_landmark | new_landmark
                                     merged_meta["is_reference"] = prev_reference | new_reference
@@ -8150,7 +8317,7 @@ class Aggregator(nn.Module):
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
-                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f reserved_target_effective=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d recent_plain_ratio_effective=%.4f frame_keep_plain_patch_final_min=%d frame_keep_plain_patch_reserved_min=%d frame_keep_budget_min=%d priority_keep_fastpath_has_plain_floor=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d fastpath_recent_frames_eff=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d",
+                                    "[geo_debug] layer=%d kv_before=%d meta_before=%d protected=%d keep_idx=%d pre_keep=%d new_kv=%d merged_meta=%d layer_budget=%d trust=%.4f recovery=%d reloc=%d safe_warmup=%d bootstrap_bank_ready=%d structure_ready=%d exec_use_cap=%d layer_cap_policy_mode=%s use_anchor_labels=%d anchor_count_raw=%d frame0_in_cache=%d ref_in_cache=%d landmark_in_cache=%d anchor_in_cache=%d keep_plain_patch_reserved=%d keep_plain_patch_final=%d frame0_hard_kept=%d keep_plain_patch_hard_floor=%d frame0_hard_capped_diverse=%d early_budget_floor_applied=%d shared_ref_early_floor_applied=%d shared_keep_order_preserved=%d allow_fill_effective=%d fast_path_allow_fill=%d selector_diag_updated=%d frame0_priority_after_plain=%d current_recovery_ref_before_frame0=%d extra_frame0_soft_promotion_enabled=%d keep_plain_patch_reserved_requested=%d reserved_ratio_prev=%.4f reserved_target_effective=%.4f frame0_hard_scale=%.4f reference_hard_scale=%.4f shared_ref_budget_upper=%d shared_ref_prev_layer_budget=%d visible_ref_quota_effective=%d invis_ref_quota_effective=%d recent_plain_floor_diverse=%d recent_plain_ratio_effective=%.4f frame_keep_plain_patch_final_min=%d frame_keep_plain_patch_reserved_min=%d frame_keep_budget_min=%d priority_keep_fastpath_has_plain_floor=%d implicit_recent_plain_floor_used=%d fastpath_recent_plain_floor_added=%d fastpath_recent_frames_eff=%d keep_plain_patch_reserved_prev_is_fastpath_safe=%d hard_cap_unique_budget=%d frame0_quota_effective=%d anchor_ttl_effective=%d allow_reference_refresh_only=%d soft_label_ready_now=%d prune_start_ratio_eff=%.4f q_recent_plain=%d post_bootstrap_growth=%d mature_structure=%d structure_exit_streak_effective=%d",
                                     int(layer_idx),
                                     int(kv_before_len),
                                     int(past_meta["frame_idx"].numel()) if past_meta is not None and "frame_idx" in past_meta else 0,
@@ -8211,6 +8378,12 @@ class Aggregator(nn.Module):
                                     int(self.geo_last_policy_inputs.get("frame0_quota_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("anchor_ttl_effective", 0) or 0),
                                     int(self.geo_last_policy_inputs.get("allow_reference_refresh_only", False)),
+                                    int(bool(self.geo_last_policy_inputs.get("soft_label_ready_now", False))),
+                                    float(self.geo_last_policy_inputs.get("prune_start_ratio_eff", self.geo_prune_start_ratio) or self.geo_prune_start_ratio),
+                                    int(self.geo_last_policy_inputs.get("reloc_q_recent_plain", 0) or 0),
+                                    int(bool(self.geo_last_policy_inputs.get("post_bootstrap_growth", False))),
+                                    int(bool(self.geo_last_policy_inputs.get("mature_structure", False))),
+                                    int(self.geo_last_policy_inputs.get("structure_exit_streak_effective", 0) or 0),
                                 )
                             assert int(merged_meta["frame_idx"].numel()) == int(new_kv[0].shape[2]), "geo meta/KV length mismatch"
                             self.geo_token_meta[layer_idx] = merged_meta
