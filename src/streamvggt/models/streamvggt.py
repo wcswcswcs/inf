@@ -367,15 +367,33 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                 )
                 policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
+                selector_fallback_ready = bool(
+                    self.aggregator._geo_structure_ready()
+                    or self.aggregator._geo_prestructure_reference_ready()
+                )
+                reloc_release_ready = bool(self.aggregator._geo_reloc_release_ready())
+                soft_current_ready = bool(self.aggregator._geo_soft_current_ready(int(frame_idx_abs)))
+                healthy_visibility = bool(stable_visible_ratio >= 0.72 and stable_visible_overlap >= 320)
+                force_current_selector = bool(
+                    self.aggregator._geo_structure_ready()
+                    and reloc_release_ready
+                    and soft_current_ready
+                    and healthy_visibility
+                )
+                self.aggregator.geo_last_policy_inputs["current_release_ready"] = bool(force_current_selector)
+                allow_last_reliable = bool(
+                    policy_runtime_bad
+                    or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
+                    or stable_visible_ratio < 0.72
+                    or stable_visible_overlap < 320
+                )
                 if (
+                    (not force_current_selector)
+                    and
                     prefer_last_reliable_view
                     and last_reliable_view is not None
-                    and (
-                        self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
-                        or stable_visible_ratio < 0.72
-                        or stable_visible_overlap < 320
-                        or policy_runtime_bad
-                    )
+                    and selector_fallback_ready
+                    and allow_last_reliable
                 ):
                     selector_view = last_reliable_view
                     selector_view_source = "last_reliable_view"
