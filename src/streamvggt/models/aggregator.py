@@ -1429,6 +1429,88 @@ class Aggregator(nn.Module):
         fresh = bool(fb_frame >= int(frame_idx) - int(max_age))
         return fb, fresh
 
+    def _geo_compute_controller_health(
+        self,
+        *,
+        frame_idx: int,
+        matched_ema: Optional[float] = None,
+        selector_overlap_ema: Optional[float] = None,
+        selector_visible_ratio_ema: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        selector_diag = self._geo_get_last_selector_diag() or {}
+        selector_fresh = bool(
+            selector_diag
+            and int(selector_diag.get("frame_idx", -1)) >= int(frame_idx) - 2
+        )
+        plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+        reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+        plain_ratio_ema = float(feedback.get("geo_plain_ratio_ema", plain_ratio_last) or plain_ratio_last)
+        reserved_ratio_ema = float(feedback.get("geo_reserved_ratio_ema", reserved_ratio_last) or reserved_ratio_last)
+        plain_ratio_recent = 0.7 * plain_ratio_last + 0.3 * plain_ratio_ema
+        reserved_ratio_recent = 0.7 * reserved_ratio_last + 0.3 * reserved_ratio_ema
+
+        stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0) or 1.0)
+        stable_overlap = float(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0.0)) or 0.0)
+        stable_selected_visible = float(selector_diag.get("stable_selected_visible", 0.0) or 0.0)
+        stable_selected_invisible = float(selector_diag.get("stable_selected_invisible", 0.0) or 0.0)
+        visible_total = float(selector_diag.get("visible_total", 0.0) or 0.0)
+
+        selector_overlap_ref = float(
+            selector_overlap_ema
+            if selector_overlap_ema is not None
+            else getattr(self, "geo_selector_overlap_ema", 0.0) or 0.0
+        )
+        ref_overlap_ref = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
+        overlap_ref = max(48.0, 0.60 * max(selector_overlap_ref, ref_overlap_ref, 48.0))
+        overlap_ratio = float(stable_overlap) / float(max(1.0, overlap_ref))
+        overlap_health = min(1.5, max(0.0, overlap_ratio))
+
+        plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_recent) / 0.08))
+        reserved_stress = 0.0 if reserved_ratio_recent <= 0.0 else min(1.0, max(0.0, (0.06 - reserved_ratio_recent) / 0.06))
+        visible_stress = min(1.0, max(0.0, (0.72 - stable_visible_ratio) / 0.22))
+        overlap_stress = min(1.0, max(0.0, (0.75 - overlap_health) / 0.35))
+        controller_stress = max(plain_stress, reserved_stress, visible_stress, overlap_stress)
+
+        handover_ok = bool(
+            feedback_fresh
+            and selector_fresh
+            and plain_ratio_recent >= 0.16
+            and reserved_ratio_recent >= 0.07
+            and stable_visible_ratio >= 0.74
+            and overlap_health >= 0.75
+        )
+        runtime_bad = bool(
+            selector_fresh
+            and (
+                stable_visible_ratio < 0.62
+                or overlap_health < 0.45
+                or (matched_ema is not None and float(matched_ema) < 0.08)
+                or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
+            )
+        )
+        return {
+            "feedback_fresh": bool(feedback_fresh),
+            "selector_fresh": bool(selector_fresh),
+            "plain_ratio_recent": float(plain_ratio_recent),
+            "reserved_ratio_recent": float(reserved_ratio_recent),
+            "stable_visible_ratio": float(stable_visible_ratio),
+            "stable_overlap": float(stable_overlap),
+            "stable_selected_visible": float(stable_selected_visible),
+            "stable_selected_invisible": float(stable_selected_invisible),
+            "visible_total": float(visible_total),
+            "overlap_ref": float(overlap_ref),
+            "overlap_health": float(overlap_health),
+            "plain_stress": float(plain_stress),
+            "reserved_stress": float(reserved_stress),
+            "visible_stress": float(visible_stress),
+            "overlap_stress": float(overlap_stress),
+            "controller_stress": float(controller_stress),
+            "handover_ok": bool(handover_ok),
+            "runtime_bad": bool(runtime_bad),
+            "selector_visible_ratio_ema": float(selector_visible_ratio_ema if selector_visible_ratio_ema is not None else getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0),
+        }
+
     def _geo_collect_policy_signals(
         self,
         *,
@@ -1582,6 +1664,12 @@ class Aggregator(nn.Module):
         instability = float(metrics["instability"])
         matched_ema = float(metrics["matched_ema"])
         selector_overlap_ema = float(metrics["selector_overlap_ema"])
+        health = self._geo_compute_controller_health(
+            frame_idx=int(frame_idx),
+            matched_ema=float(matched_ema),
+            selector_overlap_ema=float(selector_overlap_ema),
+            selector_visible_ratio_ema=float(metrics["selector_visible_ratio_ema"]),
+        )
 
         early_assist_active = self._geo_early_assist_active(int(frame_idx))
         anchor_phase_open = int(frame_idx) >= int(self.geo_anchor_enable_after)
@@ -1634,8 +1722,7 @@ class Aggregator(nn.Module):
                 len(self.geo_reference_bank) >= 8
                 or len(self.geo_landmark_voxels) >= 64
             )
-            and selector_ready_overlap >= 320.0
-            and float(metrics["selector_visible_ratio_ema"]) >= 0.72
+            and bool(health["handover_ok"])
         )
         selector_handover_ready = bool(reference_label_ready or early_handover_ready)
 
@@ -1645,7 +1732,7 @@ class Aggregator(nn.Module):
         recovery_exit_streak = int(self.geo_recovery_exit_streak)
         selector_mode = str(self.geo_selector_mode)
 
-        if selector_handover_ready and instability <= 0.45:
+        if selector_handover_ready:
             handover_ready_streak += 1
             handover_unready_streak = 0
         else:
@@ -1653,23 +1740,23 @@ class Aggregator(nn.Module):
             handover_unready_streak += 1
 
         if selector_mode == "legacy":
-            if handover_ready_streak >= 5:
+            if handover_ready_streak >= 3:
                 selector_mode = "current"
         elif selector_mode == "current":
-            if instability >= 0.70:
+            if float(health["controller_stress"]) >= 0.55 or bool(health["runtime_bad"]):
                 recovery_enter_streak += 1
             else:
                 recovery_enter_streak = 0
-            if recovery_enter_streak >= 3:
+            if recovery_enter_streak >= 2:
                 selector_mode = "recovery"
-            elif handover_unready_streak >= 8:
+            elif handover_unready_streak >= 6:
                 selector_mode = "legacy"
         else:
-            if instability <= 0.35:
+            if float(health["controller_stress"]) <= 0.25 and (not bool(health["runtime_bad"])):
                 recovery_exit_streak += 1
             else:
                 recovery_exit_streak = 0
-            if recovery_exit_streak >= 8:
+            if recovery_exit_streak >= 3:
                 selector_mode = "current"
         if self._geo_current_release_ready():
             recovery_exit_streak += 1
@@ -1693,46 +1780,22 @@ class Aggregator(nn.Module):
             reserved_ratio_last = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else 0.0)
             plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
             reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
-        if feedback_fresh:
-            plain_ratio_prev = 0.7 * float(plain_ratio_last) + 0.3 * float(plain_ratio_ema)
-            reserved_ratio_prev = 0.7 * float(reserved_ratio_last) + 0.3 * float(reserved_ratio_ema)
-            plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_prev) / 0.08))
-            if keep_plain_patch_reserved_prev <= 0:
-                reserved_stress = 0.0
-            else:
-                reserved_stress = min(1.0, max(0.0, (0.06 - reserved_ratio_prev) / 0.06))
-        else:
-            plain_ratio_prev = float(plain_ratio_ema)
-            reserved_ratio_prev = float(reserved_ratio_ema)
-            plain_stress = 0.0
-            reserved_stress = 0.0
+        plain_ratio_prev = float(health["plain_ratio_recent"])
+        reserved_ratio_prev = float(health["reserved_ratio_recent"])
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
         visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
         stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_overlap", self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0))) if isinstance(self.geo_last_selector_diag, dict) else 0
 
         reserved_target = 0.06
-        visible_stress = min(1.0, max(0.0, (0.72 - stable_visible_ratio_prev) / 0.22))
-        observation_stress = max(plain_stress, reserved_stress, visible_stress)
+        observation_stress = float(health["controller_stress"])
 
         observation_collapse = bool(
-            stable_visible_ratio_prev < 0.60
-            or (
-                bool(feedback_fresh)
-                and (
-                    plain_ratio_prev < 0.10
-                    or reserved_ratio_prev < 0.03
-                )
-            )
+            float(health["plain_ratio_recent"]) < 0.10
+            or float(health["reserved_ratio_recent"]) < 0.03
+            or float(health["stable_visible_ratio"]) < 0.60
+            or float(health["overlap_health"]) < 0.35
         )
 
-        if int(frame_idx) < int(self.geo_reference_enable_after):
-            visible_count_collapse = bool(int(visible_total_prev) < 7200)
-            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.78)
-            stable_overlap_collapse = bool(int(stable_overlap_prev) < 384)
-        else:
-            visible_count_collapse = bool(int(visible_total_prev) < 6000)
-            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.70)
-            stable_overlap_collapse = bool(int(stable_overlap_prev) < 320)
         late_bootstrap = bool(int(frame_idx) >= int(self.geo_bootstrap_frames) + 64)
         legacy_break_gate_open = bool(
             reference_phase_open
@@ -1743,9 +1806,9 @@ class Aggregator(nn.Module):
             selector_mode == "legacy"
             and legacy_break_gate_open
             and (
-                visible_count_collapse
-                or visible_ratio_collapse
-                or stable_overlap_collapse
+                float(health["stable_visible_ratio"]) < 0.78
+                or float(health["overlap_health"]) < 0.55
+                or float(observation_stress) >= 0.35
             )
         )
 
@@ -1764,11 +1827,13 @@ class Aggregator(nn.Module):
                 self._geo_structure_ready()
                 or prestructure_reloc_ready
             )
+            and self.geo_selector_mode != "legacy"
         )
         reloc_signal = bool(
-            instability >= 0.50
+            float(health["controller_stress"]) >= 0.50
             or matched_ema < 0.08
-            or selector_ready_overlap < 320.0
+            or float(health["overlap_health"]) < 0.55
+            or float(health["stable_visible_ratio"]) < 0.70
             or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
         )
         ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
@@ -1809,8 +1874,8 @@ class Aggregator(nn.Module):
                 anchor_ready and (
                     instability >= 0.35
                     or observation_collapse
-                    or float(stable_visible_ratio_prev) < 0.72
-                    or int(stable_overlap_prev) < 320
+                    or float(health["stable_visible_ratio"]) < 0.72
+                    or float(health["overlap_health"]) < 0.65
                 )
             ),
             "anchor_phase_open": bool(anchor_phase_open),
@@ -1850,6 +1915,17 @@ class Aggregator(nn.Module):
             "frame_keep_capacity_last": int(feedback.get("frame_keep_capacity_last", 0) or 0),
             "plain_ratio_capacity_last": float(feedback.get("plain_ratio_capacity_last", 0.0) or 0.0),
             "reserved_ratio_capacity_last": float(feedback.get("reserved_ratio_capacity_last", 0.0) or 0.0),
+            "health_feedback_fresh": bool(health["feedback_fresh"]),
+            "health_selector_fresh": bool(health["selector_fresh"]),
+            "plain_ratio_recent": float(health["plain_ratio_recent"]),
+            "reserved_ratio_recent": float(health["reserved_ratio_recent"]),
+            "stable_visible_ratio": float(health["stable_visible_ratio"]),
+            "stable_overlap": float(health["stable_overlap"]),
+            "overlap_ref": float(health["overlap_ref"]),
+            "overlap_health": float(health["overlap_health"]),
+            "controller_stress": float(health["controller_stress"]),
+            "handover_ok": bool(health["handover_ok"]),
+            "runtime_bad_runtime_norm": bool(health["runtime_bad"]),
         }
         plain_ratio_actual_now = float(plain_patch_final_prev) / float(max(1, int(prev_budget))) if int(prev_budget) > 0 else 0.0
         if bool(feedback_fresh) and int(prev_budget) > 0 and int(plain_patch_final_prev) > 0 and float(plain_ratio_prev) < 0.08 and plain_ratio_actual_now > 0.20:
@@ -2689,19 +2765,14 @@ class Aggregator(nn.Module):
         runtime_map_ready = bool(self._update_geo_runtime_ready(frame_idx) if runtime_map_ready is None else runtime_map_ready)
         structure_ready = self._geo_structure_ready()
         prestructure_ref_ready = self._geo_prestructure_reference_ready()
-        selector_diag = self._geo_get_last_selector_diag() or {}
-        stable_vis_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
-        stable_overlap = int(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0)))
-        visible_total = int(selector_diag.get("visible_total", 0))
+        health = self._geo_compute_controller_health(
+            frame_idx=int(frame_idx),
+            matched_ema=float(matched_ratio),
+        )
         prestructure_bad_runtime = bool(
             int(frame_idx) >= int(self.geo_bootstrap_frames) + 32
             and prestructure_ref_ready
-            and (
-                stable_vis_ratio < 0.70
-                or stable_overlap < 320
-                or visible_total < 6000
-                or float(matched_ratio) < 0.10
-            )
+            and bool(health["runtime_bad"])
         )
 
         if str(self.geo_reloc_state) != "off":
@@ -2727,15 +2798,13 @@ class Aggregator(nn.Module):
             return
 
         if runtime_map_ready:
-            bad_runtime = (
+            bad_runtime = bool(
                 float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
                 or float(matched_ratio) < 0.05
-                or stable_vis_ratio < 0.70
-                or stable_overlap < 320
-                or visible_total < 6000
+                or bool(health["runtime_bad"])
                 or (
                     len(self.geo_reference_bank) >= 16
-                    and int(ref_overlap) < max(4, int(self.geo_reference_min_overlap // 2))
+                    and int(ref_overlap) < max(4, int(0.35 * float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)))
                 )
             )
         else:
@@ -2743,6 +2812,19 @@ class Aggregator(nn.Module):
 
         if policy is not None:
             policy["diag_bad_runtime"] = bool(bad_runtime)
+            policy["runtime_overlap_health"] = float(health["overlap_health"])
+            policy["runtime_bad_runtime_norm"] = bool(health["runtime_bad"])
+            policy["health_feedback_fresh"] = bool(health["feedback_fresh"])
+            policy["health_selector_fresh"] = bool(health["selector_fresh"])
+            policy["plain_ratio_recent"] = float(health["plain_ratio_recent"])
+            policy["reserved_ratio_recent"] = float(health["reserved_ratio_recent"])
+            policy["stable_visible_ratio"] = float(health["stable_visible_ratio"])
+            policy["stable_overlap"] = float(health["stable_overlap"])
+            policy["overlap_ref"] = float(health["overlap_ref"])
+            policy["controller_stress"] = float(health["controller_stress"])
+            policy["handover_ok"] = bool(health["handover_ok"])
+        self.geo_last_policy_inputs["runtime_overlap_health"] = float(health["overlap_health"])
+        self.geo_last_policy_inputs["runtime_bad_runtime_norm"] = bool(health["runtime_bad"])
 
         can_start_new_reloc = bool(structure_ready or self._geo_prestructure_reloc_ready())
         if bool(allow_reloc_trigger) and can_start_new_reloc and bad_runtime and str(self.geo_reloc_state) == "off":
@@ -2771,7 +2853,7 @@ class Aggregator(nn.Module):
             self.geo_current_release_streak = int(self.geo_current_release_streak) + 1
         else:
             self.geo_current_release_streak = 0
-        if int(self.geo_current_release_streak) >= 3:
+        if int(self.geo_current_release_streak) >= 2:
             self.geo_reloc_state = "off"
             self.geo_reloc_frames_left = 0
             self.geo_reloc_hard_left = 0
@@ -6151,16 +6233,14 @@ class Aggregator(nn.Module):
         )
 
     def _geo_prestructure_reloc_ready(self) -> bool:
-        recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         return bool(
             self._geo_prestructure_handover_ready()
+            and self.geo_selector_mode in {"current", "recovery"}
             and len(self.geo_reference_bank) >= 64
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 12.0
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.20
-            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.08
-            and recent_plain_floor_kept_final >= 128
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.75
-            and int(self.geo_last_policy_frame) >= int(self.geo_reference_enable_after) + 16
+            and bool(health["handover_ok"])
+            and float(health["overlap_health"]) >= 0.75
         )
 
     def _geo_feedback_fresh(self, frame_idx: int) -> bool:
@@ -6182,14 +6262,9 @@ class Aggregator(nn.Module):
         )
 
     def _geo_reloc_release_ready(self) -> bool:
-        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(self.geo_last_policy_frame), max_age=2)
-        if not feedback_fresh:
-            return False
         if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
             return False
-        plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
-        reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
-        recent_plain_floor_kept_final = int(feedback.get("recent_plain_floor_kept_final", 0) or 0)
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -6199,25 +6274,18 @@ class Aggregator(nn.Module):
             self._geo_structure_ready()
             and len(self.geo_reference_bank) >= 32
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.55
             and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.15
-            and plain_ratio_last >= 0.14
-            and reserved_ratio_last >= 0.06
-            and recent_plain_floor_kept_final >= 128
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.16
-            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.06
             and selector_diag_fresh
+            and float(health["plain_ratio_recent"]) >= 0.14
+            and float(health["reserved_ratio_recent"]) >= 0.06
+            and float(health["stable_visible_ratio"]) >= 0.70
+            and float(health["overlap_health"]) >= 0.65
         )
 
     def _geo_current_release_ready(self) -> bool:
-        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(self.geo_last_policy_frame), max_age=2)
-        if not feedback_fresh:
-            return False
         if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
             return False
-        plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
-        reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
-        recent_plain_floor_kept_final = int(feedback.get("recent_plain_floor_kept_final", 0) or 0)
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -6227,14 +6295,12 @@ class Aggregator(nn.Module):
             self._geo_structure_ready()
             and len(self.geo_reference_bank) >= 128
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 20.0
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.78
             and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.18
-            and plain_ratio_last >= 0.16
-            and reserved_ratio_last >= 0.07
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.16
-            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.07
-            and recent_plain_floor_kept_final >= 128
             and selector_diag_fresh
+            and float(health["plain_ratio_recent"]) >= 0.16
+            and float(health["reserved_ratio_recent"]) >= 0.07
+            and float(health["stable_visible_ratio"]) >= 0.74
+            and float(health["overlap_health"]) >= 0.75
         )
 
     def _geo_bootstrap_bank_ready(self, frame_idx: int) -> bool:
