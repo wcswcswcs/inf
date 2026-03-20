@@ -379,6 +379,7 @@ class Aggregator(nn.Module):
         self.geo_bootstrap_ref_overlap_thr = 128.0
         self.geo_bootstrap_visible_ratio_thr = 0.50
         self.geo_bootstrap_ready_streak = 8
+        self.geo_last_keep_feedback: Dict[str, Any] = {}
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -459,6 +460,7 @@ class Aggregator(nn.Module):
         self.geo_last_committed_policy: Optional[Dict[str, Any]] = None
         self.geo_last_policy_frame: int = -1
         self.geo_last_policy_inputs: Dict[str, Any] = {}
+        self.geo_last_keep_feedback: Dict[str, Any] = {}
         self.geo_last_policy_metrics: Dict[str, float] = {}
         self.geo_last_commit_guard_frame: int = -1
         self.geo_last_debug_log_frame = -1
@@ -570,6 +572,7 @@ class Aggregator(nn.Module):
             "geo_last_committed_policy": copy.deepcopy(self.geo_last_committed_policy),
             "geo_last_policy_frame": int(self.geo_last_policy_frame),
             "geo_last_policy_inputs": copy.deepcopy(self.geo_last_policy_inputs),
+            "geo_last_keep_feedback": copy.deepcopy(self.geo_last_keep_feedback),
             "geo_last_policy_metrics": copy.deepcopy(self.geo_last_policy_metrics),
             "geo_last_commit_guard_frame": int(self.geo_last_commit_guard_frame),
             "last_scores": self.last_scores.detach().cpu().clone(),
@@ -686,6 +689,7 @@ class Aggregator(nn.Module):
         self.geo_last_committed_policy = copy.deepcopy(state.get("geo_last_committed_policy", None))
         self.geo_last_policy_frame = int(state.get("geo_last_policy_frame", -1))
         self.geo_last_policy_inputs = copy.deepcopy(state.get("geo_last_policy_inputs", {}))
+        self.geo_last_keep_feedback = copy.deepcopy(state.get("geo_last_keep_feedback", {}))
         self.geo_last_policy_metrics = copy.deepcopy(state.get("geo_last_policy_metrics", {}))
         self.geo_last_commit_guard_frame = int(state.get("geo_last_commit_guard_frame", -1))
         scores_state = state.get("last_scores", None)
@@ -1412,6 +1416,19 @@ class Aggregator(nn.Module):
         diag = copy.deepcopy(self.geo_last_selector_diag)
         return None if int(diag.get("frame_idx", -1)) < 0 else diag
 
+    def _geo_get_last_keep_feedback(self, frame_idx: int, max_age: int = 2) -> Tuple[Dict[str, Any], bool]:
+        fb = copy.deepcopy(getattr(self, "geo_last_keep_feedback", {}) or {})
+        if not fb:
+            return {}, False
+        fb_frame = int(fb.get("frame_idx", -1))
+        budget = fb.get("frame_keep_budget_last", None)
+        plain_last = fb.get("frame_keep_plain_patch_final_last", None)
+        reserved_last = fb.get("frame_keep_plain_patch_reserved_last", None)
+        if budget is None or plain_last is None or reserved_last is None:
+            return fb, False
+        fresh = bool(fb_frame >= int(frame_idx) - int(max_age))
+        return fb, fresh
+
     def _geo_collect_policy_signals(
         self,
         *,
@@ -1659,49 +1676,53 @@ class Aggregator(nn.Module):
             if recovery_exit_streak >= 3:
                 selector_mode = "current"
 
-        prev_budget = max(
-            1,
-            int(
-                self.geo_last_policy_inputs.get(
-                    "frame_keep_budget_last",
-                    self.geo_last_policy_inputs.get("final_ref_budget", 1),
-                ) or 1
-            ),
-        )
-        plain_patch_final_prev = int(
-            self.geo_last_policy_inputs.get(
-                "frame_keep_plain_patch_final_last",
-                self.geo_last_policy_inputs.get("keep_plain_patch_final", 0),
-            ) or 0
-        )
-        keep_plain_patch_reserved_prev = int(
-            self.geo_last_policy_inputs.get(
-                "frame_keep_plain_patch_reserved_last",
-                self.geo_last_policy_inputs.get("keep_plain_patch_reserved", 0),
-            ) or 0
-        )
-        plain_ratio_last = float(plain_patch_final_prev) / float(prev_budget)
-        reserved_ratio_last = float(keep_plain_patch_reserved_prev) / float(prev_budget)
-        plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
-        reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
-        plain_ratio_prev = 0.7 * float(plain_ratio_last) + 0.3 * float(plain_ratio_ema)
-        reserved_ratio_prev = 0.7 * float(reserved_ratio_last) + 0.3 * float(reserved_ratio_ema)
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        if feedback_fresh:
+            prev_budget = max(1, int(feedback.get("frame_keep_budget_last", 1) or 1))
+            plain_patch_final_prev = int(feedback.get("frame_keep_plain_patch_final_last", 0) or 0)
+            keep_plain_patch_reserved_prev = int(feedback.get("frame_keep_plain_patch_reserved_last", 0) or 0)
+            plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+            reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+            plain_ratio_ema = float(feedback.get("geo_plain_ratio_ema", plain_ratio_last) or plain_ratio_last)
+            reserved_ratio_ema = float(feedback.get("geo_reserved_ratio_ema", reserved_ratio_last) or reserved_ratio_last)
+        else:
+            prev_budget = 0
+            plain_patch_final_prev = 0
+            keep_plain_patch_reserved_prev = 0
+            plain_ratio_last = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else 1.0)
+            reserved_ratio_last = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else 0.0)
+            plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
+            reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
+        if feedback_fresh:
+            plain_ratio_prev = 0.7 * float(plain_ratio_last) + 0.3 * float(plain_ratio_ema)
+            reserved_ratio_prev = 0.7 * float(reserved_ratio_last) + 0.3 * float(reserved_ratio_ema)
+            plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_prev) / 0.08))
+            if keep_plain_patch_reserved_prev <= 0:
+                reserved_stress = 0.0
+            else:
+                reserved_stress = min(1.0, max(0.0, (0.06 - reserved_ratio_prev) / 0.06))
+        else:
+            plain_ratio_prev = float(plain_ratio_ema)
+            reserved_ratio_prev = float(reserved_ratio_ema)
+            plain_stress = 0.0
+            reserved_stress = 0.0
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
         visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
         stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_overlap", self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0))) if isinstance(self.geo_last_selector_diag, dict) else 0
 
-        plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_prev) / 0.08))
-        if keep_plain_patch_reserved_prev <= 0:
-            reserved_stress = 0.0
-        else:
-            reserved_stress = min(1.0, max(0.0, (0.06 - reserved_ratio_prev) / 0.06))
+        reserved_target = 0.06
         visible_stress = min(1.0, max(0.0, (0.72 - stable_visible_ratio_prev) / 0.22))
         observation_stress = max(plain_stress, reserved_stress, visible_stress)
 
         observation_collapse = bool(
-            plain_ratio_prev < 0.10
-            or reserved_ratio_prev < 0.03
-            or stable_visible_ratio_prev < 0.60
+            stable_visible_ratio_prev < 0.60
+            or (
+                bool(feedback_fresh)
+                and (
+                    plain_ratio_prev < 0.10
+                    or reserved_ratio_prev < 0.03
+                )
+            )
         )
 
         if int(frame_idx) < int(self.geo_reference_enable_after):
@@ -1823,7 +1844,19 @@ class Aggregator(nn.Module):
             "selector_overlap_threshold": float(320.0),
             "selector_visible_threshold": float(0.72),
             "prev_budget": int(prev_budget),
+            "feedback_fresh": bool(feedback_fresh),
+            "feedback_prev_budget": int(prev_budget),
+            "frame_keep_budget_last": int(feedback.get("frame_keep_budget_last", 0) or 0),
+            "frame_keep_capacity_last": int(feedback.get("frame_keep_capacity_last", 0) or 0),
+            "plain_ratio_capacity_last": float(feedback.get("plain_ratio_capacity_last", 0.0) or 0.0),
+            "reserved_ratio_capacity_last": float(feedback.get("reserved_ratio_capacity_last", 0.0) or 0.0),
         }
+        plain_ratio_actual_now = float(plain_patch_final_prev) / float(max(1, int(prev_budget))) if int(prev_budget) > 0 else 0.0
+        if bool(feedback_fresh) and int(prev_budget) > 0 and int(plain_patch_final_prev) > 0 and float(plain_ratio_prev) < 0.08 and plain_ratio_actual_now > 0.20:
+            policy["feedback_ratio_mismatch"] = True
+        reserved_ratio_actual_now = float(keep_plain_patch_reserved_prev) / float(max(1, int(prev_budget))) if int(prev_budget) > 0 else 0.0
+        if bool(feedback_fresh) and int(prev_budget) > 0 and int(keep_plain_patch_reserved_prev) > 0 and float(reserved_ratio_prev) < 0.04 and reserved_ratio_actual_now > 0.15:
+            policy["feedback_ratio_mismatch"] = True
         if legacy_observation_break:
             policy["legacy_break_force_recent_plain"] = True
             policy["legacy_break_anchor_scale"] = 0.90 if (early_assist_active and int(frame_idx) < int(self.geo_reference_enable_after)) else 0.20
@@ -1938,6 +1971,8 @@ class Aggregator(nn.Module):
 
         self.geo_last_committed_policy = copy.deepcopy(policy)
         self.geo_last_policy_frame = int(frame_idx)
+        # NOTE: geo_last_policy_inputs is a preview/commit snapshot for debug and policy introspection.
+        # Finalized keep feedback used by controller logic is stored separately in geo_last_keep_feedback.
         self.geo_last_policy_inputs = {
             "frame_idx": int(frame_idx),
             "total_tokens": int(total_tokens),
@@ -1954,6 +1989,14 @@ class Aggregator(nn.Module):
             "reserved_target_effective": float(policy.get("reserved_target_effective", 0.06)),
             "stable_visible_ratio_prev": float(policy.get("stable_visible_ratio_prev", 1.0)),
             "prev_budget": int(policy.get("prev_budget", 0) or 0),
+            "feedback_fresh": bool(policy.get("feedback_fresh", False)),
+            "feedback_prev_budget": int(policy.get("feedback_prev_budget", 0) or 0),
+            "frame_keep_budget_last": int(policy.get("frame_keep_budget_last", 0) or 0),
+            "frame_keep_capacity_last": int(policy.get("frame_keep_capacity_last", 0) or 0),
+            "plain_ratio_last": float(policy.get("plain_ratio_last", 0.0) or 0.0),
+            "reserved_ratio_last": float(policy.get("reserved_ratio_last", 0.0) or 0.0),
+            "plain_ratio_capacity_last": float(policy.get("plain_ratio_capacity_last", 0.0) or 0.0),
+            "reserved_ratio_capacity_last": float(policy.get("reserved_ratio_capacity_last", 0.0) or 0.0),
             "frame0_hard_scale": float(policy.get("frame0_hard_scale", 1.0)),
             "reference_hard_scale": float(policy.get("reference_hard_scale", 1.0)),
         }
@@ -5887,6 +5930,27 @@ class Aggregator(nn.Module):
                 hard_keep_continuity=float(hard_keep_continuity),
                 frame0_pin_ratio=float(min(1.0, max(0.0, frame0_pin_ratio))),
             )
+        selector_diag_frame = int(self.geo_last_selector_diag.get("frame_idx", -1)) if isinstance(self.geo_last_selector_diag, dict) else -1
+        self.geo_last_keep_feedback = {
+            "frame_idx": int(current_frame_idx),
+            "frame_keep_budget_last": int(controller_budget),
+            "frame_keep_capacity_last": int(capacity_budget),
+            "frame_keep_plain_patch_final_last": int(plain_keep_final),
+            "frame_keep_plain_patch_reserved_last": int(keep_plain_reserved_final),
+            "plain_ratio_last": float(plain_ratio_last),
+            "reserved_ratio_last": float(reserved_ratio_last),
+            "plain_ratio_capacity_last": float(plain_ratio_capacity_last),
+            "reserved_ratio_capacity_last": float(reserved_ratio_capacity_last),
+            "geo_plain_ratio_ema": float(self.geo_plain_ratio_ema),
+            "geo_reserved_ratio_ema": float(self.geo_reserved_ratio_ema),
+            "recent_plain_floor_kept_final": int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0),
+            "keep_plain_patch_final": int(plain_keep_final),
+            "keep_plain_patch_reserved": int(keep_plain_reserved_final),
+            "selector_diag_frame": int(selector_diag_frame),
+            "reloc_feedback_updated": bool(self.geo_last_policy_inputs.get("reloc_feedback_updated", False)),
+            "feedback_source": "finalize_keep",
+            "feedback_fresh": bool(True),
+        }
         self._queue_geo_console_log(
             current_frame_idx=current_frame_idx,
             total_tokens=total_tokens,
@@ -6100,13 +6164,16 @@ class Aggregator(nn.Module):
         )
 
     def _geo_feedback_fresh(self, frame_idx: int) -> bool:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        if not feedback_fresh:
+            return False
         diag = self._geo_get_last_selector_diag()
         if diag is None:
             return False
         diag_frame = int(diag.get("frame_idx", -1))
-        keep_budget_last = self.geo_last_policy_inputs.get("frame_keep_budget_last", None)
-        plain_last = self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", None)
-        reloc_feedback_updated = bool(self.geo_last_policy_inputs.get("reloc_feedback_updated", False))
+        keep_budget_last = feedback.get("frame_keep_budget_last", None)
+        plain_last = feedback.get("frame_keep_plain_patch_final_last", None)
+        reloc_feedback_updated = bool(feedback.get("reloc_feedback_updated", False))
         return bool(
             diag_frame >= int(frame_idx) - 1
             and keep_budget_last is not None
@@ -6115,14 +6182,14 @@ class Aggregator(nn.Module):
         )
 
     def _geo_reloc_release_ready(self) -> bool:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(self.geo_last_policy_frame), max_age=2)
+        if not feedback_fresh:
+            return False
         if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
             return False
-        last_budget = int(self.geo_last_policy_inputs.get("frame_keep_budget_last", 0) or 0)
-        plain_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", 0) or 0)
-        reserved_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_last", 0) or 0)
-        recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
-        plain_ratio_last = float(plain_last) / float(max(1, last_budget))
-        reserved_ratio_last = float(reserved_last) / float(max(1, last_budget))
+        plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+        reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+        recent_plain_floor_kept_final = int(feedback.get("recent_plain_floor_kept_final", 0) or 0)
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -6143,14 +6210,14 @@ class Aggregator(nn.Module):
         )
 
     def _geo_current_release_ready(self) -> bool:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(self.geo_last_policy_frame), max_age=2)
+        if not feedback_fresh:
+            return False
         if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
             return False
-        last_budget = int(self.geo_last_policy_inputs.get("frame_keep_budget_last", 0) or 0)
-        plain_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", 0) or 0)
-        reserved_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_last", 0) or 0)
-        recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
-        plain_ratio_last = float(plain_last) / float(max(1, last_budget))
-        reserved_ratio_last = float(reserved_last) / float(max(1, last_budget))
+        plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+        reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+        recent_plain_floor_kept_final = int(feedback.get("recent_plain_floor_kept_final", 0) or 0)
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
