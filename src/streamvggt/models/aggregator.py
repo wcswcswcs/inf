@@ -1684,24 +1684,23 @@ class Aggregator(nn.Module):
         reserved_ratio_last = float(keep_plain_patch_reserved_prev) / float(prev_budget)
         plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
         reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
-        plain_ratio_prev = 0.6 * float(plain_ratio_last) + 0.4 * float(plain_ratio_ema)
-        reserved_ratio_prev = 0.6 * float(reserved_ratio_last) + 0.4 * float(reserved_ratio_ema)
+        plain_ratio_prev = 0.7 * float(plain_ratio_last) + 0.3 * float(plain_ratio_ema)
+        reserved_ratio_prev = 0.7 * float(reserved_ratio_last) + 0.3 * float(reserved_ratio_ema)
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
         visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
         stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_overlap", self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0))) if isinstance(self.geo_last_selector_diag, dict) else 0
 
-        plain_stress = min(1.0, max(0.0, (0.32 - plain_ratio_prev) / 0.14))
-        reserved_target = 0.05
+        plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_prev) / 0.08))
         if keep_plain_patch_reserved_prev <= 0:
             reserved_stress = 0.0
         else:
-            reserved_stress = min(1.0, max(0.0, (reserved_target - reserved_ratio_prev) / reserved_target))
-        visible_stress = min(1.0, max(0.0, (0.75 - stable_visible_ratio_prev) / 0.25))
+            reserved_stress = min(1.0, max(0.0, (0.06 - reserved_ratio_prev) / 0.06))
+        visible_stress = min(1.0, max(0.0, (0.72 - stable_visible_ratio_prev) / 0.22))
         observation_stress = max(plain_stress, reserved_stress, visible_stress)
 
         observation_collapse = bool(
-            plain_ratio_prev < 0.30
-            or reserved_ratio_prev < 0.02
+            plain_ratio_prev < 0.10
+            or reserved_ratio_prev < 0.03
             or stable_visible_ratio_prev < 0.60
         )
 
@@ -5811,12 +5810,17 @@ class Aggregator(nn.Module):
         anchor_count_final = int((keep_role == 3).sum().item())
         plain_keep_final = int((keep_role == 0).sum().item())
         self.geo_last_policy_inputs["keep_plain_patch_final"] = int(plain_keep_final)
-        layer_keep_budget = int(max_past_tokens) if max_past_tokens is not None else int(keep.numel())
+        keep_size = int(keep.numel())
+        capacity_budget = int(max_past_tokens) if max_past_tokens is not None else int(keep.numel())
+        controller_budget = int(keep_size)
         self.geo_last_policy_inputs["frame_keep_plain_patch_final_last"] = int(plain_keep_final)
         self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_last"] = int(keep_plain_reserved_final)
-        self.geo_last_policy_inputs["frame_keep_budget_last"] = int(layer_keep_budget)
-        plain_ratio_last = float(plain_keep_final) / float(max(1, int(layer_keep_budget)))
-        reserved_ratio_last = float(keep_plain_reserved_final) / float(max(1, int(layer_keep_budget)))
+        self.geo_last_policy_inputs["frame_keep_budget_last"] = int(controller_budget)
+        self.geo_last_policy_inputs["frame_keep_capacity_last"] = int(capacity_budget)
+        plain_ratio_last = float(plain_keep_final) / float(max(1, int(controller_budget)))
+        reserved_ratio_last = float(keep_plain_reserved_final) / float(max(1, int(controller_budget)))
+        plain_ratio_capacity_last = float(plain_keep_final) / float(max(1, int(capacity_budget)))
+        reserved_ratio_capacity_last = float(keep_plain_reserved_final) / float(max(1, int(capacity_budget)))
         alpha = 0.20
         if self.geo_plain_ratio_ema is None:
             self.geo_plain_ratio_ema = float(plain_ratio_last)
@@ -5828,27 +5832,38 @@ class Aggregator(nn.Module):
             self.geo_reserved_ratio_ema = float((1.0 - alpha) * float(self.geo_reserved_ratio_ema) + alpha * float(reserved_ratio_last))
         self.geo_last_policy_inputs["plain_ratio_last"] = float(plain_ratio_last)
         self.geo_last_policy_inputs["reserved_ratio_last"] = float(reserved_ratio_last)
+        self.geo_last_policy_inputs["plain_ratio_capacity_last"] = float(plain_ratio_capacity_last)
+        self.geo_last_policy_inputs["reserved_ratio_capacity_last"] = float(reserved_ratio_capacity_last)
         self.geo_last_policy_inputs["geo_plain_ratio_ema"] = float(self.geo_plain_ratio_ema)
         self.geo_last_policy_inputs["geo_reserved_ratio_ema"] = float(self.geo_reserved_ratio_ema)
         # *_min fields are diagnostics of worst historical keep quality; controller uses *_last + EMA.
         prev_min_plain = self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_min", None)
         prev_min_reserved = self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_min", None)
         prev_min_budget = self.geo_last_policy_inputs.get("frame_keep_budget_min", None)
+        prev_min_capacity = self.geo_last_policy_inputs.get("frame_keep_capacity_min", None)
+        prev_min_plain_capacity_ratio = self.geo_last_policy_inputs.get("plain_ratio_capacity_min", None)
+        prev_min_reserved_capacity_ratio = self.geo_last_policy_inputs.get("reserved_ratio_capacity_min", None)
         if prev_min_plain is None or prev_min_reserved is None or prev_min_budget is None:
             self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = int(plain_keep_final)
             self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = int(keep_plain_reserved_final)
-            self.geo_last_policy_inputs["frame_keep_budget_min"] = int(layer_keep_budget)
+            self.geo_last_policy_inputs["frame_keep_budget_min"] = int(controller_budget)
         else:
             old_plain_ratio = float(prev_min_plain) / float(max(1, int(prev_min_budget)))
-            new_plain_ratio = float(plain_keep_final) / float(max(1, int(layer_keep_budget)))
+            new_plain_ratio = float(plain_keep_final) / float(max(1, int(controller_budget)))
             old_reserved_ratio = float(prev_min_reserved) / float(max(1, int(prev_min_budget)))
-            new_reserved_ratio = float(keep_plain_reserved_final) / float(max(1, int(layer_keep_budget)))
+            new_reserved_ratio = float(keep_plain_reserved_final) / float(max(1, int(controller_budget)))
             old_score = min(old_plain_ratio, old_reserved_ratio)
             new_score = min(new_plain_ratio, new_reserved_ratio)
             if new_score < old_score:
                 self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = int(plain_keep_final)
                 self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = int(keep_plain_reserved_final)
-                self.geo_last_policy_inputs["frame_keep_budget_min"] = int(layer_keep_budget)
+                self.geo_last_policy_inputs["frame_keep_budget_min"] = int(controller_budget)
+        if prev_min_capacity is None or int(capacity_budget) < int(prev_min_capacity):
+            self.geo_last_policy_inputs["frame_keep_capacity_min"] = int(capacity_budget)
+        if prev_min_plain_capacity_ratio is None or plain_ratio_capacity_last < float(prev_min_plain_capacity_ratio):
+            self.geo_last_policy_inputs["plain_ratio_capacity_min"] = float(plain_ratio_capacity_last)
+        if prev_min_reserved_capacity_ratio is None or reserved_ratio_capacity_last < float(prev_min_reserved_capacity_ratio):
+            self.geo_last_policy_inputs["reserved_ratio_capacity_min"] = float(reserved_ratio_capacity_last)
 
         prev_cache_identity = self.geo_cached_landmark_identity_keep.detach().cpu().clone()
         overlap = self._count_keep_cache_overlap_identity(meta, keep, prev_cache_identity)
@@ -5892,6 +5907,16 @@ class Aggregator(nn.Module):
             budget=int(max_past_tokens or 0),
             kv_comp_old=kv_old,
             kv_comp_keep=kv_keep,
+        )
+        logger.debug(
+            "[geo_keep_ratio] frame=%d keep_size=%d capacity=%d plain_actual=%.4f reserved_actual=%.4f plain_capacity=%.4f reserved_capacity=%.4f",
+            int(current_frame_idx),
+            int(controller_budget),
+            int(capacity_budget),
+            float(plain_ratio_last),
+            float(reserved_ratio_last),
+            float(plain_ratio_capacity_last),
+            float(reserved_ratio_capacity_last),
         )
         return keep
 
@@ -6062,10 +6087,16 @@ class Aggregator(nn.Module):
         )
 
     def _geo_prestructure_reloc_ready(self) -> bool:
+        recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
         return bool(
             self._geo_prestructure_handover_ready()
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.18
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.72
+            and len(self.geo_reference_bank) >= 64
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 12.0
+            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.20
+            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.08
+            and recent_plain_floor_kept_final >= 128
+            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.75
+            and int(self.geo_last_policy_frame) >= int(self.geo_reference_enable_after) + 16
         )
 
     def _geo_feedback_fresh(self, frame_idx: int) -> bool:
@@ -6088,8 +6119,10 @@ class Aggregator(nn.Module):
             return False
         last_budget = int(self.geo_last_policy_inputs.get("frame_keep_budget_last", 0) or 0)
         plain_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", 0) or 0)
+        reserved_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_last", 0) or 0)
         recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
         plain_ratio_last = float(plain_last) / float(max(1, last_budget))
+        reserved_ratio_last = float(reserved_last) / float(max(1, last_budget))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -6101,16 +6134,23 @@ class Aggregator(nn.Module):
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
             and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.55
             and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.15
-            and plain_ratio_last >= 0.18
-            and recent_plain_floor_kept_final > 0
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.18
+            and plain_ratio_last >= 0.14
+            and reserved_ratio_last >= 0.06
+            and recent_plain_floor_kept_final >= 128
+            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.16
+            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.06
             and selector_diag_fresh
         )
 
     def _geo_current_release_ready(self) -> bool:
         if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
             return False
+        last_budget = int(self.geo_last_policy_inputs.get("frame_keep_budget_last", 0) or 0)
+        plain_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", 0) or 0)
+        reserved_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_last", 0) or 0)
         recent_plain_floor_kept_final = int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0)
+        plain_ratio_last = float(plain_last) / float(max(1, last_budget))
+        reserved_ratio_last = float(reserved_last) / float(max(1, last_budget))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -6120,10 +6160,13 @@ class Aggregator(nn.Module):
             self._geo_structure_ready()
             and len(self.geo_reference_bank) >= 128
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 20.0
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.80
-            and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.20
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.22
-            and recent_plain_floor_kept_final > 0
+            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.78
+            and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.18
+            and plain_ratio_last >= 0.16
+            and reserved_ratio_last >= 0.07
+            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.16
+            and float(getattr(self, "geo_reserved_ratio_ema", 0.0) or 0.0) >= 0.07
+            and recent_plain_floor_kept_final >= 128
             and selector_diag_fresh
         )
 
