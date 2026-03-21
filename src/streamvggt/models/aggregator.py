@@ -966,7 +966,8 @@ class Aggregator(nn.Module):
     def _maybe_freeze_reference_bank(self, frame_idx: int) -> None:
         health_now = self._geo_compute_controller_health(frame_idx=int(frame_idx))
         base_freeze_ready = bool(
-            self._geo_structure_ready()
+            (not self.geo_frozen_reference_ready)
+            and self._geo_structure_ready()
             and str(self.geo_selector_mode) == "current"
             and self._geo_current_release_ready()
             and self._geo_feedback_fresh(int(frame_idx))

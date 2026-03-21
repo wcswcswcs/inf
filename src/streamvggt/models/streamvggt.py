@@ -359,7 +359,6 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
                 prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
                 health = self.aggregator._geo_compute_controller_health(frame_idx=int(frame_idx_abs))
-                policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
                 selector_fallback_ready = bool(
                     self.aggregator._geo_structure_ready()
                     or self.aggregator._geo_prestructure_reference_ready()
@@ -390,8 +389,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                 )
                 if (
-                    (not force_current_selector)
-                    or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
+                    ((not force_current_selector) or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold)
                     and selector_fallback_ready
                     and allow_last_reliable
                 ):
