@@ -367,9 +367,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 soft_current_ready = bool(self.aggregator._geo_soft_current_ready(int(frame_idx_abs)))
                 healthy_selector = bool(
                     health["selector_fresh"]
-                    and float(health["stable_visible_ratio"]) >= 0.74
-                    and float(health["overlap_health"]) >= 0.75
+                    and float(health["controller_stress"]) <= 0.20
                     and (not bool(health["runtime_bad"]))
+                    and (not bool(health["external_drift_bad"]))
                 )
                 force_current_selector = bool(
                     self.aggregator._geo_structure_ready()
@@ -384,8 +384,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     and (
                     bool(health["runtime_bad"])
                     or float(health["controller_stress"]) >= 0.45
-                    or float(health["stable_visible_ratio"]) < 0.72
-                    or float(health["overlap_health"]) < 0.60
+                    or bool(health["external_drift_bad"])
                     )
                 )
                 if (
