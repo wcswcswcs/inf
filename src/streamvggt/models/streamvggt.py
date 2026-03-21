@@ -358,40 +358,40 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
                 prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
-                selector_diag = getattr(self.aggregator, "geo_last_selector_diag", None) or {}
-                stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
-                stable_visible_overlap = int(
-                    selector_diag.get(
-                        "stable_visible_overlap",
-                        selector_diag.get("stable_visible_voxel_overlap", 0),
-                    )
-                )
+                health = self.aggregator._geo_compute_controller_health(frame_idx=int(frame_idx_abs))
                 policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
                 selector_fallback_ready = bool(
                     self.aggregator._geo_structure_ready()
                     or self.aggregator._geo_prestructure_reference_ready()
                 )
-                reloc_release_ready = bool(self.aggregator._geo_reloc_release_ready())
+                current_release_ready = bool(self.aggregator._geo_current_release_ready())
                 soft_current_ready = bool(self.aggregator._geo_soft_current_ready(int(frame_idx_abs)))
-                healthy_visibility = bool(stable_visible_ratio >= 0.72 and stable_visible_overlap >= 320)
+                healthy_selector = bool(
+                    health["selector_fresh"]
+                    and float(health["stable_visible_ratio"]) >= 0.74
+                    and float(health["overlap_health"]) >= 0.75
+                    and (not bool(health["runtime_bad"]))
+                )
                 force_current_selector = bool(
                     self.aggregator._geo_structure_ready()
-                    and reloc_release_ready
+                    and current_release_ready
                     and soft_current_ready
-                    and healthy_visibility
+                    and healthy_selector
                 )
                 self.aggregator.geo_last_policy_inputs["current_release_ready"] = bool(force_current_selector)
                 allow_last_reliable = bool(
-                    policy_runtime_bad
-                    or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
-                    or stable_visible_ratio < 0.72
-                    or stable_visible_overlap < 320
+                    prefer_last_reliable_view
+                    and last_reliable_view is not None
+                    and (
+                    bool(health["runtime_bad"])
+                    or float(health["controller_stress"]) >= 0.45
+                    or float(health["stable_visible_ratio"]) < 0.72
+                    or float(health["overlap_health"]) < 0.60
+                    )
                 )
                 if (
                     (not force_current_selector)
-                    and
-                    prefer_last_reliable_view
-                    and last_reliable_view is not None
+                    or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
                     and selector_fallback_ready
                     and allow_last_reliable
                 ):
