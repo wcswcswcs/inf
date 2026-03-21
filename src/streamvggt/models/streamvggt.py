@@ -359,6 +359,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
                 prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
                 health = self.aggregator._geo_compute_controller_health(frame_idx=int(frame_idx_abs))
+                self.aggregator.geo_last_policy_inputs["inference_selector_health_unknown"] = bool(health.get("selector_health_unknown", False))
                 selector_fallback_ready = bool(
                     self.aggregator._geo_structure_ready()
                     or self.aggregator._geo_prestructure_reference_ready()

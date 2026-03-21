@@ -1560,10 +1560,11 @@ class Aggregator(nn.Module):
                 if selector_visible_ratio_ema is not None
                 else getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0
             )
-            stable_overlap = float(max(selector_overlap_ref, ref_overlap_ref, 0.0))
+            stable_overlap = float(selector_overlap_ref if selector_overlap_ref > 0.0 else ref_overlap_ref)
             stable_selected_visible = 0.0
             stable_selected_invisible = 0.0
             visible_total = 0.0
+        selector_health_unknown = bool(not selector_fresh)
 
         overlap_ref = max(48.0, 0.60 * max(selector_overlap_ref, ref_overlap_ref, 48.0))
         overlap_ratio = float(stable_overlap) / float(max(1.0, overlap_ref))
@@ -1572,8 +1573,12 @@ class Aggregator(nn.Module):
         structure_ready = bool(self._geo_structure_ready())
         prestructure_phase = not structure_ready
         visible_target = 0.82 if prestructure_phase else 0.72
-        visible_stress = min(1.0, max(0.0, (visible_target - stable_visible_ratio) / 0.22))
-        overlap_stress = min(1.0, max(0.0, (0.75 - overlap_health) / 0.35))
+        if selector_fresh:
+            visible_stress = min(1.0, max(0.0, (visible_target - stable_visible_ratio) / 0.22))
+            overlap_stress = min(1.0, max(0.0, (0.75 - overlap_health) / 0.35))
+        else:
+            visible_stress = 0.0
+            overlap_stress = 0.0
         frozen_ready = bool(self.geo_frozen_reference_ready)
         frozen_overlap_ema = float(self.geo_frozen_ref_overlap_ema)
         frozen_residual_ema = float(self.geo_frozen_ref_residual_ema)
@@ -1589,7 +1594,8 @@ class Aggregator(nn.Module):
             and float(self.geo_frozen_ref_residual_ema) >= 0.16
             and len(self.geo_reference_bank) >= 128
         )
-        if frozen_ready and (not frozen_bank_refresh_due):
+        frozen_refresh_pending = bool(frozen_bank_refresh_due or frozen_bank_rescue_refresh_due)
+        if frozen_ready and (not frozen_refresh_pending):
             frozen_overlap_stress = min(1.0, max(0.0, (8.0 - frozen_overlap_ema) / 8.0))
             frozen_residual_stress = min(1.0, max(0.0, (frozen_residual_ema - 0.08) / 0.12))
         else:
@@ -1616,7 +1622,7 @@ class Aggregator(nn.Module):
         )
         external_drift_bad = bool(
             frozen_ready
-            and (not frozen_bank_refresh_due)
+            and (not frozen_refresh_pending)
             and (
                 frozen_overlap_ema < 8.0
                 or frozen_residual_ema > 0.16
@@ -1627,6 +1633,7 @@ class Aggregator(nn.Module):
             "keep_feedback_stale": bool(not feedback_fresh),
             "selector_fresh": bool(selector_fresh),
             "selector_feedback_stale": bool(not selector_fresh),
+            "selector_health_unknown": bool(selector_health_unknown),
             "plain_ratio_recent": float(plain_ratio_recent),
             "reserved_ratio_recent": float(reserved_ratio_recent),
             "stable_visible_ratio": float(stable_visible_ratio),
@@ -1648,7 +1655,8 @@ class Aggregator(nn.Module):
             "external_drift_bad": bool(external_drift_bad),
             "frozen_bank_refresh_due": bool(frozen_bank_refresh_due),
             "frozen_bank_rescue_refresh_due": bool(frozen_bank_rescue_refresh_due),
-            "frozen_stress_suppressed_due_to_refresh": bool(frozen_ready and frozen_bank_refresh_due),
+            "frozen_refresh_pending": bool(frozen_refresh_pending),
+            "frozen_stress_suppressed_due_to_refresh": bool(frozen_ready and frozen_refresh_pending),
             "geo_frozen_reference_ready": bool(frozen_ready),
             "geo_frozen_reference_frame": int(self.geo_frozen_reference_frame),
             "geo_frozen_ref_overlap_ema": float(frozen_overlap_ema),
@@ -2062,6 +2070,7 @@ class Aggregator(nn.Module):
             "keep_feedback_stale": bool(health["keep_feedback_stale"]),
             "health_selector_fresh": bool(health["selector_fresh"]),
             "selector_feedback_stale": bool(health["selector_feedback_stale"]),
+            "selector_health_unknown": bool(health["selector_health_unknown"]),
             "plain_ratio_recent": float(health["plain_ratio_recent"]),
             "reserved_ratio_recent": float(health["reserved_ratio_recent"]),
             "stable_visible_ratio": float(health["stable_visible_ratio"]),
@@ -2076,6 +2085,7 @@ class Aggregator(nn.Module):
             "external_drift_bad": bool(health["external_drift_bad"]),
             "frozen_bank_refresh_due": bool(health["frozen_bank_refresh_due"]),
             "frozen_bank_rescue_refresh_due": bool(health["frozen_bank_rescue_refresh_due"]),
+            "frozen_refresh_pending": bool(health["frozen_refresh_pending"]),
             "frozen_stress_suppressed_due_to_refresh": bool(health["frozen_stress_suppressed_due_to_refresh"]),
             "handover_ok": bool(health["handover_ok"]),
             "runtime_bad_runtime_norm": bool(health["runtime_bad"]),
@@ -8588,11 +8598,28 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["micro_candidate_count"] = int(candidate_indices.numel())
         self.geo_last_policy_inputs["micro_ref_rescue_selected"] = int(0)
         self.geo_last_policy_inputs["micro_stable_rescue_selected"] = int(0)
+        self.geo_last_policy_inputs["micro_view_source"] = "none"
 
         micro_grouped_old = torch.empty((0,), dtype=torch.long)
         if candidate_indices.numel() > 0:
-            world_to_cam = current_view.get("world_to_cam") if isinstance(current_view, dict) else None
-            intrinsic = current_view.get("intrinsic") if isinstance(current_view, dict) else None
+            view_src = current_view
+            if (
+                (not isinstance(view_src, dict))
+                or view_src.get("world_to_cam") is None
+                or view_src.get("intrinsic") is None
+            ):
+                view_src = trigger_view if isinstance(trigger_view, dict) else None
+            if isinstance(view_src, dict):
+                if view_src is current_view:
+                    self.geo_last_policy_inputs["micro_view_source"] = "current_view"
+                elif view_src is trigger_view:
+                    self.geo_last_policy_inputs["micro_view_source"] = "trigger_view"
+                else:
+                    self.geo_last_policy_inputs["micro_view_source"] = "none"
+            else:
+                self.geo_last_policy_inputs["micro_view_source"] = "none"
+            world_to_cam = view_src.get("world_to_cam") if isinstance(view_src, dict) else None
+            intrinsic = view_src.get("intrinsic") if isinstance(view_src, dict) else None
             if isinstance(world_to_cam, torch.Tensor):
                 world_to_cam = world_to_cam.detach().cpu()
                 if world_to_cam.ndim == 3:
@@ -8601,7 +8628,7 @@ class Aggregator(nn.Module):
                 intrinsic = intrinsic.detach().cpu()
                 if intrinsic.ndim == 3:
                     intrinsic = intrinsic[0]
-            img_hw = current_view.get("img_hw") if isinstance(current_view, dict) else None
+            img_hw = view_src.get("img_hw") if isinstance(view_src, dict) else None
             have_view = isinstance(world_to_cam, torch.Tensor) and isinstance(intrinsic, torch.Tensor)
 
             gather_idx: List[torch.Tensor] = []
@@ -9044,15 +9071,10 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["geo_reloc_release_streak"] = int(self.geo_reloc_release_streak)
             current_release_ready = bool(
                 self._geo_current_release_ready()
-                and reloc_release_ready
                 and soft_current_ready_now
                 and bool(structure_ready_now)
             )
             self.geo_last_policy_inputs["current_release_ready"] = bool(current_release_ready)
-            if current_release_ready:
-                self.geo_current_release_streak = int(self.geo_current_release_streak) + 1
-            else:
-                self.geo_current_release_streak = 0
             self.geo_last_policy_inputs["geo_current_release_streak"] = int(self.geo_current_release_streak)
             if ongoing_reloc and (not current_release_ready):
                 effective_mode = "reloc"
