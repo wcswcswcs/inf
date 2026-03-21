@@ -982,7 +982,14 @@ class Aggregator(nn.Module):
             and (not bool(health_now.get("external_drift_bad", False)))
             and len(self.geo_reference_bank) >= len(self.geo_frozen_reference_bank) + 64
         )
-        if (not base_freeze_ready) and (not refresh_due):
+        rescue_refresh_due = bool(
+            self.geo_frozen_reference_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 64)
+            and bool(health_now.get("external_drift_bad", False))
+            and float(self.geo_frozen_ref_residual_ema) >= 0.16
+            and len(self.geo_reference_bank) >= 128
+        )
+        if (not base_freeze_ready) and (not refresh_due) and (not rescue_refresh_due):
             return
         ranked = sorted(
             self.geo_reference_bank.items(),
@@ -1005,7 +1012,10 @@ class Aggregator(nn.Module):
             self.geo_frozen_reference_bank = frozen
             self.geo_frozen_reference_ready = True
             self.geo_frozen_reference_frame = int(frame_idx)
-            if refresh_due:
+            if rescue_refresh_due:
+                self.geo_frozen_reference_refresh_count = int(self.geo_frozen_reference_refresh_count) + 1
+                self.geo_frozen_reference_refresh_reason = "drift_recovery_refresh"
+            elif refresh_due:
                 self.geo_frozen_reference_refresh_count = int(self.geo_frozen_reference_refresh_count) + 1
                 self.geo_frozen_reference_refresh_reason = "periodic_stable_refresh"
             else:
@@ -1513,6 +1523,12 @@ class Aggregator(nn.Module):
             selector_diag
             and int(selector_diag.get("frame_idx", -1)) >= int(frame_idx) - 2
         )
+        selector_overlap_ref = float(
+            selector_overlap_ema
+            if selector_overlap_ema is not None
+            else getattr(self, "geo_selector_overlap_ema", 0.0) or 0.0
+        )
+        ref_overlap_ref = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
         if feedback_fresh:
             plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
             reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
@@ -1532,18 +1548,23 @@ class Aggregator(nn.Module):
             plain_stress = 0.0
             reserved_stress = 0.0
 
-        stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0) or 1.0)
-        stable_overlap = float(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0.0)) or 0.0)
-        stable_selected_visible = float(selector_diag.get("stable_selected_visible", 0.0) or 0.0)
-        stable_selected_invisible = float(selector_diag.get("stable_selected_invisible", 0.0) or 0.0)
-        visible_total = float(selector_diag.get("visible_total", 0.0) or 0.0)
+        if selector_fresh:
+            stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0) or 1.0)
+            stable_overlap = float(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0.0)) or 0.0)
+            stable_selected_visible = float(selector_diag.get("stable_selected_visible", 0.0) or 0.0)
+            stable_selected_invisible = float(selector_diag.get("stable_selected_invisible", 0.0) or 0.0)
+            visible_total = float(selector_diag.get("visible_total", 0.0) or 0.0)
+        else:
+            stable_visible_ratio = float(
+                selector_visible_ratio_ema
+                if selector_visible_ratio_ema is not None
+                else getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0
+            )
+            stable_overlap = float(max(selector_overlap_ref, ref_overlap_ref, 0.0))
+            stable_selected_visible = 0.0
+            stable_selected_invisible = 0.0
+            visible_total = 0.0
 
-        selector_overlap_ref = float(
-            selector_overlap_ema
-            if selector_overlap_ema is not None
-            else getattr(self, "geo_selector_overlap_ema", 0.0) or 0.0
-        )
-        ref_overlap_ref = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
         overlap_ref = max(48.0, 0.60 * max(selector_overlap_ref, ref_overlap_ref, 48.0))
         overlap_ratio = float(stable_overlap) / float(max(1.0, overlap_ref))
         overlap_health = min(1.5, max(0.0, overlap_ratio))
@@ -1561,6 +1582,12 @@ class Aggregator(nn.Module):
             and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 256)
             and int(self.geo_current_release_streak) >= 8
             and len(self.geo_reference_bank) >= len(self.geo_frozen_reference_bank) + 64
+        )
+        frozen_bank_rescue_refresh_due = bool(
+            frozen_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 64)
+            and float(self.geo_frozen_ref_residual_ema) >= 0.16
+            and len(self.geo_reference_bank) >= 128
         )
         if frozen_ready and (not frozen_bank_refresh_due):
             frozen_overlap_stress = min(1.0, max(0.0, (8.0 - frozen_overlap_ema) / 8.0))
@@ -1599,6 +1626,7 @@ class Aggregator(nn.Module):
             "feedback_fresh": bool(feedback_fresh),
             "keep_feedback_stale": bool(not feedback_fresh),
             "selector_fresh": bool(selector_fresh),
+            "selector_feedback_stale": bool(not selector_fresh),
             "plain_ratio_recent": float(plain_ratio_recent),
             "reserved_ratio_recent": float(reserved_ratio_recent),
             "stable_visible_ratio": float(stable_visible_ratio),
@@ -1619,6 +1647,7 @@ class Aggregator(nn.Module):
             "runtime_bad": bool(runtime_bad),
             "external_drift_bad": bool(external_drift_bad),
             "frozen_bank_refresh_due": bool(frozen_bank_refresh_due),
+            "frozen_bank_rescue_refresh_due": bool(frozen_bank_rescue_refresh_due),
             "frozen_stress_suppressed_due_to_refresh": bool(frozen_ready and frozen_bank_refresh_due),
             "geo_frozen_reference_ready": bool(frozen_ready),
             "geo_frozen_reference_frame": int(self.geo_frozen_reference_frame),
@@ -2032,6 +2061,7 @@ class Aggregator(nn.Module):
             "health_feedback_fresh": bool(health["feedback_fresh"]),
             "keep_feedback_stale": bool(health["keep_feedback_stale"]),
             "health_selector_fresh": bool(health["selector_fresh"]),
+            "selector_feedback_stale": bool(health["selector_feedback_stale"]),
             "plain_ratio_recent": float(health["plain_ratio_recent"]),
             "reserved_ratio_recent": float(health["reserved_ratio_recent"]),
             "stable_visible_ratio": float(health["stable_visible_ratio"]),
@@ -2045,6 +2075,7 @@ class Aggregator(nn.Module):
             "frozen_residual_stress": float(health["frozen_residual_stress"]),
             "external_drift_bad": bool(health["external_drift_bad"]),
             "frozen_bank_refresh_due": bool(health["frozen_bank_refresh_due"]),
+            "frozen_bank_rescue_refresh_due": bool(health["frozen_bank_rescue_refresh_due"]),
             "frozen_stress_suppressed_due_to_refresh": bool(health["frozen_stress_suppressed_due_to_refresh"]),
             "handover_ok": bool(health["handover_ok"]),
             "runtime_bad_runtime_norm": bool(health["runtime_bad"]),
@@ -8555,6 +8586,8 @@ class Aggregator(nn.Module):
                 order = torch.argsort(cf)
                 candidate_indices = candidate_indices.index_select(0, order)[-int(micro_candidate_cap):]
         self.geo_last_policy_inputs["micro_candidate_count"] = int(candidate_indices.numel())
+        self.geo_last_policy_inputs["micro_ref_rescue_selected"] = int(0)
+        self.geo_last_policy_inputs["micro_stable_rescue_selected"] = int(0)
 
         micro_grouped_old = torch.empty((0,), dtype=torch.long)
         if candidate_indices.numel() > 0:
@@ -8574,6 +8607,8 @@ class Aggregator(nn.Module):
             gather_idx: List[torch.Tensor] = []
             gather_score: List[torch.Tensor] = []
             gather_hash: List[torch.Tensor] = []
+            gather_ref_mask: List[torch.Tensor] = []
+            gather_stable_mask: List[torch.Tensor] = []
             for fidx in torch.unique(frame_idx.index_select(0, candidate_indices)).tolist():
                 fidx = int(fidx)
                 frame_meta = self.geo_frame_meta.get(fidx)
@@ -8591,7 +8626,39 @@ class Aggregator(nn.Module):
                 pts = frame_meta["pts"].index_select(0, local).to(torch.float32)
                 conf = frame_meta["conf"].index_select(0, local).to(torch.float32).clamp_min(1e-6)
                 vox = frame_meta["voxel_ids"].index_select(0, local)
-                score_t = conf
+                bank_conf_l: List[float] = []
+                bank_support_l: List[float] = []
+                bank_var_l: List[float] = []
+                is_ref_vox_l: List[bool] = []
+                is_stable_vox_l: List[bool] = []
+                for key in (tuple(int(v) for v in row) for row in vox.tolist()):
+                    bank = self.geo_voxel_bank.get(key)
+                    if bank is None:
+                        bank_conf_l.append(0.0)
+                        bank_support_l.append(1.0)
+                        bank_var_l.append(0.0)
+                    else:
+                        bank_conf_l.append(float(bank.get("conf_ema", 0.0)))
+                        bank_support_l.append(float(bank.get("support", 1.0)))
+                        bank_var_l.append(float(bank.get("pos_var", 0.0)))
+                    is_ref_vox_l.append(key in self.geo_reference_voxels)
+                    is_stable_vox_l.append(key in self.geo_stable_anchor_voxels)
+                bank_conf_t = torch.tensor(bank_conf_l, dtype=torch.float32)
+                bank_support_t = torch.tensor(bank_support_l, dtype=torch.float32)
+                bank_var_t = torch.tensor(bank_var_l, dtype=torch.float32)
+                ref_vox_t = torch.tensor(is_ref_vox_l, dtype=torch.bool)
+                stable_vox_t = torch.tensor(is_stable_vox_l, dtype=torch.bool)
+                conf_safe = conf.clamp_min(1e-6)
+                bank_conf_eff = torch.where(bank_conf_t > 0, bank_conf_t, conf_safe)
+                support_gain = torch.log1p(bank_support_t)
+                stability = (1.0 / (1.0 + bank_var_t)).to(torch.float32)
+                score_t = conf_safe * bank_conf_eff.clamp_min(1e-6) * support_gain * stability
+                if ref_vox_t.any() and float(self.geo_reference_overlap_bonus) > 0.0:
+                    score_t = score_t * torch.where(
+                        ref_vox_t,
+                        torch.full_like(score_t, 1.0 + float(self.geo_reference_overlap_bonus)),
+                        torch.ones_like(score_t),
+                    )
                 if have_view:
                     visible = self._frustum_mask(
                         pts,
@@ -8601,11 +8668,13 @@ class Aggregator(nn.Module):
                         far=float(far),
                         img_hw=img_hw,
                     )
-                    score_t = conf * torch.where(
+                    score_t = score_t * torch.where(
                         visible,
-                        torch.full_like(conf, 1.25),
-                        torch.full_like(conf, 0.85),
+                        torch.full_like(score_t, 1.25),
+                        torch.full_like(score_t, 0.85),
                     )
+                gather_ref_mask.append(ref_vox_t)
+                gather_stable_mask.append(stable_vox_t)
                 gather_idx.append(in_frame.to(torch.long))
                 gather_score.append(score_t.to(torch.float32))
                 gather_hash.append(self._voxel_hash(vox))
@@ -8613,17 +8682,39 @@ class Aggregator(nn.Module):
                 idx_all = torch.cat(gather_idx, dim=0)
                 score_all = torch.cat(gather_score, dim=0)
                 hash_all = torch.cat(gather_hash, dim=0)
+                ref_mask_all = torch.cat(gather_ref_mask, dim=0)
+                stable_mask_all = torch.cat(gather_stable_mask, dim=0)
                 micro_grouped_old = self._group_topk_by_hash(
                     hash_all,
                     score_all,
                     idx_all,
-                    topk_per_voxel=1,
+                    topk_per_voxel=2,
                 )
                 if max_past_tokens is not None and micro_grouped_old.numel() > max(128, int(0.12 * float(max_past_tokens))):
                     order = torch.argsort(score_all, descending=True)
                     top_idx = idx_all.index_select(0, order)[: max(128, int(0.12 * float(max_past_tokens)))]
                     keep_set = set(int(v) for v in top_idx.tolist())
                     micro_grouped_old = torch.tensor([int(v) for v in micro_grouped_old.tolist() if int(v) in keep_set], dtype=torch.long)
+                micro_ref_quota = max(32, int(0.03 * float(max_past_tokens or 1024)))
+                micro_stable_quota = max(32, int(0.03 * float(max_past_tokens or 1024)))
+                ref_score = score_all[ref_mask_all] if ref_mask_all.any() else torch.empty((0,), dtype=torch.float32)
+                ref_idx = idx_all[ref_mask_all] if ref_mask_all.any() else torch.empty((0,), dtype=torch.long)
+                stable_score = score_all[stable_mask_all] if stable_mask_all.any() else torch.empty((0,), dtype=torch.float32)
+                stable_idx = idx_all[stable_mask_all] if stable_mask_all.any() else torch.empty((0,), dtype=torch.long)
+                ref_rescue = torch.empty((0,), dtype=torch.long)
+                stable_rescue = torch.empty((0,), dtype=torch.long)
+                if ref_idx.numel() > 0:
+                    ref_order = torch.argsort(ref_score, descending=True)
+                    ref_rescue = ref_idx.index_select(0, ref_order[: min(int(micro_ref_quota), int(ref_idx.numel()))])
+                if stable_idx.numel() > 0:
+                    stable_order = torch.argsort(stable_score, descending=True)
+                    stable_rescue = stable_idx.index_select(0, stable_order[: min(int(micro_stable_quota), int(stable_idx.numel()))])
+                self.geo_last_policy_inputs["micro_ref_rescue_selected"] = int(ref_rescue.numel())
+                self.geo_last_policy_inputs["micro_stable_rescue_selected"] = int(stable_rescue.numel())
+                if ref_rescue.numel() > 0:
+                    micro_grouped_old = self._unique_preserve_order_long(torch.cat([micro_grouped_old, ref_rescue], dim=0))
+                if stable_rescue.numel() > 0:
+                    micro_grouped_old = self._unique_preserve_order_long(torch.cat([micro_grouped_old, stable_rescue], dim=0))
         if micro_grouped_old.numel() > 0:
             self._ordered_add(selected_fast, selected_fast_order, micro_grouped_old)
         self.geo_last_policy_inputs["micro_old_candidate_selected"] = int(micro_grouped_old.numel())

@@ -377,7 +377,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     and soft_current_ready
                     and healthy_selector
                 )
-                self.aggregator.geo_last_policy_inputs["current_release_ready"] = bool(force_current_selector)
+                self.aggregator.geo_last_policy_inputs["inference_force_current_selector"] = bool(force_current_selector)
                 allow_last_reliable = bool(
                     prefer_last_reliable_view
                     and last_reliable_view is not None
@@ -387,6 +387,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     or bool(health["external_drift_bad"])
                     )
                 )
+                self.aggregator.geo_last_policy_inputs["inference_allow_last_reliable"] = bool(allow_last_reliable)
                 if (
                     ((not force_current_selector) or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold)
                     and selector_fallback_ready
