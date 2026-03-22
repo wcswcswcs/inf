@@ -379,6 +379,8 @@ class Aggregator(nn.Module):
         self.geo_bootstrap_ref_overlap_thr = 128.0
         self.geo_bootstrap_visible_ratio_thr = 0.50
         self.geo_bootstrap_ready_streak = 8
+        self.geo_current_microprune_period = 4
+        self.geo_last_keep_feedback: Dict[str, Any] = {}
         self.reset_geo_cache_state()
 
     def reset_geo_cache_state(self):
@@ -459,6 +461,14 @@ class Aggregator(nn.Module):
         self.geo_last_committed_policy: Optional[Dict[str, Any]] = None
         self.geo_last_policy_frame: int = -1
         self.geo_last_policy_inputs: Dict[str, Any] = {}
+        self.geo_last_keep_feedback: Dict[str, Any] = {}
+        self.geo_frozen_reference_bank: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        self.geo_frozen_reference_ready: bool = False
+        self.geo_frozen_reference_frame: int = -1
+        self.geo_frozen_ref_overlap_ema: float = 0.0
+        self.geo_frozen_ref_residual_ema: float = 0.0
+        self.geo_frozen_reference_refresh_count: int = 0
+        self.geo_frozen_reference_refresh_reason: str = "none"
         self.geo_last_policy_metrics: Dict[str, float] = {}
         self.geo_last_commit_guard_frame: int = -1
         self.geo_last_debug_log_frame = -1
@@ -570,6 +580,14 @@ class Aggregator(nn.Module):
             "geo_last_committed_policy": copy.deepcopy(self.geo_last_committed_policy),
             "geo_last_policy_frame": int(self.geo_last_policy_frame),
             "geo_last_policy_inputs": copy.deepcopy(self.geo_last_policy_inputs),
+            "geo_last_keep_feedback": copy.deepcopy(self.geo_last_keep_feedback),
+            "geo_frozen_reference_bank": copy.deepcopy(self.geo_frozen_reference_bank),
+            "geo_frozen_reference_ready": bool(self.geo_frozen_reference_ready),
+            "geo_frozen_reference_frame": int(self.geo_frozen_reference_frame),
+            "geo_frozen_ref_overlap_ema": float(self.geo_frozen_ref_overlap_ema),
+            "geo_frozen_ref_residual_ema": float(self.geo_frozen_ref_residual_ema),
+            "geo_frozen_reference_refresh_count": int(self.geo_frozen_reference_refresh_count),
+            "geo_frozen_reference_refresh_reason": str(self.geo_frozen_reference_refresh_reason),
             "geo_last_policy_metrics": copy.deepcopy(self.geo_last_policy_metrics),
             "geo_last_commit_guard_frame": int(self.geo_last_commit_guard_frame),
             "last_scores": self.last_scores.detach().cpu().clone(),
@@ -686,6 +704,14 @@ class Aggregator(nn.Module):
         self.geo_last_committed_policy = copy.deepcopy(state.get("geo_last_committed_policy", None))
         self.geo_last_policy_frame = int(state.get("geo_last_policy_frame", -1))
         self.geo_last_policy_inputs = copy.deepcopy(state.get("geo_last_policy_inputs", {}))
+        self.geo_last_keep_feedback = copy.deepcopy(state.get("geo_last_keep_feedback", {}))
+        self.geo_frozen_reference_bank = copy.deepcopy(state.get("geo_frozen_reference_bank", {}))
+        self.geo_frozen_reference_ready = bool(state.get("geo_frozen_reference_ready", False))
+        self.geo_frozen_reference_frame = int(state.get("geo_frozen_reference_frame", -1))
+        self.geo_frozen_ref_overlap_ema = float(state.get("geo_frozen_ref_overlap_ema", 0.0))
+        self.geo_frozen_ref_residual_ema = float(state.get("geo_frozen_ref_residual_ema", 0.0))
+        self.geo_frozen_reference_refresh_count = int(state.get("geo_frozen_reference_refresh_count", 0))
+        self.geo_frozen_reference_refresh_reason = str(state.get("geo_frozen_reference_refresh_reason", "none"))
         self.geo_last_policy_metrics = copy.deepcopy(state.get("geo_last_policy_metrics", {}))
         self.geo_last_commit_guard_frame = int(state.get("geo_last_commit_guard_frame", -1))
         scores_state = state.get("last_scores", None)
@@ -936,6 +962,64 @@ class Aggregator(nn.Module):
             self.geo_reference_hash_tensor = self._voxel_hash(vox)
         else:
             self.geo_reference_hash_tensor = torch.empty((0,), dtype=torch.long)
+
+    def _maybe_freeze_reference_bank(self, frame_idx: int) -> None:
+        health_now = self._geo_compute_controller_health(frame_idx=int(frame_idx))
+        base_freeze_ready = bool(
+            (not self.geo_frozen_reference_ready)
+            and self._geo_structure_ready()
+            and str(self.geo_selector_mode) == "current"
+            and self._geo_current_release_ready()
+            and self._geo_feedback_fresh(int(frame_idx))
+            and (not bool(health_now.get("external_drift_bad", False)))
+            and int(self.geo_current_release_streak) >= 3
+            and len(self.geo_reference_bank) >= 128
+        )
+        refresh_due = bool(
+            self.geo_frozen_reference_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 256)
+            and int(self.geo_current_release_streak) >= 8
+            and (not bool(health_now.get("external_drift_bad", False)))
+            and len(self.geo_reference_bank) >= len(self.geo_frozen_reference_bank) + 64
+        )
+        rescue_refresh_due = bool(
+            self.geo_frozen_reference_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 64)
+            and bool(health_now.get("external_drift_bad", False))
+            and float(self.geo_frozen_ref_residual_ema) >= 0.16
+            and len(self.geo_reference_bank) >= 128
+        )
+        if (not base_freeze_ready) and (not refresh_due) and (not rescue_refresh_due):
+            return
+        ranked = sorted(
+            self.geo_reference_bank.items(),
+            key=lambda kv: (
+                float(kv[1].get("score", 0.0)),
+                float(self.geo_voxel_bank.get(kv[0], {}).get("support", 0.0)),
+                float(self.geo_voxel_bank.get(kv[0], {}).get("conf_ema", 0.0)),
+            ),
+            reverse=True,
+        )
+        frozen: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        for key, item in ranked[:512]:
+            frozen[key] = {
+                "pos_x": float(item.get("pos_x", 0.0)),
+                "pos_y": float(item.get("pos_y", 0.0)),
+                "pos_z": float(item.get("pos_z", 0.0)),
+                "score": float(item.get("score", 0.0)),
+            }
+        if frozen:
+            self.geo_frozen_reference_bank = frozen
+            self.geo_frozen_reference_ready = True
+            self.geo_frozen_reference_frame = int(frame_idx)
+            if rescue_refresh_due:
+                self.geo_frozen_reference_refresh_count = int(self.geo_frozen_reference_refresh_count) + 1
+                self.geo_frozen_reference_refresh_reason = "drift_recovery_refresh"
+            elif refresh_due:
+                self.geo_frozen_reference_refresh_count = int(self.geo_frozen_reference_refresh_count) + 1
+                self.geo_frozen_reference_refresh_reason = "periodic_stable_refresh"
+            else:
+                self.geo_frozen_reference_refresh_reason = "initial_freeze"
 
     def _active_frames_for_anchor_refresh(self, current_frame_idx: int) -> set[int]:
         current_frame_idx = int(current_frame_idx)
@@ -1412,6 +1496,174 @@ class Aggregator(nn.Module):
         diag = copy.deepcopy(self.geo_last_selector_diag)
         return None if int(diag.get("frame_idx", -1)) < 0 else diag
 
+    def _geo_get_last_keep_feedback(self, frame_idx: int, max_age: int = 2) -> Tuple[Dict[str, Any], bool]:
+        fb = copy.deepcopy(getattr(self, "geo_last_keep_feedback", {}) or {})
+        if not fb:
+            return {}, False
+        fb_frame = int(fb.get("frame_idx", -1))
+        budget = fb.get("frame_keep_budget_last", None)
+        plain_last = fb.get("frame_keep_plain_patch_final_last", None)
+        reserved_last = fb.get("frame_keep_plain_patch_reserved_last", None)
+        if budget is None or plain_last is None or reserved_last is None:
+            return fb, False
+        fresh = bool(fb_frame >= int(frame_idx) - int(max_age))
+        return fb, fresh
+
+    def _geo_compute_controller_health(
+        self,
+        *,
+        frame_idx: int,
+        matched_ema: Optional[float] = None,
+        selector_overlap_ema: Optional[float] = None,
+        selector_visible_ratio_ema: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        selector_diag = self._geo_get_last_selector_diag() or {}
+        selector_fresh = bool(
+            selector_diag
+            and int(selector_diag.get("frame_idx", -1)) >= int(frame_idx) - 2
+        )
+        selector_overlap_ref = float(
+            selector_overlap_ema
+            if selector_overlap_ema is not None
+            else getattr(self, "geo_selector_overlap_ema", 0.0) or 0.0
+        )
+        ref_overlap_ref = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
+        if feedback_fresh:
+            plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+            reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+            plain_ratio_ema = float(feedback.get("geo_plain_ratio_ema", plain_ratio_last) or plain_ratio_last)
+            reserved_ratio_ema = float(feedback.get("geo_reserved_ratio_ema", reserved_ratio_last) or reserved_ratio_last)
+            plain_ratio_recent = 0.7 * plain_ratio_last + 0.3 * plain_ratio_ema
+            reserved_ratio_recent = 0.7 * reserved_ratio_last + 0.3 * reserved_ratio_ema
+            plain_stress = min(1.0, max(0.0, (0.18 - plain_ratio_recent) / 0.08))
+            reserved_stress = 0.0 if reserved_ratio_recent <= 0.0 else min(1.0, max(0.0, (0.06 - reserved_ratio_recent) / 0.06))
+        else:
+            plain_ratio_last = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else 0.0)
+            reserved_ratio_last = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else 0.0)
+            plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
+            reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
+            plain_ratio_recent = float(plain_ratio_ema)
+            reserved_ratio_recent = float(reserved_ratio_ema)
+            plain_stress = 0.0
+            reserved_stress = 0.0
+
+        if selector_fresh:
+            stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0) or 1.0)
+            stable_overlap = float(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0.0)) or 0.0)
+            stable_selected_visible = float(selector_diag.get("stable_selected_visible", 0.0) or 0.0)
+            stable_selected_invisible = float(selector_diag.get("stable_selected_invisible", 0.0) or 0.0)
+            visible_total = float(selector_diag.get("visible_total", 0.0) or 0.0)
+        else:
+            stable_visible_ratio = float(
+                selector_visible_ratio_ema
+                if selector_visible_ratio_ema is not None
+                else getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0
+            )
+            stable_overlap = float(selector_overlap_ref if selector_overlap_ref > 0.0 else ref_overlap_ref)
+            stable_selected_visible = 0.0
+            stable_selected_invisible = 0.0
+            visible_total = 0.0
+        selector_health_unknown = bool(not selector_fresh)
+
+        overlap_ref = max(48.0, 0.60 * max(selector_overlap_ref, ref_overlap_ref, 48.0))
+        overlap_ratio = float(stable_overlap) / float(max(1.0, overlap_ref))
+        overlap_health = min(1.5, max(0.0, overlap_ratio))
+
+        structure_ready = bool(self._geo_structure_ready())
+        prestructure_phase = not structure_ready
+        visible_target = 0.82 if prestructure_phase else 0.72
+        if selector_fresh:
+            visible_stress = min(1.0, max(0.0, (visible_target - stable_visible_ratio) / 0.22))
+            overlap_stress = min(1.0, max(0.0, (0.75 - overlap_health) / 0.35))
+        else:
+            visible_stress = 0.0
+            overlap_stress = 0.0
+        frozen_ready = bool(self.geo_frozen_reference_ready)
+        frozen_overlap_ema = float(self.geo_frozen_ref_overlap_ema)
+        frozen_residual_ema = float(self.geo_frozen_ref_residual_ema)
+        frozen_bank_refresh_due = bool(
+            frozen_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 256)
+            and int(self.geo_current_release_streak) >= 8
+            and len(self.geo_reference_bank) >= len(self.geo_frozen_reference_bank) + 64
+        )
+        frozen_bank_rescue_refresh_due = bool(
+            frozen_ready
+            and (int(frame_idx) - int(self.geo_frozen_reference_frame) >= 64)
+            and float(self.geo_frozen_ref_residual_ema) >= 0.16
+            and len(self.geo_reference_bank) >= 128
+        )
+        frozen_refresh_pending = bool(frozen_bank_refresh_due or frozen_bank_rescue_refresh_due)
+        if frozen_ready and (not frozen_refresh_pending):
+            frozen_overlap_stress = min(1.0, max(0.0, (8.0 - frozen_overlap_ema) / 8.0))
+            frozen_residual_stress = min(1.0, max(0.0, (frozen_residual_ema - 0.08) / 0.12))
+        else:
+            frozen_overlap_stress = 0.0
+            frozen_residual_stress = 0.0
+        controller_stress = max(plain_stress, reserved_stress, visible_stress, overlap_stress, frozen_overlap_stress, frozen_residual_stress)
+
+        handover_ok = bool(
+            feedback_fresh
+            and selector_fresh
+            and plain_ratio_recent >= 0.16
+            and reserved_ratio_recent >= 0.07
+            and stable_visible_ratio >= 0.74
+            and overlap_health >= 0.75
+        )
+        runtime_bad = bool(
+            selector_fresh
+            and (
+                stable_visible_ratio < 0.62
+                or overlap_health < 0.45
+                or (matched_ema is not None and float(matched_ema) < 0.08)
+                or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
+            )
+        )
+        external_drift_bad = bool(
+            frozen_ready
+            and (not frozen_refresh_pending)
+            and (
+                frozen_overlap_ema < 8.0
+                or frozen_residual_ema > 0.16
+            )
+        )
+        return {
+            "feedback_fresh": bool(feedback_fresh),
+            "keep_feedback_stale": bool(not feedback_fresh),
+            "selector_fresh": bool(selector_fresh),
+            "selector_feedback_stale": bool(not selector_fresh),
+            "selector_health_unknown": bool(selector_health_unknown),
+            "plain_ratio_recent": float(plain_ratio_recent),
+            "reserved_ratio_recent": float(reserved_ratio_recent),
+            "stable_visible_ratio": float(stable_visible_ratio),
+            "stable_overlap": float(stable_overlap),
+            "stable_selected_visible": float(stable_selected_visible),
+            "stable_selected_invisible": float(stable_selected_invisible),
+            "visible_total": float(visible_total),
+            "overlap_ref": float(overlap_ref),
+            "overlap_health": float(overlap_health),
+            "plain_stress": float(plain_stress),
+            "reserved_stress": float(reserved_stress),
+            "visible_stress": float(visible_stress),
+            "overlap_stress": float(overlap_stress),
+            "frozen_overlap_stress": float(frozen_overlap_stress),
+            "frozen_residual_stress": float(frozen_residual_stress),
+            "controller_stress": float(controller_stress),
+            "handover_ok": bool(handover_ok),
+            "runtime_bad": bool(runtime_bad),
+            "external_drift_bad": bool(external_drift_bad),
+            "frozen_bank_refresh_due": bool(frozen_bank_refresh_due),
+            "frozen_bank_rescue_refresh_due": bool(frozen_bank_rescue_refresh_due),
+            "frozen_refresh_pending": bool(frozen_refresh_pending),
+            "frozen_stress_suppressed_due_to_refresh": bool(frozen_ready and frozen_refresh_pending),
+            "geo_frozen_reference_ready": bool(frozen_ready),
+            "geo_frozen_reference_frame": int(self.geo_frozen_reference_frame),
+            "geo_frozen_ref_overlap_ema": float(frozen_overlap_ema),
+            "geo_frozen_ref_residual_ema": float(frozen_residual_ema),
+            "selector_visible_ratio_ema": float(selector_visible_ratio_ema if selector_visible_ratio_ema is not None else getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0),
+        }
+
     def _geo_collect_policy_signals(
         self,
         *,
@@ -1534,18 +1786,7 @@ class Aggregator(nn.Module):
         selector_visible_ratio_ema = _ema_preview(self.geo_selector_visible_ratio_ema, "selector_visible_ratio")
 
         maturity = self._geo_preview_maturity(matched_ema=matched_ema, trust_score=signals.get("trust_score"))
-        instability = self._geo_preview_instability(
-            trust_score=signals.get("trust_score"),
-            matched_ema=matched_ema,
-            new_voxel_ema=new_voxel_ema,
-            selector_overlap_ema=selector_overlap_ema,
-            selector_visible_ratio_ema=selector_visible_ratio_ema,
-            motion_ema=motion_ema,
-            confdrop_ema=confdrop_ema,
-            pressure_ema=pressure_ema,
-            hard_keep_continuity=signals.get("hard_keep_continuity"),
-            frame0_pin_ratio=signals.get("frame0_pin_ratio"),
-        )
+        instability = float(self.geo_instability_ema)
 
         return {
             "pressure_ema": pressure_ema,
@@ -1562,9 +1803,17 @@ class Aggregator(nn.Module):
 
     def _geo_preview_adaptive_policy(self, *, frame_idx: int, metrics: Dict[str, float]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         maturity = float(metrics["maturity"])
+        instability_preview_old = float(metrics["instability"])
         instability = float(metrics["instability"])
         matched_ema = float(metrics["matched_ema"])
         selector_overlap_ema = float(metrics["selector_overlap_ema"])
+        health = self._geo_compute_controller_health(
+            frame_idx=int(frame_idx),
+            matched_ema=float(matched_ema),
+            selector_overlap_ema=float(selector_overlap_ema),
+            selector_visible_ratio_ema=float(metrics["selector_visible_ratio_ema"]),
+        )
+        instability = self._ema(self.geo_instability_ema, float(health["controller_stress"]))
 
         early_assist_active = self._geo_early_assist_active(int(frame_idx))
         anchor_phase_open = int(frame_idx) >= int(self.geo_anchor_enable_after)
@@ -1617,10 +1866,16 @@ class Aggregator(nn.Module):
                 len(self.geo_reference_bank) >= 8
                 or len(self.geo_landmark_voxels) >= 64
             )
-            and selector_ready_overlap >= 320.0
-            and float(metrics["selector_visible_ratio_ema"]) >= 0.72
+            and bool(health["handover_ok"])
         )
-        selector_handover_ready = bool(reference_label_ready or early_handover_ready)
+        selector_handover_ready = bool(
+            reference_label_ready
+            or (
+                soft_bootstrap_ready
+                and len(self.geo_reference_bank) >= 32
+                and bool(health["handover_ok"])
+            )
+        )
 
         handover_ready_streak = int(self.geo_handover_ready_streak)
         handover_unready_streak = int(self.geo_handover_unready_streak)
@@ -1628,7 +1883,7 @@ class Aggregator(nn.Module):
         recovery_exit_streak = int(self.geo_recovery_exit_streak)
         selector_mode = str(self.geo_selector_mode)
 
-        if selector_handover_ready and instability <= 0.45:
+        if selector_handover_ready:
             handover_ready_streak += 1
             handover_unready_streak = 0
         else:
@@ -1636,83 +1891,62 @@ class Aggregator(nn.Module):
             handover_unready_streak += 1
 
         if selector_mode == "legacy":
-            if handover_ready_streak >= 5:
+            if handover_ready_streak >= 2:
                 selector_mode = "current"
         elif selector_mode == "current":
-            if instability >= 0.70:
+            if float(health["controller_stress"]) >= 0.55 or bool(health["runtime_bad"]):
                 recovery_enter_streak += 1
             else:
                 recovery_enter_streak = 0
-            if recovery_enter_streak >= 3:
+            if recovery_enter_streak >= 2:
                 selector_mode = "recovery"
-            elif handover_unready_streak >= 8:
+            elif handover_unready_streak >= 6:
                 selector_mode = "legacy"
         else:
-            if instability <= 0.35:
+            if float(health["controller_stress"]) <= 0.25 and (not bool(health["runtime_bad"])):
                 recovery_exit_streak += 1
             else:
                 recovery_exit_streak = 0
-            if recovery_exit_streak >= 8:
+            if recovery_exit_streak >= 3:
                 selector_mode = "current"
         if self._geo_current_release_ready():
             recovery_exit_streak += 1
             if recovery_exit_streak >= 3:
                 selector_mode = "current"
 
-        prev_budget = max(
-            1,
-            int(
-                self.geo_last_policy_inputs.get(
-                    "frame_keep_budget_last",
-                    self.geo_last_policy_inputs.get("final_ref_budget", 1),
-                ) or 1
-            ),
-        )
-        plain_patch_final_prev = int(
-            self.geo_last_policy_inputs.get(
-                "frame_keep_plain_patch_final_last",
-                self.geo_last_policy_inputs.get("keep_plain_patch_final", 0),
-            ) or 0
-        )
-        keep_plain_patch_reserved_prev = int(
-            self.geo_last_policy_inputs.get(
-                "frame_keep_plain_patch_reserved_last",
-                self.geo_last_policy_inputs.get("keep_plain_patch_reserved", 0),
-            ) or 0
-        )
-        plain_ratio_last = float(plain_patch_final_prev) / float(prev_budget)
-        reserved_ratio_last = float(keep_plain_patch_reserved_prev) / float(prev_budget)
-        plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
-        reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
-        plain_ratio_prev = 0.6 * float(plain_ratio_last) + 0.4 * float(plain_ratio_ema)
-        reserved_ratio_prev = 0.6 * float(reserved_ratio_last) + 0.4 * float(reserved_ratio_ema)
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        if feedback_fresh:
+            prev_budget = max(1, int(feedback.get("frame_keep_budget_last", 1) or 1))
+            plain_patch_final_prev = int(feedback.get("frame_keep_plain_patch_final_last", 0) or 0)
+            keep_plain_patch_reserved_prev = int(feedback.get("frame_keep_plain_patch_reserved_last", 0) or 0)
+            plain_ratio_last = float(feedback.get("plain_ratio_last", 0.0) or 0.0)
+            reserved_ratio_last = float(feedback.get("reserved_ratio_last", 0.0) or 0.0)
+            plain_ratio_ema = float(feedback.get("geo_plain_ratio_ema", plain_ratio_last) or plain_ratio_last)
+            reserved_ratio_ema = float(feedback.get("geo_reserved_ratio_ema", reserved_ratio_last) or reserved_ratio_last)
+        else:
+            prev_budget = 0
+            plain_patch_final_prev = 0
+            keep_plain_patch_reserved_prev = 0
+            plain_ratio_last = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else 1.0)
+            reserved_ratio_last = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else 0.0)
+            plain_ratio_ema = float(self.geo_plain_ratio_ema if self.geo_plain_ratio_ema is not None else plain_ratio_last)
+            reserved_ratio_ema = float(self.geo_reserved_ratio_ema if self.geo_reserved_ratio_ema is not None else reserved_ratio_last)
+        plain_ratio_prev = float(health["plain_ratio_recent"])
+        reserved_ratio_prev = float(health["reserved_ratio_recent"])
         stable_visible_ratio_prev = float(self.geo_last_selector_diag.get("stable_visible_ratio", 1.0)) if isinstance(self.geo_last_selector_diag, dict) else 1.0
         visible_total_prev = int(self.geo_last_selector_diag.get("visible_total", self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0))) if isinstance(self.geo_last_selector_diag, dict) else int(self.geo_last_policy_inputs.get("selector_diag_true_visible_total", 0) or 0)
         stable_overlap_prev = int(self.geo_last_selector_diag.get("stable_visible_overlap", self.geo_last_selector_diag.get("stable_visible_voxel_overlap", 0))) if isinstance(self.geo_last_selector_diag, dict) else 0
 
-        plain_stress = min(1.0, max(0.0, (0.32 - plain_ratio_prev) / 0.14))
-        reserved_target = 0.05
-        if keep_plain_patch_reserved_prev <= 0:
-            reserved_stress = 0.0
-        else:
-            reserved_stress = min(1.0, max(0.0, (reserved_target - reserved_ratio_prev) / reserved_target))
-        visible_stress = min(1.0, max(0.0, (0.75 - stable_visible_ratio_prev) / 0.25))
-        observation_stress = max(plain_stress, reserved_stress, visible_stress)
+        reserved_target = 0.06
+        observation_stress = float(health["controller_stress"])
 
         observation_collapse = bool(
-            plain_ratio_prev < 0.30
-            or reserved_ratio_prev < 0.02
-            or stable_visible_ratio_prev < 0.60
+            float(health["plain_ratio_recent"]) < 0.10
+            or float(health["reserved_ratio_recent"]) < 0.03
+            or float(health["stable_visible_ratio"]) < 0.60
+            or float(health["overlap_health"]) < 0.35
         )
 
-        if int(frame_idx) < int(self.geo_reference_enable_after):
-            visible_count_collapse = bool(int(visible_total_prev) < 7200)
-            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.78)
-            stable_overlap_collapse = bool(int(stable_overlap_prev) < 384)
-        else:
-            visible_count_collapse = bool(int(visible_total_prev) < 6000)
-            visible_ratio_collapse = bool(float(stable_visible_ratio_prev) < 0.70)
-            stable_overlap_collapse = bool(int(stable_overlap_prev) < 320)
         late_bootstrap = bool(int(frame_idx) >= int(self.geo_bootstrap_frames) + 64)
         legacy_break_gate_open = bool(
             reference_phase_open
@@ -1723,9 +1957,9 @@ class Aggregator(nn.Module):
             selector_mode == "legacy"
             and legacy_break_gate_open
             and (
-                visible_count_collapse
-                or visible_ratio_collapse
-                or stable_overlap_collapse
+                float(health["stable_visible_ratio"]) < (0.80 if not structure_ready else 0.75)
+                or float(health["overlap_health"]) < 0.65
+                or float(health["controller_stress"]) >= 0.25
             )
         )
 
@@ -1744,11 +1978,13 @@ class Aggregator(nn.Module):
                 self._geo_structure_ready()
                 or prestructure_reloc_ready
             )
+            and selector_mode in {"current", "recovery"}
         )
         reloc_signal = bool(
-            instability >= 0.50
+            float(health["controller_stress"]) >= 0.50
             or matched_ema < 0.08
-            or selector_ready_overlap < 320.0
+            or float(health["overlap_health"]) < 0.55
+            or float(health["stable_visible_ratio"]) < 0.70
             or float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
         )
         ongoing_recovery = bool(int(self.geo_recovery_frames_left) > 0)
@@ -1789,8 +2025,8 @@ class Aggregator(nn.Module):
                 anchor_ready and (
                     instability >= 0.35
                     or observation_collapse
-                    or float(stable_visible_ratio_prev) < 0.72
-                    or int(stable_overlap_prev) < 320
+                    or float(health["stable_visible_ratio"]) < 0.72
+                    or float(health["overlap_health"]) < 0.65
                 )
             ),
             "anchor_phase_open": bool(anchor_phase_open),
@@ -1824,7 +2060,49 @@ class Aggregator(nn.Module):
             "selector_overlap_threshold": float(320.0),
             "selector_visible_threshold": float(0.72),
             "prev_budget": int(prev_budget),
+            "feedback_fresh": bool(feedback_fresh),
+            "feedback_prev_budget": int(prev_budget),
+            "frame_keep_budget_last": int(feedback.get("frame_keep_budget_last", 0) or 0),
+            "frame_keep_capacity_last": int(feedback.get("frame_keep_capacity_last", 0) or 0),
+            "plain_ratio_capacity_last": float(feedback.get("plain_ratio_capacity_last", 0.0) or 0.0),
+            "reserved_ratio_capacity_last": float(feedback.get("reserved_ratio_capacity_last", 0.0) or 0.0),
+            "health_feedback_fresh": bool(health["feedback_fresh"]),
+            "keep_feedback_stale": bool(health["keep_feedback_stale"]),
+            "health_selector_fresh": bool(health["selector_fresh"]),
+            "selector_feedback_stale": bool(health["selector_feedback_stale"]),
+            "selector_health_unknown": bool(health["selector_health_unknown"]),
+            "plain_ratio_recent": float(health["plain_ratio_recent"]),
+            "reserved_ratio_recent": float(health["reserved_ratio_recent"]),
+            "stable_visible_ratio": float(health["stable_visible_ratio"]),
+            "stable_overlap": float(health["stable_overlap"]),
+            "overlap_ref": float(health["overlap_ref"]),
+            "overlap_health": float(health["overlap_health"]),
+            "controller_stress": float(health["controller_stress"]),
+            "visible_stress": float(health["visible_stress"]),
+            "overlap_stress": float(health["overlap_stress"]),
+            "frozen_overlap_stress": float(health["frozen_overlap_stress"]),
+            "frozen_residual_stress": float(health["frozen_residual_stress"]),
+            "external_drift_bad": bool(health["external_drift_bad"]),
+            "frozen_bank_refresh_due": bool(health["frozen_bank_refresh_due"]),
+            "frozen_bank_rescue_refresh_due": bool(health["frozen_bank_rescue_refresh_due"]),
+            "frozen_refresh_pending": bool(health["frozen_refresh_pending"]),
+            "frozen_stress_suppressed_due_to_refresh": bool(health["frozen_stress_suppressed_due_to_refresh"]),
+            "handover_ok": bool(health["handover_ok"]),
+            "runtime_bad_runtime_norm": bool(health["runtime_bad"]),
+            "geo_frozen_reference_ready": bool(health["geo_frozen_reference_ready"]),
+            "geo_frozen_reference_frame": int(health["geo_frozen_reference_frame"]),
+            "geo_frozen_ref_overlap_ema": float(health["geo_frozen_ref_overlap_ema"]),
+            "geo_frozen_ref_residual_ema": float(health["geo_frozen_ref_residual_ema"]),
+            "instability_preview_old": float(instability_preview_old),
+            "instability_preview_new": float(instability),
+            "instability_committed": float(instability),
         }
+        plain_ratio_actual_now = float(plain_patch_final_prev) / float(max(1, int(prev_budget))) if int(prev_budget) > 0 else 0.0
+        if bool(feedback_fresh) and int(prev_budget) > 0 and int(plain_patch_final_prev) > 0 and float(plain_ratio_prev) < 0.08 and plain_ratio_actual_now > 0.20:
+            policy["feedback_ratio_mismatch"] = True
+        reserved_ratio_actual_now = float(keep_plain_patch_reserved_prev) / float(max(1, int(prev_budget))) if int(prev_budget) > 0 else 0.0
+        if bool(feedback_fresh) and int(prev_budget) > 0 and int(keep_plain_patch_reserved_prev) > 0 and float(reserved_ratio_prev) < 0.04 and reserved_ratio_actual_now > 0.15:
+            policy["feedback_ratio_mismatch"] = True
         if legacy_observation_break:
             policy["legacy_break_force_recent_plain"] = True
             policy["legacy_break_anchor_scale"] = 0.90 if (early_assist_active and int(frame_idx) < int(self.geo_reference_enable_after)) else 0.20
@@ -1929,7 +2207,7 @@ class Aggregator(nn.Module):
         self.geo_selector_overlap_ema = float(metrics["selector_overlap_ema"])
         self.geo_selector_visible_ratio_ema = float(metrics["selector_visible_ratio_ema"])
         self.geo_maturity_ema = float(metrics["maturity"])
-        self.geo_instability_ema = float(metrics["instability"])
+        self.geo_instability_ema = float(policy.get("instability_committed", metrics["instability"]))
 
         self.geo_selector_mode = str(fsm["selector_mode_next"])
         self.geo_handover_ready_streak = int(fsm["handover_ready_streak_next"])
@@ -1939,6 +2217,8 @@ class Aggregator(nn.Module):
 
         self.geo_last_committed_policy = copy.deepcopy(policy)
         self.geo_last_policy_frame = int(frame_idx)
+        # NOTE: geo_last_policy_inputs is a preview/commit snapshot for debug and policy introspection.
+        # Finalized keep feedback used by controller logic is stored separately in geo_last_keep_feedback.
         self.geo_last_policy_inputs = {
             "frame_idx": int(frame_idx),
             "total_tokens": int(total_tokens),
@@ -1955,8 +2235,37 @@ class Aggregator(nn.Module):
             "reserved_target_effective": float(policy.get("reserved_target_effective", 0.06)),
             "stable_visible_ratio_prev": float(policy.get("stable_visible_ratio_prev", 1.0)),
             "prev_budget": int(policy.get("prev_budget", 0) or 0),
+            "feedback_fresh": bool(policy.get("feedback_fresh", False)),
+            "feedback_prev_budget": int(policy.get("feedback_prev_budget", 0) or 0),
+            "frame_keep_budget_last": int(policy.get("frame_keep_budget_last", 0) or 0),
+            "frame_keep_capacity_last": int(policy.get("frame_keep_capacity_last", 0) or 0),
+            "plain_ratio_last": float(policy.get("plain_ratio_last", 0.0) or 0.0),
+            "reserved_ratio_last": float(policy.get("reserved_ratio_last", 0.0) or 0.0),
+            "plain_ratio_capacity_last": float(policy.get("plain_ratio_capacity_last", 0.0) or 0.0),
+            "reserved_ratio_capacity_last": float(policy.get("reserved_ratio_capacity_last", 0.0) or 0.0),
+            "controller_stress": float(policy.get("controller_stress", 0.0) or 0.0),
+            "visible_stress": float(policy.get("visible_stress", 0.0) or 0.0),
+            "overlap_stress": float(policy.get("overlap_stress", 0.0) or 0.0),
+            "frozen_overlap_stress": float(policy.get("frozen_overlap_stress", 0.0) or 0.0),
+            "frozen_residual_stress": float(policy.get("frozen_residual_stress", 0.0) or 0.0),
+            "external_drift_bad": bool(policy.get("external_drift_bad", False)),
+            "health_feedback_fresh": bool(policy.get("health_feedback_fresh", False)),
+            "health_selector_fresh": bool(policy.get("health_selector_fresh", False)),
+            "plain_ratio_recent": float(policy.get("plain_ratio_recent", 0.0) or 0.0),
+            "reserved_ratio_recent": float(policy.get("reserved_ratio_recent", 0.0) or 0.0),
+            "stable_visible_ratio": float(policy.get("stable_visible_ratio", 0.0) or 0.0),
+            "stable_overlap": float(policy.get("stable_overlap", 0.0) or 0.0),
+            "overlap_ref": float(policy.get("overlap_ref", 0.0) or 0.0),
+            "overlap_health": float(policy.get("overlap_health", 0.0) or 0.0),
+            "geo_frozen_reference_ready": bool(policy.get("geo_frozen_reference_ready", False)),
+            "geo_frozen_reference_frame": int(policy.get("geo_frozen_reference_frame", -1) or -1),
+            "geo_frozen_ref_overlap_ema": float(policy.get("geo_frozen_ref_overlap_ema", 0.0) or 0.0),
+            "geo_frozen_ref_residual_ema": float(policy.get("geo_frozen_ref_residual_ema", 0.0) or 0.0),
             "frame0_hard_scale": float(policy.get("frame0_hard_scale", 1.0)),
             "reference_hard_scale": float(policy.get("reference_hard_scale", 1.0)),
+            "instability_preview_old": float(policy.get("instability_preview_old", metrics["instability"])),
+            "instability_preview_new": float(policy.get("instability_preview_new", self.geo_instability_ema)),
+            "instability_committed": float(policy.get("instability_committed", self.geo_instability_ema)),
         }
         self.geo_last_policy_metrics = copy.deepcopy(metrics)
         self.geo_last_commit_guard_frame = int(frame_idx)
@@ -2647,19 +2956,14 @@ class Aggregator(nn.Module):
         runtime_map_ready = bool(self._update_geo_runtime_ready(frame_idx) if runtime_map_ready is None else runtime_map_ready)
         structure_ready = self._geo_structure_ready()
         prestructure_ref_ready = self._geo_prestructure_reference_ready()
-        selector_diag = self._geo_get_last_selector_diag() or {}
-        stable_vis_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
-        stable_overlap = int(selector_diag.get("stable_visible_overlap", selector_diag.get("stable_visible_voxel_overlap", 0)))
-        visible_total = int(selector_diag.get("visible_total", 0))
+        health = self._geo_compute_controller_health(
+            frame_idx=int(frame_idx),
+            matched_ema=float(matched_ratio),
+        )
         prestructure_bad_runtime = bool(
             int(frame_idx) >= int(self.geo_bootstrap_frames) + 32
             and prestructure_ref_ready
-            and (
-                stable_vis_ratio < 0.70
-                or stable_overlap < 320
-                or visible_total < 6000
-                or float(matched_ratio) < 0.10
-            )
+            and bool(health["runtime_bad"])
         )
 
         if str(self.geo_reloc_state) != "off":
@@ -2685,15 +2989,13 @@ class Aggregator(nn.Module):
             return
 
         if runtime_map_ready:
-            bad_runtime = (
+            bad_runtime = bool(
                 float(self.geo_trust_score) < float(self.geo_selection_low_trust_threshold)
                 or float(matched_ratio) < 0.05
-                or stable_vis_ratio < 0.70
-                or stable_overlap < 320
-                or visible_total < 6000
+                or bool(health["runtime_bad"])
                 or (
                     len(self.geo_reference_bank) >= 16
-                    and int(ref_overlap) < max(4, int(self.geo_reference_min_overlap // 2))
+                    and int(ref_overlap) < max(4, int(0.35 * float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)))
                 )
             )
         else:
@@ -2701,6 +3003,21 @@ class Aggregator(nn.Module):
 
         if policy is not None:
             policy["diag_bad_runtime"] = bool(bad_runtime)
+            policy["runtime_overlap_health"] = float(health["overlap_health"])
+            policy["runtime_bad_runtime_norm"] = bool(health["runtime_bad"])
+            policy["runtime_bad_from_health"] = bool(health["runtime_bad"])
+            policy["health_feedback_fresh"] = bool(health["feedback_fresh"])
+            policy["health_selector_fresh"] = bool(health["selector_fresh"])
+            policy["plain_ratio_recent"] = float(health["plain_ratio_recent"])
+            policy["reserved_ratio_recent"] = float(health["reserved_ratio_recent"])
+            policy["stable_visible_ratio"] = float(health["stable_visible_ratio"])
+            policy["stable_overlap"] = float(health["stable_overlap"])
+            policy["overlap_ref"] = float(health["overlap_ref"])
+            policy["controller_stress"] = float(health["controller_stress"])
+            policy["handover_ok"] = bool(health["handover_ok"])
+        self.geo_last_policy_inputs["runtime_overlap_health"] = float(health["overlap_health"])
+        self.geo_last_policy_inputs["runtime_bad_runtime_norm"] = bool(health["runtime_bad"])
+        self.geo_last_policy_inputs["runtime_bad_from_health"] = bool(health["runtime_bad"])
 
         can_start_new_reloc = bool(structure_ready or self._geo_prestructure_reloc_ready())
         if bool(allow_reloc_trigger) and can_start_new_reloc and bad_runtime and str(self.geo_reloc_state) == "off":
@@ -2729,7 +3046,7 @@ class Aggregator(nn.Module):
             self.geo_current_release_streak = int(self.geo_current_release_streak) + 1
         else:
             self.geo_current_release_streak = 0
-        if int(self.geo_current_release_streak) >= 3:
+        if int(self.geo_current_release_streak) >= 2:
             self.geo_reloc_state = "off"
             self.geo_reloc_frames_left = 0
             self.geo_reloc_hard_left = 0
@@ -2872,6 +3189,21 @@ class Aggregator(nn.Module):
             ref_pos = torch.tensor([ref["pos_x"], ref["pos_y"], ref["pos_z"]], dtype=pos_mean.dtype)
             ref_residuals.append(float(((pos_mean - ref_pos) ** 2).mean().sqrt().item()))
         ref_overlap = int(len(ref_residuals))
+        frozen_ref_residuals: List[float] = []
+        frozen_ref_overlap = 0
+        if bool(self.geo_frozen_reference_ready) and self.geo_frozen_reference_bank:
+            for g in range(num_groups):
+                key = tuple(int(v) for v in uniq_vox[g].tolist())
+                frozen_ref = self.geo_frozen_reference_bank.get(key)
+                if frozen_ref is None:
+                    continue
+                pos_mean = pos_mean_all[g]
+                frozen_pos = torch.tensor([frozen_ref["pos_x"], frozen_ref["pos_y"], frozen_ref["pos_z"]], dtype=pos_mean.dtype)
+                frozen_ref_residuals.append(float(((pos_mean - frozen_pos) ** 2).mean().sqrt().item()))
+            frozen_ref_overlap = int(len(frozen_ref_residuals))
+        frozen_ref_residual_mean = float(sum(frozen_ref_residuals) / float(max(1, len(frozen_ref_residuals)))) if frozen_ref_residuals else 0.0
+        self.geo_frozen_ref_overlap_ema = self._ema(self.geo_frozen_ref_overlap_ema, float(frozen_ref_overlap))
+        self.geo_frozen_ref_residual_ema = self._ema(self.geo_frozen_ref_residual_ema, float(frozen_ref_residual_mean))
 
         policy = copy.deepcopy(self.geo_last_committed_policy) if self.geo_last_committed_policy is not None else self._geo_default_policy(int(frame_idx))
         safe_warmup = not bool(policy["use_anchor_labels"])
@@ -3236,6 +3568,7 @@ class Aggregator(nn.Module):
         )
 
         structure_ready_now = self._update_geo_structure_ready_streak(frame_idx)
+        self._maybe_freeze_reference_bank(frame_idx)
         self.geo_last_observation = {
             "frame_idx": int(frame_idx),
             "matched_ratio": float(matched_ratio),
@@ -3249,6 +3582,8 @@ class Aggregator(nn.Module):
             "seed_reference_quota": float(seed_reference_quota),
             "seed_landmark_quota": float(seed_landmark_quota),
             "post_bootstrap_growth": float(1.0 if post_bootstrap_growth else 0.0),
+            "frozen_ref_overlap": float(frozen_ref_overlap),
+            "frozen_ref_residual": float(frozen_ref_residual_mean),
         }
 
         bootstrap_voxel_count = int(len(self.geo_voxel_bank))
@@ -3264,6 +3599,12 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["seed_landmark_quota"] = int(seed_landmark_quota)
         self.geo_last_policy_inputs["diag_bad_runtime"] = bool((policy or {}).get("diag_bad_runtime", False))
         self.geo_last_policy_inputs["post_bootstrap_growth"] = bool(post_bootstrap_growth)
+        self.geo_last_policy_inputs["geo_frozen_reference_ready"] = bool(self.geo_frozen_reference_ready)
+        self.geo_last_policy_inputs["geo_frozen_reference_frame"] = int(self.geo_frozen_reference_frame)
+        self.geo_last_policy_inputs["geo_frozen_ref_overlap_ema"] = float(self.geo_frozen_ref_overlap_ema)
+        self.geo_last_policy_inputs["geo_frozen_ref_residual_ema"] = float(self.geo_frozen_ref_residual_ema)
+        self.geo_last_policy_inputs["geo_frozen_reference_refresh_count"] = int(self.geo_frozen_reference_refresh_count)
+        self.geo_last_policy_inputs["geo_frozen_reference_refresh_reason"] = str(self.geo_frozen_reference_refresh_reason)
 
         if self._should_log_geo_bootstrap(int(frame_idx)):
             logger.info(
@@ -4683,6 +5024,248 @@ class Aggregator(nn.Module):
         )
         return self._build_identity_keep_from_meta(meta, keep, preserve_order=True)
 
+    def _build_selector_diag_payload_for_keep(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        keep_idx_seed: torch.Tensor,
+        current_view: Optional[Dict[str, Any]],
+        trigger_view: Optional[Dict[str, Any]],
+        near: float,
+        far: float,
+        current_frame_idx: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
+        keep_idx_seed = self._sanitize_keep_idx_preserve_order(
+            keep_idx_seed.detach().cpu().long(),
+            meta_len=int(meta.get("frame_idx", torch.empty((0,), dtype=torch.long)).numel()),
+            kv_len=int(meta.get("frame_idx", torch.empty((0,), dtype=torch.long)).numel()),
+        )
+        proxy = self._geo_proxy_selector_diag(
+            current_frame_idx=int(current_frame_idx),
+            selected_total=int(keep_idx_seed.numel()),
+        )
+        fallback_diag = {
+            "stable_visible_voxel_overlap": int(proxy["stable_visible_overlap"]),
+            "stable_selected_visible": int(proxy["stable_selected_visible"]),
+            "stable_selected_invisible": int(proxy["stable_selected_invisible"]),
+            "visible_total": int(proxy["visible_total"]),
+        }
+        if keep_idx_seed.numel() == 0:
+            return None, fallback_diag
+
+        view = current_view if isinstance(current_view, dict) else None
+        if view is None or view.get("world_to_cam") is None or view.get("intrinsic") is None:
+            view = trigger_view if isinstance(trigger_view, dict) else None
+        if view is None or view.get("world_to_cam") is None or view.get("intrinsic") is None:
+            return None, fallback_diag
+
+        world_to_cam = view.get("world_to_cam")
+        intrinsic = view.get("intrinsic")
+        img_hw = view.get("img_hw")
+        if isinstance(world_to_cam, torch.Tensor):
+            world_to_cam = world_to_cam.detach().cpu()
+        if isinstance(intrinsic, torch.Tensor):
+            intrinsic = intrinsic.detach().cpu()
+        if isinstance(world_to_cam, torch.Tensor) and world_to_cam.ndim == 3:
+            world_to_cam = world_to_cam[0]
+        if isinstance(intrinsic, torch.Tensor) and intrinsic.ndim == 3:
+            intrinsic = intrinsic[0]
+        if not isinstance(world_to_cam, torch.Tensor) or not isinstance(intrinsic, torch.Tensor):
+            return None, fallback_diag
+
+        frame_idx = meta.get("frame_idx", torch.empty((0,), dtype=torch.long))
+        local_idx = meta.get("local_patch_idx", torch.full((frame_idx.numel(),), -1, dtype=torch.long))
+        gather_idx: List[torch.Tensor] = []
+        gather_hash: List[torch.Tensor] = []
+        gather_visible: List[torch.Tensor] = []
+        for fidx in torch.unique(frame_idx.index_select(0, keep_idx_seed)).tolist():
+            fidx = int(fidx)
+            frame_meta = self.geo_frame_meta.get(fidx)
+            if frame_meta is None or frame_meta.get("pts") is None or frame_meta.get("voxel_ids") is None:
+                continue
+            in_frame = keep_idx_seed[frame_idx.index_select(0, keep_idx_seed) == fidx]
+            if in_frame.numel() == 0:
+                continue
+            local = local_idx.index_select(0, in_frame).long()
+            valid = (local >= 0) & (local < frame_meta["pts"].shape[0])
+            if valid.sum().item() == 0:
+                continue
+            in_frame = in_frame[valid]
+            local = local[valid]
+            pts = frame_meta["pts"].index_select(0, local).to(torch.float32)
+            vox = frame_meta["voxel_ids"].index_select(0, local)
+            visible = self._frustum_mask(
+                pts,
+                world_to_cam.to(torch.float32),
+                intrinsic.to(torch.float32),
+                near=float(near),
+                far=float(far),
+                img_hw=img_hw,
+            )
+            gather_idx.append(in_frame.to(torch.long))
+            gather_hash.append(self._voxel_hash(vox))
+            gather_visible.append(visible.to(torch.bool))
+
+        if not gather_idx:
+            return None, fallback_diag
+
+        diag_idx_all = torch.cat(gather_idx, dim=0).detach().cpu().long()
+        diag_hash_all = torch.cat(gather_hash, dim=0).detach().cpu().long()
+        diag_visible_all = torch.cat(gather_visible, dim=0).detach().cpu().bool()
+        stable_source = self.geo_reference_voxels if len(self.geo_reference_voxels) > 0 else self.geo_stable_map_voxels
+        stable_hash = self._voxel_hash(torch.tensor(sorted(stable_source), dtype=torch.long)) if stable_source else torch.empty((0,), dtype=torch.long)
+        stable_mask = torch.isin(diag_hash_all, stable_hash) if stable_hash.numel() > 0 else torch.zeros_like(diag_visible_all)
+        selected_mask = torch.ones_like(diag_visible_all, dtype=torch.bool)
+        fallback_diag = {
+            "stable_visible_voxel_overlap": int(torch.unique(diag_hash_all[stable_mask & diag_visible_all]).numel()) if stable_hash.numel() > 0 else 0,
+            "stable_selected_visible": int((selected_mask & stable_mask & diag_visible_all).sum().item()),
+            "stable_selected_invisible": int((selected_mask & stable_mask & (~diag_visible_all)).sum().item()),
+            "visible_total": int(diag_visible_all.sum().item()),
+        }
+        diag_payload: Dict[str, Any] = {
+            "diag_idx_all": diag_idx_all,
+            "diag_hash_all": diag_hash_all,
+            "diag_visible_all": diag_visible_all,
+            "diag_stable_hash": stable_hash.detach().cpu().long(),
+            "diag_world_to_cam": world_to_cam.detach().cpu(),
+            "diag_intrinsic": intrinsic.detach().cpu(),
+            "diag_img_hw": img_hw,
+            "diag_near": float(near),
+            "diag_far": float(far),
+            "stable_visible_voxel_overlap": int(fallback_diag["stable_visible_voxel_overlap"]),
+            "stable_selected_visible": int(fallback_diag["stable_selected_visible"]),
+            "stable_selected_invisible": int(fallback_diag["stable_selected_invisible"]),
+            "visible_total": int(fallback_diag["visible_total"]),
+        }
+        return diag_payload, fallback_diag
+
+    def _build_reloc_keep_with_feedback(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        current_frame_idx: int,
+        recent_frames: int,
+        max_past_tokens: int,
+        current_view: Optional[Dict[str, Any]],
+        trigger_view: Optional[Dict[str, Any]],
+        near: float,
+        far: float,
+        hard_keep_idx: Optional[torch.Tensor],
+        policy: Optional[Dict[str, Any]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        identity_seed = self._build_reloc_identity_keep(
+            meta=meta,
+            max_past_tokens=max_past_tokens,
+            recent_frames=recent_frames,
+            policy=policy,
+        )
+        keep_seed = self._identity_keep_to_index(meta, identity_seed, preserve_order=True)
+        plain_reserved_idx = self._implicit_recent_plain_floor_idx(
+            meta,
+            current_frame_idx=int(current_frame_idx),
+            recent_frames_eff=max(1, int(recent_frames)),
+            max_past_tokens=int(max_past_tokens),
+            policy=policy,
+        )
+        diag_payload, fallback_diag = self._build_selector_diag_payload_for_keep(
+            meta=meta,
+            keep_idx_seed=keep_seed,
+            current_view=current_view,
+            trigger_view=trigger_view,
+            near=float(near),
+            far=float(far),
+            current_frame_idx=int(current_frame_idx),
+        )
+        priority_for_cap = self._unique_preserve_order_long(
+            torch.cat([
+                hard_keep_idx.detach().cpu().long() if hard_keep_idx is not None else torch.empty((0,), dtype=torch.long),
+                plain_reserved_idx,
+                keep_seed,
+            ], dim=0)
+        )
+        final_keep_idx = self._finalize_geo_keep(
+            meta=meta,
+            selected=set(int(v) for v in keep_seed.tolist()),
+            selected_order=[int(v) for v in keep_seed.tolist()],
+            current_frame_idx=int(current_frame_idx),
+            recent_frames_eff=max(1, int(recent_frames)),
+            max_past_tokens=int(max_past_tokens),
+            candidate_count=int(keep_seed.numel()),
+            visible_total=int(fallback_diag["visible_total"]),
+            anchor_count=int((meta.get("geo_role", self._compute_primary_geo_role(meta)) == 3).sum().item()),
+            stable_count=0,
+            tau_bucket=float("nan"),
+            stable_visible_voxel_overlap=int(fallback_diag["stable_visible_voxel_overlap"]),
+            stable_selected_visible=int(fallback_diag["stable_selected_visible"]),
+            stable_selected_invisible=int(fallback_diag["stable_selected_invisible"]),
+            fast_path=9,
+            hard_keep_idx=hard_keep_idx,
+            diag_payload=diag_payload,
+            allow_fill=False,
+            priority_keep_idx=priority_for_cap,
+            policy=policy,
+            update_selector_diag=True,
+            plain_reserved_idx=plain_reserved_idx,
+        )
+
+        plain_survived = int(torch.isin(plain_reserved_idx, final_keep_idx).sum().item()) if plain_reserved_idx.numel() > 0 else 0
+        plain_floor_target = min(
+            int(plain_reserved_idx.numel()),
+            max(128, int(0.05 * int(max_past_tokens))),
+        )
+        plain_floor_violation = bool(plain_reserved_idx.numel() > 0 and plain_survived < plain_floor_target)
+        if plain_floor_violation:
+            retry_priority_for_cap = self._unique_preserve_order_long(
+                torch.cat([
+                    plain_reserved_idx,
+                    hard_keep_idx.detach().cpu().long() if hard_keep_idx is not None else torch.empty((0,), dtype=torch.long),
+                    plain_reserved_idx,
+                    keep_seed,
+                ], dim=0)
+            )
+            retry_keep_idx = self._finalize_geo_keep(
+                meta=meta,
+                selected=set(int(v) for v in keep_seed.tolist()),
+                selected_order=[int(v) for v in keep_seed.tolist()],
+                current_frame_idx=int(current_frame_idx),
+                recent_frames_eff=max(1, int(recent_frames)),
+                max_past_tokens=int(max_past_tokens),
+                candidate_count=int(keep_seed.numel()),
+                visible_total=int(fallback_diag["visible_total"]),
+                anchor_count=int((meta.get("geo_role", self._compute_primary_geo_role(meta)) == 3).sum().item()),
+                stable_count=0,
+                tau_bucket=float("nan"),
+                stable_visible_voxel_overlap=int(fallback_diag["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(fallback_diag["stable_selected_visible"]),
+                stable_selected_invisible=int(fallback_diag["stable_selected_invisible"]),
+                fast_path=9,
+                hard_keep_idx=hard_keep_idx,
+                diag_payload=diag_payload,
+                allow_fill=False,
+                priority_keep_idx=retry_priority_for_cap,
+                policy=policy,
+                update_selector_diag=True,
+                plain_reserved_idx=plain_reserved_idx,
+            )
+            retry_plain_survived = int(torch.isin(plain_reserved_idx, retry_keep_idx).sum().item()) if plain_reserved_idx.numel() > 0 else 0
+            if retry_plain_survived >= plain_survived:
+                final_keep_idx = retry_keep_idx
+                plain_survived = retry_plain_survived
+            plain_floor_violation = bool(plain_reserved_idx.numel() > 0 and plain_survived < plain_floor_target)
+
+        self.geo_last_policy_inputs["reloc_plain_floor_target"] = int(plain_floor_target)
+        self.geo_last_policy_inputs["reloc_plain_floor_survived"] = int(plain_survived)
+        self.geo_last_policy_inputs["reloc_plain_floor_violation"] = bool(plain_floor_violation)
+        final_identity_keep = self._build_identity_keep_from_meta(
+            meta,
+            final_keep_idx,
+            preserve_order=True,
+        )
+        self.geo_last_policy_inputs["reloc_feedback_updated"] = bool(True)
+        self.geo_last_policy_inputs["reloc_feedback_path"] = "shared_finalize"
+        self.geo_last_policy_inputs["selector_diag_updated"] = bool(True)
+        return final_keep_idx, final_identity_keep
+
     def _select_patch_diverse(
         self,
         patch_idx: torch.Tensor,
@@ -5569,12 +6152,17 @@ class Aggregator(nn.Module):
         anchor_count_final = int((keep_role == 3).sum().item())
         plain_keep_final = int((keep_role == 0).sum().item())
         self.geo_last_policy_inputs["keep_plain_patch_final"] = int(plain_keep_final)
-        layer_keep_budget = int(max_past_tokens) if max_past_tokens is not None else int(keep.numel())
+        keep_size = int(keep.numel())
+        capacity_budget = int(max_past_tokens) if max_past_tokens is not None else int(keep.numel())
+        controller_budget = int(keep_size)
         self.geo_last_policy_inputs["frame_keep_plain_patch_final_last"] = int(plain_keep_final)
         self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_last"] = int(keep_plain_reserved_final)
-        self.geo_last_policy_inputs["frame_keep_budget_last"] = int(layer_keep_budget)
-        plain_ratio_last = float(plain_keep_final) / float(max(1, int(layer_keep_budget)))
-        reserved_ratio_last = float(keep_plain_reserved_final) / float(max(1, int(layer_keep_budget)))
+        self.geo_last_policy_inputs["frame_keep_budget_last"] = int(controller_budget)
+        self.geo_last_policy_inputs["frame_keep_capacity_last"] = int(capacity_budget)
+        plain_ratio_last = float(plain_keep_final) / float(max(1, int(controller_budget)))
+        reserved_ratio_last = float(keep_plain_reserved_final) / float(max(1, int(controller_budget)))
+        plain_ratio_capacity_last = float(plain_keep_final) / float(max(1, int(capacity_budget)))
+        reserved_ratio_capacity_last = float(keep_plain_reserved_final) / float(max(1, int(capacity_budget)))
         alpha = 0.20
         if self.geo_plain_ratio_ema is None:
             self.geo_plain_ratio_ema = float(plain_ratio_last)
@@ -5586,27 +6174,38 @@ class Aggregator(nn.Module):
             self.geo_reserved_ratio_ema = float((1.0 - alpha) * float(self.geo_reserved_ratio_ema) + alpha * float(reserved_ratio_last))
         self.geo_last_policy_inputs["plain_ratio_last"] = float(plain_ratio_last)
         self.geo_last_policy_inputs["reserved_ratio_last"] = float(reserved_ratio_last)
+        self.geo_last_policy_inputs["plain_ratio_capacity_last"] = float(plain_ratio_capacity_last)
+        self.geo_last_policy_inputs["reserved_ratio_capacity_last"] = float(reserved_ratio_capacity_last)
         self.geo_last_policy_inputs["geo_plain_ratio_ema"] = float(self.geo_plain_ratio_ema)
         self.geo_last_policy_inputs["geo_reserved_ratio_ema"] = float(self.geo_reserved_ratio_ema)
         # *_min fields are diagnostics of worst historical keep quality; controller uses *_last + EMA.
         prev_min_plain = self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_min", None)
         prev_min_reserved = self.geo_last_policy_inputs.get("frame_keep_plain_patch_reserved_min", None)
         prev_min_budget = self.geo_last_policy_inputs.get("frame_keep_budget_min", None)
+        prev_min_capacity = self.geo_last_policy_inputs.get("frame_keep_capacity_min", None)
+        prev_min_plain_capacity_ratio = self.geo_last_policy_inputs.get("plain_ratio_capacity_min", None)
+        prev_min_reserved_capacity_ratio = self.geo_last_policy_inputs.get("reserved_ratio_capacity_min", None)
         if prev_min_plain is None or prev_min_reserved is None or prev_min_budget is None:
             self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = int(plain_keep_final)
             self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = int(keep_plain_reserved_final)
-            self.geo_last_policy_inputs["frame_keep_budget_min"] = int(layer_keep_budget)
+            self.geo_last_policy_inputs["frame_keep_budget_min"] = int(controller_budget)
         else:
             old_plain_ratio = float(prev_min_plain) / float(max(1, int(prev_min_budget)))
-            new_plain_ratio = float(plain_keep_final) / float(max(1, int(layer_keep_budget)))
+            new_plain_ratio = float(plain_keep_final) / float(max(1, int(controller_budget)))
             old_reserved_ratio = float(prev_min_reserved) / float(max(1, int(prev_min_budget)))
-            new_reserved_ratio = float(keep_plain_reserved_final) / float(max(1, int(layer_keep_budget)))
+            new_reserved_ratio = float(keep_plain_reserved_final) / float(max(1, int(controller_budget)))
             old_score = min(old_plain_ratio, old_reserved_ratio)
             new_score = min(new_plain_ratio, new_reserved_ratio)
             if new_score < old_score:
                 self.geo_last_policy_inputs["frame_keep_plain_patch_final_min"] = int(plain_keep_final)
                 self.geo_last_policy_inputs["frame_keep_plain_patch_reserved_min"] = int(keep_plain_reserved_final)
-                self.geo_last_policy_inputs["frame_keep_budget_min"] = int(layer_keep_budget)
+                self.geo_last_policy_inputs["frame_keep_budget_min"] = int(controller_budget)
+        if prev_min_capacity is None or int(capacity_budget) < int(prev_min_capacity):
+            self.geo_last_policy_inputs["frame_keep_capacity_min"] = int(capacity_budget)
+        if prev_min_plain_capacity_ratio is None or plain_ratio_capacity_last < float(prev_min_plain_capacity_ratio):
+            self.geo_last_policy_inputs["plain_ratio_capacity_min"] = float(plain_ratio_capacity_last)
+        if prev_min_reserved_capacity_ratio is None or reserved_ratio_capacity_last < float(prev_min_reserved_capacity_ratio):
+            self.geo_last_policy_inputs["reserved_ratio_capacity_min"] = float(reserved_ratio_capacity_last)
 
         prev_cache_identity = self.geo_cached_landmark_identity_keep.detach().cpu().clone()
         overlap = self._count_keep_cache_overlap_identity(meta, keep, prev_cache_identity)
@@ -5630,6 +6229,30 @@ class Aggregator(nn.Module):
                 hard_keep_continuity=float(hard_keep_continuity),
                 frame0_pin_ratio=float(min(1.0, max(0.0, frame0_pin_ratio))),
             )
+        selector_diag_frame = int(self.geo_last_selector_diag.get("frame_idx", -1)) if isinstance(self.geo_last_selector_diag, dict) else -1
+        mode_feedback = str((policy or {}).get("mode", "legacy"))
+        reloc_feedback_updated = bool(self.geo_last_policy_inputs.get("reloc_feedback_updated", False))
+        self.geo_last_keep_feedback = {
+            "frame_idx": int(current_frame_idx),
+            "frame_keep_budget_last": int(controller_budget),
+            "frame_keep_capacity_last": int(capacity_budget),
+            "frame_keep_plain_patch_final_last": int(plain_keep_final),
+            "frame_keep_plain_patch_reserved_last": int(keep_plain_reserved_final),
+            "plain_ratio_last": float(plain_ratio_last),
+            "reserved_ratio_last": float(reserved_ratio_last),
+            "plain_ratio_capacity_last": float(plain_ratio_capacity_last),
+            "reserved_ratio_capacity_last": float(reserved_ratio_capacity_last),
+            "geo_plain_ratio_ema": float(self.geo_plain_ratio_ema),
+            "geo_reserved_ratio_ema": float(self.geo_reserved_ratio_ema),
+            "recent_plain_floor_kept_final": int(self.geo_last_policy_inputs.get("recent_plain_floor_kept_final", 0) or 0),
+            "keep_plain_patch_final": int(plain_keep_final),
+            "keep_plain_patch_reserved": int(keep_plain_reserved_final),
+            "selector_diag_frame": int(selector_diag_frame),
+            "reloc_feedback_updated": bool(reloc_feedback_updated),
+            "feedback_updated": bool(True),
+            "feedback_source": str("finalize_reloc" if reloc_feedback_updated else f"finalize_{mode_feedback}"),
+            "feedback_fresh": bool(True),
+        }
         self._queue_geo_console_log(
             current_frame_idx=current_frame_idx,
             total_tokens=total_tokens,
@@ -5650,6 +6273,16 @@ class Aggregator(nn.Module):
             budget=int(max_past_tokens or 0),
             kv_comp_old=kv_old,
             kv_comp_keep=kv_keep,
+        )
+        logger.debug(
+            "[geo_keep_ratio] frame=%d keep_size=%d capacity=%d plain_actual=%.4f reserved_actual=%.4f plain_capacity=%.4f reserved_capacity=%.4f",
+            int(current_frame_idx),
+            int(controller_budget),
+            int(capacity_budget),
+            float(plain_ratio_last),
+            float(reserved_ratio_last),
+            float(plain_ratio_capacity_last),
+            float(reserved_ratio_capacity_last),
         )
         return keep
 
@@ -5820,16 +6453,38 @@ class Aggregator(nn.Module):
         )
 
     def _geo_prestructure_reloc_ready(self) -> bool:
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         return bool(
             self._geo_prestructure_handover_ready()
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.18
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.72
+            and self.geo_selector_mode in {"current", "recovery"}
+            and len(self.geo_reference_bank) >= 64
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 12.0
+            and bool(health["handover_ok"])
+            and float(health["overlap_health"]) >= 0.75
+        )
+
+    def _geo_feedback_fresh(self, frame_idx: int) -> bool:
+        feedback, feedback_fresh = self._geo_get_last_keep_feedback(int(frame_idx), max_age=2)
+        if not feedback_fresh:
+            return False
+        diag = self._geo_get_last_selector_diag()
+        if diag is None:
+            return False
+        diag_frame = int(diag.get("frame_idx", -1))
+        keep_budget_last = feedback.get("frame_keep_budget_last", None)
+        plain_last = feedback.get("frame_keep_plain_patch_final_last", None)
+        feedback_updated = bool(feedback.get("feedback_updated", False))
+        return bool(
+            diag_frame >= int(frame_idx) - 1
+            and keep_budget_last is not None
+            and plain_last is not None
+            and feedback_updated
         )
 
     def _geo_reloc_release_ready(self) -> bool:
-        last_budget = int(self.geo_last_policy_inputs.get("frame_keep_budget_last", 0) or 0)
-        plain_last = int(self.geo_last_policy_inputs.get("frame_keep_plain_patch_final_last", 0) or 0)
-        plain_ratio_last = float(plain_last) / float(max(1, last_budget))
+        if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
+            return False
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -5839,13 +6494,19 @@ class Aggregator(nn.Module):
             self._geo_structure_ready()
             and len(self.geo_reference_bank) >= 32
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.55
             and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.15
-            and plain_ratio_last >= 0.18
             and selector_diag_fresh
+            and float(health["plain_ratio_recent"]) >= 0.14
+            and float(health["reserved_ratio_recent"]) >= 0.06
+            and float(health["stable_visible_ratio"]) >= 0.70
+            and float(health["overlap_health"]) >= 0.65
+            and (not bool(health["external_drift_bad"]))
         )
 
     def _geo_current_release_ready(self) -> bool:
+        if not self._geo_feedback_fresh(int(self.geo_last_policy_frame)):
+            return False
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         selector_diag = self._geo_get_last_selector_diag()
         selector_diag_fresh = bool(
             selector_diag is not None
@@ -5855,10 +6516,14 @@ class Aggregator(nn.Module):
             self._geo_structure_ready()
             and len(self.geo_reference_bank) >= 128
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 20.0
-            and float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0) >= 0.80
-            and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.20
-            and float(getattr(self, "geo_plain_ratio_ema", 0.0) or 0.0) >= 0.22
+            and float(getattr(self, "geo_matched_ema", 0.0) or 0.0) >= 0.18
             and selector_diag_fresh
+            and float(health["plain_ratio_recent"]) >= 0.16
+            and float(health["reserved_ratio_recent"]) >= 0.07
+            and float(health["stable_visible_ratio"]) >= 0.74
+            and float(health["overlap_health"]) >= 0.75
+            and (not bool(health["external_drift_bad"]))
+            and ((not self.geo_frozen_reference_ready) or float(self.geo_frozen_ref_residual_ema) <= 0.12)
         )
 
     def _geo_bootstrap_bank_ready(self, frame_idx: int) -> bool:
@@ -6499,7 +7164,18 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["prestructure_ref_ready"] = bool(prestructure_ref_ready)
         self.geo_last_policy_inputs["force_real_prune"] = bool(force_real_prune)
         self.geo_last_policy_inputs["prune_start_ratio_eff"] = float(prune_start_ratio_eff)
-        if (not force_real_prune) and max_past_tokens is not None and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff)):
+        allow_keepall_fastpath = bool(
+            max_past_tokens is not None
+            and mode_now == "legacy"
+        )
+        micro_prune_active = bool(
+            mode_now in {"current", "recovery"}
+            and max_past_tokens is not None
+            and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff))
+            and (int(current_frame_idx) % max(1, int(self.geo_current_microprune_period)) != 0)
+        )
+        self.geo_last_policy_inputs["micro_prune_active"] = bool(micro_prune_active)
+        if allow_keepall_fastpath and total_tokens <= int(float(max_past_tokens) * float(prune_start_ratio_eff)):
             keep_all = torch.arange(total_tokens, dtype=torch.long)
             logger.info(
                 "[geo_keep] total_tokens=%d budget=%d selected=%d selected_ratio=%.4f skip_prune=1 prune_start_ratio_eff=%.4f",
@@ -6534,6 +7210,7 @@ class Aggregator(nn.Module):
                 )
             )
             self.geo_last_policy_inputs["priority_keep_fastpath_has_plain_floor"] = bool(fast_plain_reserved.numel() > 0)
+            self.geo_last_policy_inputs["selector_diag_source"] = "proxy_legacy"
             return self._finalize_geo_keep(
                 meta=meta,
                 selected=selected_fast,
@@ -6558,6 +7235,8 @@ class Aggregator(nn.Module):
                 plain_reserved_idx=fast_plain_reserved,
                 priority_keep_idx=priority_for_cap_fast,
             )
+        if mode_now in {"current", "recovery"}:
+            self.geo_last_policy_inputs["selector_diag_source"] = f"real_{mode_now}"
 
         hard_keep = self._build_hard_backbone_keep(
             meta,
@@ -6638,6 +7317,22 @@ class Aggregator(nn.Module):
 
         # Optional fast-path (event/interval gated): only run full geo selection on key/unstable frames.
         if structure_ready and self.geo_selection_interval > 1 and (not force_full_select) and (current_frame_idx % self.geo_selection_interval != 0):
+            if mode_now in {"current", "recovery"}:
+                return self._select_geo_active_indices_current_micro(
+                    meta=meta,
+                    selected=selected,
+                    selected_order=selected_order,
+                    current_frame_idx=current_frame_idx,
+                    recent_frames_eff=recent_frames_eff,
+                    max_past_tokens=max_past_tokens,
+                    hard_keep=hard_keep,
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    policy=policy,
+                    reason="not_force_full_select",
+                )
             recent_idx = torch.nonzero(recent_mask, as_tuple=False).flatten().tolist()
             self._ordered_add(selected, selected_order, recent_idx)
             selected_fast = set(selected)
@@ -6677,6 +7372,25 @@ class Aggregator(nn.Module):
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
             )
+            update_selector_diag_fast = bool(mode_now in {"current", "recovery"})
+            diag_payload_fast = None
+            fast_fallback_diag = {
+                "visible_total": int(proxy["visible_total"]),
+                "stable_visible_voxel_overlap": int(proxy["stable_visible_overlap"]),
+                "stable_selected_visible": int(proxy["stable_selected_visible"]),
+                "stable_selected_invisible": int(proxy["stable_selected_invisible"]),
+            }
+            if update_selector_diag_fast:
+                diag_payload_fast, fast_fallback_diag = self._build_selector_diag_payload_for_keep(
+                    meta=meta,
+                    keep_idx_seed=torch.tensor(selected_fast_order, dtype=torch.long),
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    current_frame_idx=int(current_frame_idx),
+                )
+                self.geo_last_policy_inputs["selector_diag_source"] = f"real_{mode_now}"
             return self._finalize_geo_keep(
                 meta=meta,
                 selected=selected_fast,
@@ -6685,20 +7399,21 @@ class Aggregator(nn.Module):
                 recent_frames_eff=recent_frames_eff,
                 max_past_tokens=max_past_tokens,
                 candidate_count=0,
-                visible_total=int(proxy["visible_total"]),
+                visible_total=int(fast_fallback_diag["visible_total"]),
                 anchor_count=int(meta.get("is_anchor", torch.zeros_like(meta["is_special"])).sum().item()),
                 stable_count=0,
                 tau_bucket=float("nan"),
-                stable_visible_voxel_overlap=int(proxy["stable_visible_overlap"]),
-                stable_selected_visible=int(proxy["stable_selected_visible"]),
-                stable_selected_invisible=int(proxy["stable_selected_invisible"]),
+                stable_visible_voxel_overlap=int(fast_fallback_diag["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(fast_fallback_diag["stable_selected_visible"]),
+                stable_selected_invisible=int(fast_fallback_diag["stable_selected_invisible"]),
                 fast_path=1,
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
                 allow_fill=False,
-                update_selector_diag=False,
+                update_selector_diag=bool(update_selector_diag_fast),
+                diag_payload=diag_payload_fast,
                 plain_reserved_idx=fast_plain_reserved,
                 priority_keep_idx=priority_for_cap_fast,
             )
@@ -6782,6 +7497,22 @@ class Aggregator(nn.Module):
             self._ordered_add(selected, selected_order, local_u)
 
         if (not use_view_pruning) or current_view is None or current_view.get("world_to_cam") is None or current_view.get("intrinsic") is None:
+            if mode_now in {"current", "recovery"}:
+                return self._select_geo_active_indices_current_micro(
+                    meta=meta,
+                    selected=selected,
+                    selected_order=selected_order,
+                    current_frame_idx=current_frame_idx,
+                    recent_frames_eff=recent_frames_eff,
+                    max_past_tokens=max_past_tokens,
+                    hard_keep=hard_keep,
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    policy=policy,
+                    reason="no_current_view",
+                )
             selected_fast = set(selected)
             selected_fast_order = list(selected_order)
             self._ordered_add(
@@ -6819,6 +7550,25 @@ class Aggregator(nn.Module):
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
             )
+            update_selector_diag_fast = bool(mode_now in {"current", "recovery"})
+            diag_payload_fast = None
+            fast_fallback_diag = {
+                "visible_total": int(proxy["visible_total"]),
+                "stable_visible_voxel_overlap": int(proxy["stable_visible_overlap"]),
+                "stable_selected_visible": int(proxy["stable_selected_visible"]),
+                "stable_selected_invisible": int(proxy["stable_selected_invisible"]),
+            }
+            if update_selector_diag_fast:
+                diag_payload_fast, fast_fallback_diag = self._build_selector_diag_payload_for_keep(
+                    meta=meta,
+                    keep_idx_seed=torch.tensor(selected_fast_order, dtype=torch.long),
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    current_frame_idx=int(current_frame_idx),
+                )
+                self.geo_last_policy_inputs["selector_diag_source"] = f"real_{mode_now}"
             return self._finalize_geo_keep(
                 meta=meta,
                 selected=selected_fast,
@@ -6827,20 +7577,21 @@ class Aggregator(nn.Module):
                 recent_frames_eff=recent_frames_eff,
                 max_past_tokens=max_past_tokens,
                 candidate_count=0,
-                visible_total=int(proxy["visible_total"]),
+                visible_total=int(fast_fallback_diag["visible_total"]),
                 anchor_count=0,
                 stable_count=0,
                 tau_bucket=float("nan"),
-                stable_visible_voxel_overlap=int(proxy["stable_visible_overlap"]),
-                stable_selected_visible=int(proxy["stable_selected_visible"]),
-                stable_selected_invisible=int(proxy["stable_selected_invisible"]),
+                stable_visible_voxel_overlap=int(fast_fallback_diag["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(fast_fallback_diag["stable_selected_visible"]),
+                stable_selected_invisible=int(fast_fallback_diag["stable_selected_invisible"]),
                 fast_path=3,
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
                 allow_fill=False,
-                update_selector_diag=False,
+                update_selector_diag=bool(update_selector_diag_fast),
+                diag_payload=diag_payload_fast,
                 plain_reserved_idx=fast_plain_reserved,
                 priority_keep_idx=priority_for_cap_fast,
             )
@@ -6866,6 +7617,22 @@ class Aggregator(nn.Module):
         candidate_mask = (~is_special) & (~recent_mask) & (local_idx >= 0)
         candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
         if candidate_indices.numel() == 0:
+            if mode_now in {"current", "recovery"}:
+                return self._select_geo_active_indices_current_micro(
+                    meta=meta,
+                    selected=selected,
+                    selected_order=selected_order,
+                    current_frame_idx=current_frame_idx,
+                    recent_frames_eff=recent_frames_eff,
+                    max_past_tokens=max_past_tokens,
+                    hard_keep=hard_keep,
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    policy=policy,
+                    reason="empty_candidates",
+                )
             selected_fast = set(selected)
             selected_fast_order = list(selected_order)
             self._ordered_add(
@@ -6903,6 +7670,25 @@ class Aggregator(nn.Module):
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
             )
+            update_selector_diag_fast = bool(mode_now in {"current", "recovery"})
+            diag_payload_fast = None
+            fast_fallback_diag = {
+                "visible_total": int(proxy["visible_total"]),
+                "stable_visible_voxel_overlap": int(proxy["stable_visible_overlap"]),
+                "stable_selected_visible": int(proxy["stable_selected_visible"]),
+                "stable_selected_invisible": int(proxy["stable_selected_invisible"]),
+            }
+            if update_selector_diag_fast:
+                diag_payload_fast, fast_fallback_diag = self._build_selector_diag_payload_for_keep(
+                    meta=meta,
+                    keep_idx_seed=torch.tensor(selected_fast_order, dtype=torch.long),
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    current_frame_idx=int(current_frame_idx),
+                )
+                self.geo_last_policy_inputs["selector_diag_source"] = f"real_{mode_now}"
             return self._finalize_geo_keep(
                 meta=meta,
                 selected=selected_fast,
@@ -6911,20 +7697,21 @@ class Aggregator(nn.Module):
                 recent_frames_eff=recent_frames_eff,
                 max_past_tokens=max_past_tokens,
                 candidate_count=0,
-                visible_total=int(proxy["visible_total"]),
+                visible_total=int(fast_fallback_diag["visible_total"]),
                 anchor_count=0,
                 stable_count=0,
                 tau_bucket=float("nan"),
-                stable_visible_voxel_overlap=int(proxy["stable_visible_overlap"]),
-                stable_selected_visible=int(proxy["stable_selected_visible"]),
-                stable_selected_invisible=int(proxy["stable_selected_invisible"]),
+                stable_visible_voxel_overlap=int(fast_fallback_diag["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(fast_fallback_diag["stable_selected_visible"]),
+                stable_selected_invisible=int(fast_fallback_diag["stable_selected_invisible"]),
                 fast_path=6,
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
                 allow_fill=False,
-                update_selector_diag=False,
+                update_selector_diag=bool(update_selector_diag_fast),
+                diag_payload=diag_payload_fast,
                 plain_reserved_idx=fast_plain_reserved,
                 priority_keep_idx=priority_for_cap_fast,
             )
@@ -6945,6 +7732,12 @@ class Aggregator(nn.Module):
             cf = frame_idx[candidate_indices]
             order = torch.argsort(cf)
             candidate_indices = candidate_indices.index_select(0, order)[-self.geo_max_candidate_tokens :]
+        if micro_prune_active and candidate_indices.numel() > 0:
+            micro_cap = max(512, int(0.70 * float(max_past_tokens or candidate_indices.numel())))
+            if candidate_indices.numel() > micro_cap:
+                cf = frame_idx[candidate_indices]
+                order = torch.argsort(cf)
+                candidate_indices = candidate_indices.index_select(0, order)[-int(micro_cap):]
 
         # Global per-voxel top-k across all old frames (tensorized grouping to reduce Python overhead).
         gather_idx: List[torch.Tensor] = []
@@ -7044,6 +7837,22 @@ class Aggregator(nn.Module):
             gather_visible.append(visible.to(torch.bool))
 
         if not gather_idx:
+            if mode_now in {"current", "recovery"}:
+                return self._select_geo_active_indices_current_micro(
+                    meta=meta,
+                    selected=selected,
+                    selected_order=selected_order,
+                    current_frame_idx=current_frame_idx,
+                    recent_frames_eff=recent_frames_eff,
+                    max_past_tokens=max_past_tokens,
+                    hard_keep=hard_keep,
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    policy=policy,
+                    reason="empty_gather",
+                )
             selected_fast = set(selected)
             selected_fast_order = list(selected_order)
             self._ordered_add(
@@ -7081,6 +7890,25 @@ class Aggregator(nn.Module):
                 current_frame_idx=current_frame_idx,
                 selected_total=len(selected_fast),
             )
+            update_selector_diag_fast = bool(mode_now in {"current", "recovery"})
+            diag_payload_fast = None
+            fast_fallback_diag = {
+                "visible_total": int(proxy["visible_total"]),
+                "stable_visible_voxel_overlap": int(proxy["stable_visible_overlap"]),
+                "stable_selected_visible": int(proxy["stable_selected_visible"]),
+                "stable_selected_invisible": int(proxy["stable_selected_invisible"]),
+            }
+            if update_selector_diag_fast:
+                diag_payload_fast, fast_fallback_diag = self._build_selector_diag_payload_for_keep(
+                    meta=meta,
+                    keep_idx_seed=torch.tensor(selected_fast_order, dtype=torch.long),
+                    current_view=current_view,
+                    trigger_view=trigger_view,
+                    near=float(near),
+                    far=float(far),
+                    current_frame_idx=int(current_frame_idx),
+                )
+                self.geo_last_policy_inputs["selector_diag_source"] = f"real_{mode_now}"
             return self._finalize_geo_keep(
                 meta=meta,
                 selected=selected_fast,
@@ -7089,20 +7917,21 @@ class Aggregator(nn.Module):
                 recent_frames_eff=recent_frames_eff,
                 max_past_tokens=max_past_tokens,
                 candidate_count=int(candidate_count),
-                visible_total=int(proxy["visible_total"]),
+                visible_total=int(fast_fallback_diag["visible_total"]),
                 anchor_count=0,
                 stable_count=0,
                 tau_bucket=float("nan"),
-                stable_visible_voxel_overlap=int(proxy["stable_visible_overlap"]),
-                stable_selected_visible=int(proxy["stable_selected_visible"]),
-                stable_selected_invisible=int(proxy["stable_selected_invisible"]),
+                stable_visible_voxel_overlap=int(fast_fallback_diag["stable_visible_voxel_overlap"]),
+                stable_selected_visible=int(fast_fallback_diag["stable_selected_visible"]),
+                stable_selected_invisible=int(fast_fallback_diag["stable_selected_invisible"]),
                 fast_path=7,
                 hard_keep_idx=hard_keep,
                 reanchor_added=0,
                 reanchor_overlap_avg=0.0,
                 policy=policy,
                 allow_fill=False,
-                update_selector_diag=False,
+                update_selector_diag=bool(update_selector_diag_fast),
+                diag_payload=diag_payload_fast,
                 plain_reserved_idx=fast_plain_reserved,
                 priority_keep_idx=priority_for_cap_fast,
             )
@@ -7710,6 +8539,269 @@ class Aggregator(nn.Module):
             allow_fill=False,
             plain_reserved_idx=recent_plain_floor_kept,
         )
+
+    def _select_geo_active_indices_current_micro(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        selected: set[int],
+        selected_order: List[int],
+        current_frame_idx: int,
+        recent_frames_eff: int,
+        max_past_tokens: Optional[int],
+        hard_keep: Optional[torch.Tensor],
+        current_view: Optional[Dict[str, torch.Tensor]],
+        trigger_view: Optional[Dict[str, Any]],
+        near: float,
+        far: float,
+        policy: Optional[Dict[str, Any]],
+        reason: str,
+    ) -> torch.Tensor:
+        self.geo_last_policy_inputs["micro_prune_active"] = bool(True)
+        self.geo_last_policy_inputs["micro_prune_reason"] = str(reason)
+        self.geo_last_policy_inputs["micro_prune_real_geo"] = bool(True)
+        selected_fast = set(int(v) for v in selected)
+        selected_fast_order = [int(v) for v in selected_order]
+        self._ordered_add(
+            selected_fast,
+            selected_fast_order,
+            self._seed_geo_backbone_keep(
+                meta=meta,
+                current_frame_idx=current_frame_idx,
+                max_past_tokens=max_past_tokens,
+                recent_frames_eff=recent_frames_eff,
+                policy=policy,
+            ),
+        )
+        frame_idx = meta["frame_idx"]
+        is_special = meta.get("is_special", torch.zeros_like(frame_idx, dtype=torch.bool))
+        local_idx = meta.get("local_patch_idx", torch.full_like(frame_idx, -1))
+        recent_min = max(0, int(current_frame_idx) - int(recent_frames_eff))
+        recent_idx = torch.nonzero((frame_idx >= recent_min) & (~is_special), as_tuple=False).flatten()
+        if recent_idx.numel() > 0:
+            recent_idx = self._take_recent_quota(recent_idx, frame_idx=frame_idx, quota=max(512, int(recent_idx.numel())))
+            self._ordered_add(selected_fast, selected_fast_order, recent_idx)
+
+        candidate_mask = (~is_special) & (~(frame_idx >= recent_min)) & (local_idx >= 0)
+        candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        micro_candidate_cap = max(512, int(0.25 * float(max_past_tokens or max(1, int(candidate_indices.numel())))))
+        if candidate_indices.numel() > 0:
+            unique_old_frames = torch.unique(frame_idx.index_select(0, candidate_indices))
+            max_old_frames = 6
+            if unique_old_frames.numel() > max_old_frames:
+                frame_cutoff = int(unique_old_frames.sort().values[-max_old_frames].item())
+                candidate_indices = candidate_indices[frame_idx.index_select(0, candidate_indices) >= frame_cutoff]
+            if candidate_indices.numel() > micro_candidate_cap:
+                cf = frame_idx.index_select(0, candidate_indices)
+                order = torch.argsort(cf)
+                candidate_indices = candidate_indices.index_select(0, order)[-int(micro_candidate_cap):]
+        self.geo_last_policy_inputs["micro_candidate_count"] = int(candidate_indices.numel())
+        self.geo_last_policy_inputs["micro_ref_rescue_selected"] = int(0)
+        self.geo_last_policy_inputs["micro_stable_rescue_selected"] = int(0)
+        self.geo_last_policy_inputs["micro_view_source"] = "none"
+
+        micro_grouped_old = torch.empty((0,), dtype=torch.long)
+        if candidate_indices.numel() > 0:
+            view_src = current_view
+            if (
+                (not isinstance(view_src, dict))
+                or view_src.get("world_to_cam") is None
+                or view_src.get("intrinsic") is None
+            ):
+                view_src = trigger_view if isinstance(trigger_view, dict) else None
+            if isinstance(view_src, dict):
+                if view_src is current_view:
+                    self.geo_last_policy_inputs["micro_view_source"] = "current_view"
+                elif view_src is trigger_view:
+                    self.geo_last_policy_inputs["micro_view_source"] = "trigger_view"
+                else:
+                    self.geo_last_policy_inputs["micro_view_source"] = "none"
+            else:
+                self.geo_last_policy_inputs["micro_view_source"] = "none"
+            world_to_cam = view_src.get("world_to_cam") if isinstance(view_src, dict) else None
+            intrinsic = view_src.get("intrinsic") if isinstance(view_src, dict) else None
+            if isinstance(world_to_cam, torch.Tensor):
+                world_to_cam = world_to_cam.detach().cpu()
+                if world_to_cam.ndim == 3:
+                    world_to_cam = world_to_cam[0]
+            if isinstance(intrinsic, torch.Tensor):
+                intrinsic = intrinsic.detach().cpu()
+                if intrinsic.ndim == 3:
+                    intrinsic = intrinsic[0]
+            img_hw = view_src.get("img_hw") if isinstance(view_src, dict) else None
+            have_view = isinstance(world_to_cam, torch.Tensor) and isinstance(intrinsic, torch.Tensor)
+
+            gather_idx: List[torch.Tensor] = []
+            gather_score: List[torch.Tensor] = []
+            gather_hash: List[torch.Tensor] = []
+            gather_ref_mask: List[torch.Tensor] = []
+            gather_stable_mask: List[torch.Tensor] = []
+            for fidx in torch.unique(frame_idx.index_select(0, candidate_indices)).tolist():
+                fidx = int(fidx)
+                frame_meta = self.geo_frame_meta.get(fidx)
+                if frame_meta is None:
+                    continue
+                in_frame = candidate_indices[frame_idx.index_select(0, candidate_indices) == fidx]
+                if in_frame.numel() == 0:
+                    continue
+                local = local_idx.index_select(0, in_frame).long()
+                valid_local = (local >= 0) & (local < frame_meta["pts"].shape[0])
+                if valid_local.sum().item() == 0:
+                    continue
+                in_frame = in_frame[valid_local]
+                local = local[valid_local]
+                pts = frame_meta["pts"].index_select(0, local).to(torch.float32)
+                conf = frame_meta["conf"].index_select(0, local).to(torch.float32).clamp_min(1e-6)
+                vox = frame_meta["voxel_ids"].index_select(0, local)
+                bank_conf_l: List[float] = []
+                bank_support_l: List[float] = []
+                bank_var_l: List[float] = []
+                is_ref_vox_l: List[bool] = []
+                is_stable_vox_l: List[bool] = []
+                for key in (tuple(int(v) for v in row) for row in vox.tolist()):
+                    bank = self.geo_voxel_bank.get(key)
+                    if bank is None:
+                        bank_conf_l.append(0.0)
+                        bank_support_l.append(1.0)
+                        bank_var_l.append(0.0)
+                    else:
+                        bank_conf_l.append(float(bank.get("conf_ema", 0.0)))
+                        bank_support_l.append(float(bank.get("support", 1.0)))
+                        bank_var_l.append(float(bank.get("pos_var", 0.0)))
+                    is_ref_vox_l.append(key in self.geo_reference_voxels)
+                    is_stable_vox_l.append(key in self.geo_stable_anchor_voxels)
+                bank_conf_t = torch.tensor(bank_conf_l, dtype=torch.float32)
+                bank_support_t = torch.tensor(bank_support_l, dtype=torch.float32)
+                bank_var_t = torch.tensor(bank_var_l, dtype=torch.float32)
+                ref_vox_t = torch.tensor(is_ref_vox_l, dtype=torch.bool)
+                stable_vox_t = torch.tensor(is_stable_vox_l, dtype=torch.bool)
+                conf_safe = conf.clamp_min(1e-6)
+                bank_conf_eff = torch.where(bank_conf_t > 0, bank_conf_t, conf_safe)
+                support_gain = torch.log1p(bank_support_t)
+                stability = (1.0 / (1.0 + bank_var_t)).to(torch.float32)
+                score_t = conf_safe * bank_conf_eff.clamp_min(1e-6) * support_gain * stability
+                if ref_vox_t.any() and float(self.geo_reference_overlap_bonus) > 0.0:
+                    score_t = score_t * torch.where(
+                        ref_vox_t,
+                        torch.full_like(score_t, 1.0 + float(self.geo_reference_overlap_bonus)),
+                        torch.ones_like(score_t),
+                    )
+                if have_view:
+                    visible = self._frustum_mask(
+                        pts,
+                        world_to_cam.to(torch.float32),
+                        intrinsic.to(torch.float32),
+                        near=float(near),
+                        far=float(far),
+                        img_hw=img_hw,
+                    )
+                    score_t = score_t * torch.where(
+                        visible,
+                        torch.full_like(score_t, 1.25),
+                        torch.full_like(score_t, 0.85),
+                    )
+                gather_ref_mask.append(ref_vox_t)
+                gather_stable_mask.append(stable_vox_t)
+                gather_idx.append(in_frame.to(torch.long))
+                gather_score.append(score_t.to(torch.float32))
+                gather_hash.append(self._voxel_hash(vox))
+            if gather_idx:
+                idx_all = torch.cat(gather_idx, dim=0)
+                score_all = torch.cat(gather_score, dim=0)
+                hash_all = torch.cat(gather_hash, dim=0)
+                ref_mask_all = torch.cat(gather_ref_mask, dim=0)
+                stable_mask_all = torch.cat(gather_stable_mask, dim=0)
+                micro_grouped_old = self._group_topk_by_hash(
+                    hash_all,
+                    score_all,
+                    idx_all,
+                    topk_per_voxel=2,
+                )
+                if max_past_tokens is not None and micro_grouped_old.numel() > max(128, int(0.12 * float(max_past_tokens))):
+                    order = torch.argsort(score_all, descending=True)
+                    top_idx = idx_all.index_select(0, order)[: max(128, int(0.12 * float(max_past_tokens)))]
+                    keep_set = set(int(v) for v in top_idx.tolist())
+                    micro_grouped_old = torch.tensor([int(v) for v in micro_grouped_old.tolist() if int(v) in keep_set], dtype=torch.long)
+                micro_ref_quota = max(32, int(0.03 * float(max_past_tokens or 1024)))
+                micro_stable_quota = max(32, int(0.03 * float(max_past_tokens or 1024)))
+                ref_score = score_all[ref_mask_all] if ref_mask_all.any() else torch.empty((0,), dtype=torch.float32)
+                ref_idx = idx_all[ref_mask_all] if ref_mask_all.any() else torch.empty((0,), dtype=torch.long)
+                stable_score = score_all[stable_mask_all] if stable_mask_all.any() else torch.empty((0,), dtype=torch.float32)
+                stable_idx = idx_all[stable_mask_all] if stable_mask_all.any() else torch.empty((0,), dtype=torch.long)
+                ref_rescue = torch.empty((0,), dtype=torch.long)
+                stable_rescue = torch.empty((0,), dtype=torch.long)
+                if ref_idx.numel() > 0:
+                    ref_order = torch.argsort(ref_score, descending=True)
+                    ref_rescue = ref_idx.index_select(0, ref_order[: min(int(micro_ref_quota), int(ref_idx.numel()))])
+                if stable_idx.numel() > 0:
+                    stable_order = torch.argsort(stable_score, descending=True)
+                    stable_rescue = stable_idx.index_select(0, stable_order[: min(int(micro_stable_quota), int(stable_idx.numel()))])
+                self.geo_last_policy_inputs["micro_ref_rescue_selected"] = int(ref_rescue.numel())
+                self.geo_last_policy_inputs["micro_stable_rescue_selected"] = int(stable_rescue.numel())
+                if ref_rescue.numel() > 0:
+                    micro_grouped_old = self._unique_preserve_order_long(torch.cat([micro_grouped_old, ref_rescue], dim=0))
+                if stable_rescue.numel() > 0:
+                    micro_grouped_old = self._unique_preserve_order_long(torch.cat([micro_grouped_old, stable_rescue], dim=0))
+        if micro_grouped_old.numel() > 0:
+            self._ordered_add(selected_fast, selected_fast_order, micro_grouped_old)
+        self.geo_last_policy_inputs["micro_old_candidate_selected"] = int(micro_grouped_old.numel())
+
+        keep_seed = self._unique_preserve_order_long(torch.tensor(selected_fast_order, dtype=torch.long))
+        fast_plain_reserved = self._augment_fastpath_with_recent_plain_floor(
+            meta=meta,
+            selected_set=selected_fast,
+            selected_order=selected_fast_order,
+            current_frame_idx=current_frame_idx,
+            recent_frames_eff=recent_frames_eff,
+            max_past_tokens=max_past_tokens,
+            policy=policy,
+        )
+        priority_for_cap_fast = self._unique_preserve_order_long(
+            torch.cat(
+                [
+                    hard_keep.detach().cpu().long() if hard_keep is not None else torch.empty((0,), dtype=torch.long),
+                    fast_plain_reserved,
+                    torch.tensor(selected_fast_order, dtype=torch.long),
+                ],
+                dim=0,
+            )
+        )
+        diag_payload_fast, fast_fallback_diag = self._build_selector_diag_payload_for_keep(
+            meta=meta,
+            keep_idx_seed=keep_seed,
+            current_view=current_view,
+            trigger_view=trigger_view,
+            near=float(near),
+            far=float(far),
+            current_frame_idx=int(current_frame_idx),
+        )
+        self.geo_last_policy_inputs["selector_diag_source"] = "real_current_micro"
+        return self._finalize_geo_keep(
+            meta=meta,
+            selected=selected_fast,
+            selected_order=selected_fast_order,
+            current_frame_idx=current_frame_idx,
+            recent_frames_eff=recent_frames_eff,
+            max_past_tokens=max_past_tokens,
+            candidate_count=int(candidate_indices.numel()),
+            visible_total=int(fast_fallback_diag["visible_total"]),
+            anchor_count=int(meta.get("is_anchor", torch.zeros_like(meta["is_special"])).sum().item()),
+            stable_count=0,
+            tau_bucket=float("nan"),
+            stable_visible_voxel_overlap=int(fast_fallback_diag["stable_visible_voxel_overlap"]),
+            stable_selected_visible=int(fast_fallback_diag["stable_selected_visible"]),
+            stable_selected_invisible=int(fast_fallback_diag["stable_selected_invisible"]),
+            fast_path=10,
+            hard_keep_idx=hard_keep,
+            reanchor_added=0,
+            reanchor_overlap_avg=0.0,
+            policy=policy,
+            allow_fill=False,
+            update_selector_diag=True,
+            diag_payload=diag_payload_fast,
+            plain_reserved_idx=fast_plain_reserved,
+            priority_keep_idx=priority_for_cap_fast,
+        )
     def __build_patch_embed__(
         self,
         patch_embed,
@@ -7979,15 +9071,10 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["geo_reloc_release_streak"] = int(self.geo_reloc_release_streak)
             current_release_ready = bool(
                 self._geo_current_release_ready()
-                and reloc_release_ready
                 and soft_current_ready_now
                 and bool(structure_ready_now)
             )
             self.geo_last_policy_inputs["current_release_ready"] = bool(current_release_ready)
-            if current_release_ready:
-                self.geo_current_release_streak = int(self.geo_current_release_streak) + 1
-            else:
-                self.geo_current_release_streak = 0
             self.geo_last_policy_inputs["geo_current_release_streak"] = int(self.geo_current_release_streak)
             if ongoing_reloc and (not current_release_ready):
                 effective_mode = "reloc"
@@ -8028,6 +9115,13 @@ class Aggregator(nn.Module):
             self.geo_last_policy_inputs["soft_bootstrap_ready"] = bool((geo_policy or {}).get("soft_bootstrap_ready", False))
             self.geo_last_policy_inputs["recovery_selector"] = bool(False)
             self.geo_last_policy_inputs["shared_keep_order_preserved"] = bool(False)
+            self.geo_last_policy_inputs["reloc_feedback_updated"] = bool(False)
+            self.geo_last_policy_inputs["reloc_feedback_path"] = "none"
+            self.geo_last_policy_inputs["selector_diag_updated"] = bool(False)
+            self.geo_last_policy_inputs["reloc_plain_floor_target"] = int(0)
+            self.geo_last_policy_inputs["reloc_plain_floor_survived"] = int(0)
+            self.geo_last_policy_inputs["reloc_plain_floor_violation"] = bool(False)
+            self.geo_last_policy_inputs["reloc_per_layer_rebuild_fallback"] = bool(False)
 
             if ref_meta is not None:
                 mode_now = str(effective_mode)
@@ -8109,40 +9203,19 @@ class Aggregator(nn.Module):
                     geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, geo_shared_keep_idx)
                 elif mode_now == "reloc":
                     geo_reloc_active = True
-                    reloc_identity_keep = self._build_reloc_identity_keep(
+                    geo_shared_keep_idx, geo_shared_identity_keep = self._build_reloc_keep_with_feedback(
                         meta=ref_meta,
-                        max_past_tokens=max(0, int(ref_past_budget)),
+                        current_frame_idx=int(cache_frame_idx),
                         recent_frames=max(1, int(geo_recent_frames)),
-                        policy=exec_policy,
-                    )
-                    reloc_keep_idx = self._identity_keep_to_index(ref_meta, reloc_identity_keep, preserve_order=True)
-                    reloc_selected = set(int(v) for v in reloc_keep_idx.tolist())
-                    reloc_order = [int(v) for v in reloc_keep_idx.tolist()]
-                    reloc_proxy = self._geo_proxy_selector_diag(
-                        current_frame_idx=int(cache_frame_idx),
-                        selected_total=int(reloc_keep_idx.numel()),
-                    )
-                    reloc_final_idx = self._finalize_geo_keep(
-                        meta=ref_meta,
-                        selected=reloc_selected,
-                        selected_order=reloc_order,
-                        current_frame_idx=int(cache_frame_idx),
-                        recent_frames_eff=max(1, int(geo_recent_frames)),
                         max_past_tokens=max(0, int(ref_past_budget)),
-                        candidate_count=int(reloc_keep_idx.numel()),
-                        visible_total=int(reloc_proxy["visible_total"]),
-                        anchor_count=int(ref_meta.get("is_anchor", torch.zeros_like(ref_meta["is_special"])).sum().item()),
-                        stable_count=0,
-                        tau_bucket=float("nan"),
-                        stable_visible_voxel_overlap=int(reloc_proxy["stable_visible_overlap"]),
-                        stable_selected_visible=int(reloc_proxy["stable_selected_visible"]),
-                        stable_selected_invisible=int(reloc_proxy["stable_selected_invisible"]),
-                        fast_path=7,
+                        current_view=current_view,
+                        trigger_view=policy_view,
+                        near=float(geo_near),
+                        far=float(geo_far),
+                        hard_keep_idx=hard_keep_for_bootstrap,
                         policy=exec_policy,
-                        allow_fill=False,
-                        update_selector_diag=True,
                     )
-                    geo_shared_identity_keep = self._build_identity_keep_from_meta(ref_meta, reloc_final_idx, preserve_order=True)
+                    self.geo_last_policy_inputs["shared_keep_order_preserved"] = bool(True)
                 else:
                     raise RuntimeError(f"Unknown effective_mode: {mode_now}")
             else:
@@ -8260,6 +9333,8 @@ class Aggregator(nn.Module):
                                         policy=exec_policy,
                                     )
                             elif geo_reloc_active:
+                                reloc_rebuild_fallback = bool(geo_shared_identity_keep is None or geo_shared_identity_keep.numel() == 0)
+                                self.geo_last_policy_inputs["reloc_per_layer_rebuild_fallback"] = bool(reloc_rebuild_fallback)
                                 if geo_shared_identity_keep is not None and geo_shared_identity_keep.numel() > 0:
                                     layer_identity_keep = self._cap_identity_keep_with_protection(
                                         past_meta,
