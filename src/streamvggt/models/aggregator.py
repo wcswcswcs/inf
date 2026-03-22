@@ -135,6 +135,8 @@ class Aggregator(nn.Module):
         geo_recovery_reference_refresh: bool = True,
         geo_recovery_landmark_quota_per_frame: int = 16,
         geo_recovery_reference_quota_per_frame: int = 8,
+        geo_reference_growth_quota_per_keyframe: int = 32,
+        geo_reference_seed_quota_per_keyframe: int = 8,
         geo_stable_map_ratio: float = 0.4,
         geo_stable_read_budget_ratio: float = 0.2,
         geo_stable_invisible_quota_ratio: float = 0.1,
@@ -322,6 +324,8 @@ class Aggregator(nn.Module):
         self.geo_recovery_reference_refresh = bool(geo_recovery_reference_refresh)
         self.geo_recovery_landmark_quota_per_frame = max(0, int(geo_recovery_landmark_quota_per_frame))
         self.geo_recovery_reference_quota_per_frame = max(0, int(geo_recovery_reference_quota_per_frame))
+        self.geo_reference_growth_quota_per_keyframe = max(1, int(geo_reference_growth_quota_per_keyframe))
+        self.geo_reference_seed_quota_per_keyframe = max(1, int(geo_reference_seed_quota_per_keyframe))
         self.geo_stable_map_ratio = float(min(max(geo_stable_map_ratio, 0.05), 0.9))
         self.geo_stable_read_budget_ratio = float(min(max(geo_stable_read_budget_ratio, 0.0), 0.8))
         self.geo_stable_invisible_quota_ratio = float(min(max(geo_stable_invisible_quota_ratio, 0.0), 1.0))
@@ -909,8 +913,23 @@ class Aggregator(nn.Module):
         if uniq_vox.numel() == 0:
             return
 
-        quota_new = int(1e9) if quota_override is None else max(0, int(quota_override))
+        quota_new = int(self.geo_reference_growth_quota_per_keyframe) if quota_override is None else max(0, int(quota_override))
+        ref_before = int(len(self.geo_reference_bank))
         new_added = 0
+        reference_voxels_snapshot = set(self.geo_reference_voxels)
+
+        def _near_reference(voxel_key: Tuple[int, int, int]) -> bool:
+            if not reference_voxels_snapshot:
+                return False
+            x, y, z = voxel_key
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if (x + dx, y + dy, z + dz) in reference_voxels_snapshot:
+                            return True
+            return False
+
+        candidates: List[Tuple[float, float, Tuple[int, int, int], Dict[str, Any]]] = []
         for i in range(int(uniq_vox.shape[0])):
             key = tuple(int(v) for v in uniq_vox[i].tolist())
             if key in self.geo_reference_bank:
@@ -936,12 +955,26 @@ class Aggregator(nn.Module):
                 continue
             if float(bank.get("pos_var", 1e9)) > self.geo_stable_anchor_max_pos_var:
                 continue
-            score = float(conf_mean_all[i].item()) * float(bank.get("conf_ema", 0.0))
+            in_stable = key in self.geo_stable_map_voxels
+            in_anchor = key in self.geo_stable_anchor_voxels
+            near_ref = _near_reference(key)
+            if not (in_stable or in_anchor or near_ref):
+                continue
+            conf_ema = float(bank.get("conf_ema", 0.0))
+            support = float(bank.get("support", 0.0))
+            pos_var = float(bank.get("pos_var", 0.0))
+            score = float(conf_mean_all[i].item()) * conf_ema
+            structure_score = float(score * math.log1p(max(0.0, support)) / (1.0 + max(0.0, pos_var)))
+            source_priority = 2.0 if in_stable else (1.0 if in_anchor else 0.0)
+            candidates.append((source_priority, structure_score, key, bank))
+
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        for _, score_rank, key, bank in candidates[:quota_new]:
             self.geo_reference_bank[key] = {
                 "pos_x": float(bank["pos_x"]),
                 "pos_y": float(bank["pos_y"]),
                 "pos_z": float(bank["pos_z"]),
-                "score": float(score),
+                "score": float(score_rank),
                 "created_frame": float(frame_idx),
             }
             new_added += 1
@@ -962,6 +995,21 @@ class Aggregator(nn.Module):
             self.geo_reference_hash_tensor = self._voxel_hash(vox)
         else:
             self.geo_reference_hash_tensor = torch.empty((0,), dtype=torch.long)
+        ref_after = int(len(self.geo_reference_bank))
+        self.geo_last_policy_inputs["reference_growth_quota_effective"] = int(quota_new)
+        self.geo_last_policy_inputs["reference_growth_new_added"] = int(new_added)
+        self.geo_last_policy_inputs["ref_bank_before"] = int(ref_before)
+        self.geo_last_policy_inputs["ref_bank_after"] = int(ref_after)
+        self.geo_last_policy_inputs["ref_bank_delta"] = int(ref_after - ref_before)
+        if int(new_added) > 64:
+            logger.warning(
+                "[geo_reference_growth] frame=%d new_added=%d quota=%d ref_before=%d ref_after=%d",
+                int(frame_idx),
+                int(new_added),
+                int(quota_new),
+                int(ref_before),
+                int(ref_after),
+            )
 
     def _maybe_freeze_reference_bank(self, frame_idx: int) -> None:
         health_now = self._geo_compute_controller_health(frame_idx=int(frame_idx))
@@ -1843,8 +1891,8 @@ class Aggregator(nn.Module):
                 landmark_growth_ready
                 or matched_ema >= 0.08
             )
-        selector_ready_overlap = max(float(selector_overlap_ema), float(metrics["ref_overlap_ema"]))
-        reference_growth_ready = bool(
+        ref_overlap_ready = float(metrics["ref_overlap_ema"])
+        reference_seed_ready = bool(
             reference_phase_open
             and (bootstrap_bank_ready or soft_bootstrap_ready)
             and landmark_growth_ready
@@ -1852,9 +1900,20 @@ class Aggregator(nn.Module):
                 len(self.geo_stable_anchor_voxels) >= 64
                 or len(self.geo_landmark_voxels) >= 64
             )
-            and selector_ready_overlap >= 8.0
+            and len(self.geo_reference_bank) < 16
         )
+        reference_expand_ready = bool(
+            reference_phase_open
+            and landmark_growth_ready
+            and len(self.geo_reference_bank) >= 16
+            and ref_overlap_ready >= 12.0
+            and matched_ema >= 0.10
+            and float(health["overlap_health"]) >= 0.60
+        )
+        reference_growth_ready = bool(reference_expand_ready)
         if int(frame_idx) < 128:
+            reference_seed_ready = False
+            reference_expand_ready = False
             reference_growth_ready = False
 
         landmark_label_ready = bool(landmark_phase_open and structure_ready and landmark_growth_ready)
@@ -1973,7 +2032,6 @@ class Aggregator(nn.Module):
             reloc_phase_open
             and (
                 self._geo_structure_ready()
-                or prestructure_reloc_ready
             )
             and selector_mode in {"current", "recovery"}
         )
@@ -2000,6 +2058,8 @@ class Aggregator(nn.Module):
             "use_reference_labels": bool(reference_label_ready),
             "allow_landmark_growth": bool(landmark_growth_ready),
             "allow_reference_growth": bool(reference_growth_ready),
+            "reference_seed_ready": bool(reference_seed_ready),
+            "reference_expand_ready": bool(reference_expand_ready),
             "landmark_growth_ready": bool(landmark_growth_ready),
             "reference_growth_ready": bool(reference_growth_ready),
             "landmark_label_ready": bool(landmark_label_ready),
@@ -2007,6 +2067,7 @@ class Aggregator(nn.Module):
             "use_recovery": bool((selector_mode == "recovery") or ongoing_recovery),
             "ongoing_recovery": bool(ongoing_recovery),
             "allow_reloc_trigger": bool(allow_reloc_trigger),
+            "reloc_gate_source": str("structure_only" if allow_reloc_trigger else "disabled"),
             "use_reloc": bool(ongoing_reloc or (allow_reloc_trigger and reloc_signal)),
             "use_cap": bool(base_use_cap),
             "cap_alpha": float(base_cap_alpha),
@@ -2508,8 +2569,14 @@ class Aggregator(nn.Module):
             allow_cap = False
         else:
             upper_budget = int(raw_max)
-            base_ref_layer_budget = int(raw_min)
-            ref_budget_source = "min"
+            release_hardened = bool(self.geo_frozen_reference_ready or self._geo_current_release_ready())
+            if release_hardened:
+                base_ref_layer_budget = int(raw_min)
+                ref_budget_source = "min"
+            else:
+                guarded_budget = max(int(raw_min), int(round(0.75 * float(raw_max) + 0.25 * float(raw_min))))
+                base_ref_layer_budget = int(guarded_budget)
+                ref_budget_source = "guarded"
             allow_cap = bool(geo_policy is not None and bool(geo_policy.get("use_cap", False)))
         self.geo_last_policy_inputs["shared_ref_early_floor_applied"] = bool(apply_early_floor)
 
@@ -3016,7 +3083,8 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["runtime_bad_runtime_norm"] = bool(health["runtime_bad"])
         self.geo_last_policy_inputs["runtime_bad_from_health"] = bool(health["runtime_bad"])
 
-        can_start_new_reloc = bool(structure_ready or self._geo_prestructure_reloc_ready())
+        can_start_new_reloc = bool(structure_ready)
+        self.geo_last_policy_inputs["reloc_gate_source"] = str("structure_only" if can_start_new_reloc else "disabled")
         if bool(allow_reloc_trigger) and can_start_new_reloc and bad_runtime and str(self.geo_reloc_state) == "off":
             self.geo_reloc_state = "hard"
             self.geo_reloc_hard_left = int(self.geo_reloc_hard_frames)
@@ -3303,32 +3371,30 @@ class Aggregator(nn.Module):
 
         recovery_new_voxel_quota = int(self.geo_recovery_new_voxel_quota_per_frame) if repair_mode else int(1e9)
         recovery_landmark_quota = int(self.geo_recovery_landmark_quota_per_frame) if repair_mode else None
-        recovery_reference_quota = int(self.geo_recovery_reference_quota_per_frame) if repair_mode else None
+        normal_reference_quota = int(self.geo_reference_growth_quota_per_keyframe)
+        recovery_reference_quota = int(self.geo_recovery_reference_quota_per_frame) if repair_mode else int(normal_reference_quota)
         seed_reference_quota = 0
         seed_landmark_quota = 0
         ref_phase_open = bool(policy.get("reference_phase_open", False))
         ref_growth_allowed = bool(policy.get("allow_reference_growth", False))
-        if ref_phase_open and ref_growth_allowed and len(self.geo_reference_bank) < 16:
-            seed_reference_quota = 16
+        ref_seed_ready = bool(policy.get("reference_seed_ready", False))
+        if ref_phase_open and ref_seed_ready and len(self.geo_reference_bank) < 16:
+            seed_reference_quota = int(self.geo_reference_seed_quota_per_keyframe)
             seed_landmark_quota = 32
-            if recovery_reference_quota is None:
-                recovery_reference_quota = seed_reference_quota
-            else:
-                recovery_reference_quota = max(int(recovery_reference_quota), int(seed_reference_quota))
+            recovery_reference_quota = max(int(recovery_reference_quota), int(seed_reference_quota))
             if recovery_landmark_quota is None:
                 recovery_landmark_quota = seed_landmark_quota
             else:
                 recovery_landmark_quota = max(int(recovery_landmark_quota), int(seed_landmark_quota))
+            allow_promote_reference = bool(allow_promote_reference or bool(promote_reference_ready))
         if post_bootstrap_growth and (not structure_ready):
             if len(self.geo_reference_bank) < 64:
                 recovery_reference_quota = max(int(recovery_reference_quota or 0), 32)
-                allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)))
             if len(self.geo_landmark_voxels) < 512:
                 recovery_landmark_quota = max(int(recovery_landmark_quota or 0), 96)
-                allow_promote_landmark = bool(allow_promote_landmark or bool(policy.get("allow_landmark_growth", False)))
         if allow_reference_refresh_only and len(self.geo_reference_bank) < 64:
             allow_reference_refresh_only = False
-            allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)) or bool(bootstrap_or_soft))
+            allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)))
         high_conf_thr = max(float(self.geo_stable_anchor_min_conf), 1.1)
         stable_or_ref_set = set(self.geo_stable_anchor_voxels)
         stable_or_ref_set.update(self.geo_reference_voxels)
@@ -6459,27 +6525,26 @@ class Aggregator(nn.Module):
         )
     def _geo_prestructure_reference_ready(self) -> bool:
         ref_overlap_ema = float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0)
+        selector_visible_ratio_ema = float(getattr(self, "geo_selector_visible_ratio_ema", 0.0) or 0.0)
         return bool(
-            len(self.geo_reference_bank) >= 16
-            and ref_overlap_ema >= 4.0
+            len(self.geo_reference_bank) >= 64
+            and ref_overlap_ema >= 12.0
+            and selector_visible_ratio_ema >= 0.60
         )
 
     def _geo_prestructure_handover_ready(self) -> bool:
+        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         return bool(
             self._geo_prestructure_reference_ready()
-            and len(self.geo_reference_bank) >= 32
-            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 8.0
+            and len(self.geo_reference_bank) >= 128
+            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 16.0
+            and bool(health["handover_ok"])
         )
 
     def _geo_prestructure_reloc_ready(self) -> bool:
-        health = self._geo_compute_controller_health(frame_idx=int(self.geo_last_policy_frame))
         return bool(
-            self._geo_prestructure_handover_ready()
-            and self.geo_selector_mode in {"current", "recovery"}
-            and len(self.geo_reference_bank) >= 64
-            and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 12.0
-            and bool(health["handover_ok"])
-            and float(health["overlap_health"]) >= 0.75
+            self.geo_frozen_reference_ready
+            and self._geo_prestructure_handover_ready()
         )
 
     def _geo_feedback_fresh(self, frame_idx: int) -> bool:
