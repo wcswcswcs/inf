@@ -1821,9 +1821,8 @@ class Aggregator(nn.Module):
             int(frame_idx) >= int(self.geo_landmark_enable_after)
             or (bool(early_assist_active) and int(frame_idx) >= 64)
         )
-        reference_phase_open = (
+        reference_phase_open = bool(
             int(frame_idx) >= int(self.geo_reference_enable_after)
-            or (bool(early_assist_active) and int(frame_idx) >= 128)
         )
         reloc_phase_open = int(frame_idx) >= int(self.geo_reloc_enable_after)
 
@@ -1870,11 +1869,8 @@ class Aggregator(nn.Module):
         )
         selector_handover_ready = bool(
             reference_label_ready
-            or (
-                soft_bootstrap_ready
-                and len(self.geo_reference_bank) >= 32
-                and bool(health["handover_ok"])
-            )
+            and bool(health["handover_ok"])
+            and len(self.geo_reference_bank) >= max(32, int(self.geo_bootstrap_min_refs))
         )
 
         handover_ready_streak = int(self.geo_handover_ready_streak)
@@ -1947,11 +1943,12 @@ class Aggregator(nn.Module):
             or float(health["overlap_health"]) < 0.35
         )
 
-        late_bootstrap = bool(int(frame_idx) >= int(self.geo_bootstrap_frames) + 64)
         legacy_break_gate_open = bool(
-            reference_phase_open
-            or late_bootstrap
-            or (early_assist_active and int(frame_idx) >= 64)
+            structure_ready
+            or (
+                reference_phase_open
+                and len(self.geo_reference_bank) >= max(32, int(self.geo_bootstrap_min_refs))
+            )
         )
         legacy_observation_break = bool(
             selector_mode == "legacy"
@@ -3309,7 +3306,9 @@ class Aggregator(nn.Module):
         recovery_reference_quota = int(self.geo_recovery_reference_quota_per_frame) if repair_mode else None
         seed_reference_quota = 0
         seed_landmark_quota = 0
-        if bootstrap_or_soft and len(self.geo_reference_bank) < 16:
+        ref_phase_open = bool(policy.get("reference_phase_open", False))
+        ref_growth_allowed = bool(policy.get("allow_reference_growth", False))
+        if ref_phase_open and ref_growth_allowed and len(self.geo_reference_bank) < 16:
             seed_reference_quota = 16
             seed_landmark_quota = 32
             if recovery_reference_quota is None:
@@ -3320,8 +3319,6 @@ class Aggregator(nn.Module):
                 recovery_landmark_quota = seed_landmark_quota
             else:
                 recovery_landmark_quota = max(int(recovery_landmark_quota), int(seed_landmark_quota))
-            allow_promote_landmark = bool(allow_promote_landmark or (bool(promote_reference_ready) and bool(policy.get("allow_landmark_growth", False))))
-            allow_promote_reference = bool(allow_promote_reference or (bool(promote_reference_ready) and bool(policy.get("allow_reference_growth", False))))
         if post_bootstrap_growth and (not structure_ready):
             if len(self.geo_reference_bank) < 64:
                 recovery_reference_quota = max(int(recovery_reference_quota or 0), 32)
@@ -5024,6 +5021,26 @@ class Aggregator(nn.Module):
         )
         return self._build_identity_keep_from_meta(meta, keep, preserve_order=True)
 
+    def _geo_diag_stable_source_voxels(
+        self,
+        allow_recovery_reference_fallback: bool = True,
+    ) -> Tuple[set[Tuple[int, int, int]], str]:
+        stable_source: set[Tuple[int, int, int]] = set(self.geo_stable_map_voxels)
+        source_tag = "stable_map"
+        if (
+            allow_recovery_reference_fallback
+            and int(self.geo_recovery_frames_left) > 0
+            and len(self.geo_reference_voxels) > 0
+        ):
+            overlap_ref = set(self.geo_stable_map_voxels).intersection(self.geo_reference_voxels)
+            if overlap_ref:
+                stable_source = overlap_ref
+                source_tag = "stable_map∩reference"
+            else:
+                stable_source = set(self.geo_reference_voxels)
+                source_tag = "reference_fallback"
+        return stable_source, source_tag
+
     def _build_selector_diag_payload_for_keep(
         self,
         *,
@@ -5112,7 +5129,7 @@ class Aggregator(nn.Module):
         diag_idx_all = torch.cat(gather_idx, dim=0).detach().cpu().long()
         diag_hash_all = torch.cat(gather_hash, dim=0).detach().cpu().long()
         diag_visible_all = torch.cat(gather_visible, dim=0).detach().cpu().bool()
-        stable_source = self.geo_reference_voxels if len(self.geo_reference_voxels) > 0 else self.geo_stable_map_voxels
+        stable_source, diag_stable_source = self._geo_diag_stable_source_voxels(allow_recovery_reference_fallback=True)
         stable_hash = self._voxel_hash(torch.tensor(sorted(stable_source), dtype=torch.long)) if stable_source else torch.empty((0,), dtype=torch.long)
         stable_mask = torch.isin(diag_hash_all, stable_hash) if stable_hash.numel() > 0 else torch.zeros_like(diag_visible_all)
         selected_mask = torch.ones_like(diag_visible_all, dtype=torch.bool)
@@ -5132,6 +5149,7 @@ class Aggregator(nn.Module):
             "diag_img_hw": img_hw,
             "diag_near": float(near),
             "diag_far": float(far),
+            "diag_stable_source": str(diag_stable_source),
             "stable_visible_voxel_overlap": int(fallback_diag["stable_visible_voxel_overlap"]),
             "stable_selected_visible": int(fallback_diag["stable_selected_visible"]),
             "stable_selected_invisible": int(fallback_diag["stable_selected_invisible"]),
@@ -5563,7 +5581,7 @@ class Aggregator(nn.Module):
                 if grouped.numel() > 0:
                     self._ordered_add(selected, selected_order, grouped)
 
-                stable_source = self.geo_reference_voxels if len(self.geo_reference_voxels) > 0 else self.geo_stable_map_voxels
+                stable_source, diag_stable_source = self._geo_diag_stable_source_voxels(allow_recovery_reference_fallback=True)
                 if stable_source:
                     stable_hash = self._voxel_hash(torch.tensor(sorted(stable_source), dtype=torch.long))
                     stable_mask = torch.isin(hash_all, stable_hash)
@@ -5572,6 +5590,7 @@ class Aggregator(nn.Module):
                     legacy_diag_stable_selected_visible = int((selected_mask & stable_mask & visible_all).sum().item())
                     legacy_diag_stable_selected_invisible = int((selected_mask & stable_mask & (~visible_all)).sum().item())
                     legacy_diag_measured = True
+                    self.geo_last_policy_inputs["diag_stable_source"] = str(diag_stable_source)
 
         if bool((policy or {}).get("legacy_observation_break", False)):
             legacy_recent_plain_reserved = self._legacy_recent_plain_floor_idx(
@@ -6406,12 +6425,12 @@ class Aggregator(nn.Module):
 
     def _geo_effective_bootstrap_thresholds(self) -> Dict[str, Any]:
         return {
-            "voxels": min(int(self.geo_bootstrap_min_voxels), 768),
-            "stable_anchors": min(int(self.geo_bootstrap_min_stable_anchors), 96),
-            "refs": min(int(self.geo_bootstrap_min_refs), 16),
-            "ref_overlap": min(float(self.geo_bootstrap_ref_overlap_thr), 16.0),
-            "visible_ratio": min(float(self.geo_bootstrap_visible_ratio_thr), 0.30),
-            "ready_streak": min(int(self.geo_bootstrap_ready_streak), 3),
+            "voxels": int(self.geo_bootstrap_min_voxels),
+            "stable_anchors": int(self.geo_bootstrap_min_stable_anchors),
+            "refs": int(self.geo_bootstrap_min_refs),
+            "ref_overlap": float(self.geo_bootstrap_ref_overlap_thr),
+            "visible_ratio": float(self.geo_bootstrap_visible_ratio_thr),
+            "ready_streak": int(self.geo_bootstrap_ready_streak),
         }
 
     def _geo_soft_bootstrap_ready(self, frame_idx: int) -> bool:
@@ -8005,11 +8024,8 @@ class Aggregator(nn.Module):
         reanchor_overlap_sum = 0
         reanchor_frames_used = 0
         vis_hash_unique = torch.unique(hash_all[visible_all]) if visible_all.any() else torch.empty((0,), dtype=hash_all.dtype)
-        stable_source_voxels = self.geo_stable_map_voxels
+        stable_source_voxels, _ = self._geo_diag_stable_source_voxels(allow_recovery_reference_fallback=True)
         stable_hash_for_diag = torch.empty((0,), dtype=torch.long)
-        if enable_stable_logic and self.geo_recovery_frames_left > 0 and self.geo_reference_voxels:
-            overlap_ref = self.geo_stable_map_voxels.intersection(self.geo_reference_voxels)
-            stable_source_voxels = overlap_ref if overlap_ref else self.geo_reference_voxels
         if enable_stable_logic and stable_source_voxels:
             stable_hash = self._voxel_hash(torch.tensor(sorted(stable_source_voxels), dtype=torch.long))
             stable_hash_for_diag = stable_hash.detach().cpu()
