@@ -2027,12 +2027,16 @@ class Aggregator(nn.Module):
             or float(health["overlap_health"]) < 0.35
         )
 
-        ref_in_cache_prev = int(self.geo_last_policy_inputs.get("ref_in_cache", 0) or 0)
+        ref_in_cache_prev = self._geo_prev_cache_count("ref_in_cache", int(frame_idx))
+        landmark_in_cache_prev = self._geo_prev_cache_count("landmark_in_cache", int(frame_idx))
+        anchor_in_cache_prev = self._geo_prev_cache_count("anchor_in_cache", int(frame_idx))
+        frame0_in_cache_prev = self._geo_prev_cache_count("frame0_in_cache", int(frame_idx))
         legacy_break_gate_open = bool(
             structure_ready
             or (
                 self._geo_prestructure_reference_ready()
                 and ref_in_cache_prev >= 16
+                and landmark_in_cache_prev >= 32
             )
         )
         legacy_observation_break = bool(
@@ -2142,6 +2146,10 @@ class Aggregator(nn.Module):
             "stable_overlap_prev": int(stable_overlap_prev),
             "legacy_observation_break": bool(legacy_observation_break),
             "legacy_break_gate_open": bool(legacy_break_gate_open),
+            "ref_in_cache_prev": int(ref_in_cache_prev),
+            "landmark_in_cache_prev": int(landmark_in_cache_prev),
+            "anchor_in_cache_prev": int(anchor_in_cache_prev),
+            "frame0_in_cache_prev": int(frame0_in_cache_prev),
             "selector_overlap_threshold": float(320.0),
             "selector_visible_threshold": float(0.72),
             "prev_budget": int(prev_budget),
@@ -3210,6 +3218,14 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["landmark_in_cache"] = int(st.get("landmark_in_cache_max", 0))
         self.geo_last_policy_inputs["anchor_in_cache"] = int(st.get("anchor_in_cache_max", 0))
 
+    def _geo_prev_cache_count(self, key: str, frame_idx: int, max_age: int = 2) -> int:
+        stats_frame = int(self.geo_last_policy_inputs.get("cache_stats_frame_idx", -1) or -1)
+        if stats_frame < 0:
+            return 0
+        if int(frame_idx) - int(stats_frame) > int(max_age):
+            return 0
+        return int(self.geo_last_policy_inputs.get(key, 0) or 0)
+
     def _allow_repair_existing_voxel(
         self,
         *,
@@ -3414,11 +3430,13 @@ class Aggregator(nn.Module):
             self.geo_reloc_good_streak = 0
 
         repair_mode = bool(recovery_mode) or bool(int(self.geo_reloc_frames_left) > 0 or str(self.geo_reloc_state) != "off")
-        ref_in_cache_prev = int(self.geo_last_policy_inputs.get("ref_in_cache", 0) or 0)
+        ref_in_cache_prev = self._geo_prev_cache_count("ref_in_cache", int(frame_idx))
+        landmark_in_cache_prev = self._geo_prev_cache_count("landmark_in_cache", int(frame_idx))
         healthy_refresh_only = bool(
             self._geo_structure_ready()
             and float(getattr(self, "geo_ref_overlap_ema", 0.0) or 0.0) >= 6.0
             and ref_in_cache_prev >= 256
+            and landmark_in_cache_prev >= 128
         )
         allow_reference_refresh_only = bool(
             repair_mode
@@ -3450,7 +3468,7 @@ class Aggregator(nn.Module):
         ref_phase_open = bool(policy.get("reference_phase_open", False))
         ref_growth_allowed = bool(policy.get("allow_reference_growth", False))
         ref_seed_ready = bool(policy.get("reference_seed_ready", False))
-        if ref_phase_open and ref_seed_ready and len(self.geo_reference_bank) < 16:
+        if ref_phase_open and ref_growth_allowed and ref_seed_ready and len(self.geo_reference_bank) < 16:
             seed_reference_quota = int(self.geo_reference_seed_quota_per_keyframe)
             seed_landmark_quota = 32
             recovery_reference_quota = max(int(recovery_reference_quota), int(seed_reference_quota))
@@ -4779,7 +4797,12 @@ class Aggregator(nn.Module):
             f"allow_fill_effective={bool(inp.get('allow_fill_effective', True))} "
             f"fast_path_allow_fill={bool(inp.get('fast_path_allow_fill', False))} "
             f"selector_diag_updated={bool(inp.get('selector_diag_updated', True))} "
+            f"selector_diag_proxy_preselect={bool(inp.get('selector_diag_proxy_preselect', False))} "
+            f"selector_diag_proxy_final={bool(inp.get('selector_diag_proxy_final', False))} "
+            f"selector_diag_proxy_stage={str(inp.get('selector_diag_proxy_stage', 'none'))} "
             f"selector_diag_proxy_backfill={bool(inp.get('selector_diag_proxy_backfill', False))} "
+            f"diag_extra_keep_count={int(inp.get('diag_extra_keep_count', 0) or 0)} "
+            f"diag_extra_keep_skipped={int(inp.get('diag_extra_keep_skipped', 0) or 0)} "
             f"selector_diag_true_visible_total={int(inp.get('selector_diag_true_visible_total', 0) or 0)} "
             f"legacy_observation_break={bool(inp.get('legacy_observation_break', policy.get('legacy_observation_break', False)))} "
             f"legacy_break_force_recent_plain={bool(inp.get('legacy_break_force_recent_plain', False))} "
@@ -6323,12 +6346,7 @@ class Aggregator(nn.Module):
         self.geo_last_policy_inputs["implicit_recent_plain_floor_used"] = bool(plain_reserved_idx is not None and keep_plain_reserved_requested > 0)
         self.geo_last_policy_inputs["keep_plain_patch_reserved_prev_is_fastpath_safe"] = bool(plain_reserved_idx is not None)
 
-        if isinstance(diag_payload, dict):
-            self.geo_last_policy_inputs["selector_diag_proxy_backfill"] = bool(diag_payload.get("selector_diag_proxy_backfill", False))
-            self.geo_last_policy_inputs["selector_diag_true_visible_total"] = int(diag_payload.get("selector_diag_true_visible_total", visible_total) or 0)
-        else:
-            self.geo_last_policy_inputs["selector_diag_proxy_backfill"] = bool(False)
-            self.geo_last_policy_inputs["selector_diag_true_visible_total"] = int(visible_total)
+        preselect_proxy = bool(diag_payload.get("selector_diag_proxy_backfill", False)) if isinstance(diag_payload, dict) else False
 
         diag_final = self._recompute_selector_diag_from_final_keep(
             meta=meta,
@@ -6341,10 +6359,26 @@ class Aggregator(nn.Module):
                 "visible_total": int(visible_total),
             },
         )
-        self.geo_last_policy_inputs["selector_diag_proxy_backfill"] = bool(diag_final.get("diag_proxy_backfill", self.geo_last_policy_inputs.get("selector_diag_proxy_backfill", False)))
-        self.geo_last_policy_inputs["diag_proxy_backfill"] = bool(diag_final.get("diag_proxy_backfill", False))
-        self.geo_last_policy_inputs["diag_extra_keep_count"] = int(diag_final.get("diag_extra_keep_count", self.geo_last_policy_inputs.get("diag_extra_keep_count", 0) or 0))
-        self.geo_last_policy_inputs["diag_extra_keep_skipped"] = int(diag_final.get("diag_extra_keep_skipped", self.geo_last_policy_inputs.get("diag_extra_keep_skipped", 0) or 0))
+        final_proxy = bool(diag_final.get("diag_proxy_backfill", False))
+        diag_extra_keep_count = int(diag_final.get("diag_extra_keep_count", self.geo_last_policy_inputs.get("diag_extra_keep_count", 0) or 0))
+        diag_extra_keep_skipped = int(diag_final.get("diag_extra_keep_skipped", self.geo_last_policy_inputs.get("diag_extra_keep_skipped", 0) or 0))
+        diag_visible_total_final = int(diag_final.get("visible_total", visible_total))
+        if preselect_proxy and final_proxy:
+            proxy_stage = "both"
+        elif preselect_proxy:
+            proxy_stage = "preselect"
+        elif final_proxy:
+            proxy_stage = "final"
+        else:
+            proxy_stage = "none"
+        self.geo_last_policy_inputs["selector_diag_proxy_preselect"] = bool(preselect_proxy)
+        self.geo_last_policy_inputs["selector_diag_proxy_final"] = bool(final_proxy)
+        self.geo_last_policy_inputs["selector_diag_proxy_stage"] = str(proxy_stage)
+        self.geo_last_policy_inputs["selector_diag_proxy_backfill"] = bool(preselect_proxy or final_proxy)
+        self.geo_last_policy_inputs["diag_proxy_backfill"] = bool(final_proxy)
+        self.geo_last_policy_inputs["selector_diag_true_visible_total"] = int(diag_visible_total_final)
+        self.geo_last_policy_inputs["diag_extra_keep_count"] = int(diag_extra_keep_count)
+        self.geo_last_policy_inputs["diag_extra_keep_skipped"] = int(diag_extra_keep_skipped)
 
         geo_role_all = meta.get("geo_role", self._compute_primary_geo_role(meta))
         keep_role = geo_role_all.index_select(0, keep.detach().cpu().long()) if keep.numel() > 0 else torch.empty((0,), dtype=torch.long)
@@ -6451,6 +6485,10 @@ class Aggregator(nn.Module):
             "feedback_updated": bool(True),
             "feedback_source": str("finalize_reloc" if reloc_feedback_updated else f"finalize_{mode_feedback}"),
             "feedback_fresh": bool(True),
+            "selector_diag_proxy_backfill": bool(self.geo_last_policy_inputs.get("selector_diag_proxy_backfill", False)),
+            "selector_diag_proxy_stage": str(self.geo_last_policy_inputs.get("selector_diag_proxy_stage", "none")),
+            "diag_extra_keep_count": int(self.geo_last_policy_inputs.get("diag_extra_keep_count", 0) or 0),
+            "diag_extra_keep_skipped": int(self.geo_last_policy_inputs.get("diag_extra_keep_skipped", 0) or 0),
         }
         self._queue_geo_console_log(
             current_frame_idx=current_frame_idx,
