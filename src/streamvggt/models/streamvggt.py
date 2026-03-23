@@ -403,6 +403,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                 )
                 self.aggregator.geo_last_policy_inputs["inference_allow_last_reliable"] = bool(allow_last_reliable)
+                using_last_reliable = False
                 if (
                     ((not force_current_selector) or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold)
                     and selector_fallback_ready
@@ -410,14 +411,21 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 ):
                     selector_view = last_reliable_view
                     selector_view_source = "last_reliable_view"
-                    fallback_exit_healthy_streak = 0
+                    using_last_reliable = True
                 else:
+                    selector_view = policy_view
+                    selector_view_source = "current_view" if selector_view is not None else "none"
+                if using_last_reliable:
                     if healthy_selector:
                         fallback_exit_healthy_streak = int(fallback_exit_healthy_streak) + 1
                     else:
                         fallback_exit_healthy_streak = 0
-                    selector_view = policy_view
-                    selector_view_source = "current_view" if selector_view is not None else "none"
+                    if int(fallback_exit_healthy_streak) >= 2:
+                        selector_view = policy_view
+                        selector_view_source = "current_view" if selector_view is not None else "none"
+                        fallback_exit_healthy_streak = 0
+                else:
+                    fallback_exit_healthy_streak = 0
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
