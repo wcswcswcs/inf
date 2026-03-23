@@ -467,6 +467,14 @@ class Aggregator(nn.Module):
         self.geo_last_policy_frame: int = -1
         self.geo_last_policy_inputs: Dict[str, Any] = {}
         self.geo_last_keep_feedback: Dict[str, Any] = {}
+        self._geo_step_cache_stats: Dict[str, int] = {
+            "frame_idx": -1,
+            "layers_seen": 0,
+            "frame0_in_cache_max": 0,
+            "ref_in_cache_max": 0,
+            "landmark_in_cache_max": 0,
+            "anchor_in_cache_max": 0,
+        }
         self.geo_frozen_reference_bank: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         self.geo_frozen_reference_ready: bool = False
         self.geo_frozen_reference_frame: int = -1
@@ -3157,6 +3165,51 @@ class Aggregator(nn.Module):
             if take.any():
                 meta["is_keyframe"][idx[take]] = True
 
+    def _geo_reset_step_cache_stats(self) -> None:
+        self._geo_step_cache_stats = {
+            "frame_idx": -1,
+            "layers_seen": 0,
+            "frame0_in_cache_max": 0,
+            "ref_in_cache_max": 0,
+            "landmark_in_cache_max": 0,
+            "anchor_in_cache_max": 0,
+        }
+
+    def _geo_accumulate_step_cache_stats(
+        self,
+        *,
+        frame_idx: int,
+        frame0_in_cache: int,
+        ref_in_cache: int,
+        landmark_in_cache: int,
+        anchor_in_cache: int,
+    ) -> None:
+        st = getattr(self, "_geo_step_cache_stats", None)
+        if (not isinstance(st, dict)) or int(st.get("frame_idx", -1)) != int(frame_idx):
+            self._geo_reset_step_cache_stats()
+            st = self._geo_step_cache_stats
+            st["frame_idx"] = int(frame_idx)
+
+        st["layers_seen"] = int(st.get("layers_seen", 0)) + 1
+        st["frame0_in_cache_max"] = max(int(st.get("frame0_in_cache_max", 0)), int(frame0_in_cache))
+        st["ref_in_cache_max"] = max(int(st.get("ref_in_cache_max", 0)), int(ref_in_cache))
+        st["landmark_in_cache_max"] = max(int(st.get("landmark_in_cache_max", 0)), int(landmark_in_cache))
+        st["anchor_in_cache_max"] = max(int(st.get("anchor_in_cache_max", 0)), int(anchor_in_cache))
+
+    def _geo_commit_step_cache_stats(self, frame_idx: int) -> None:
+        st = getattr(self, "_geo_step_cache_stats", None)
+        if not isinstance(st, dict):
+            return
+        if int(st.get("frame_idx", -1)) != int(frame_idx):
+            return
+
+        self.geo_last_policy_inputs["cache_stats_frame_idx"] = int(frame_idx)
+        self.geo_last_policy_inputs["cache_stats_layers_seen"] = int(st.get("layers_seen", 0))
+        self.geo_last_policy_inputs["frame0_in_cache"] = int(st.get("frame0_in_cache_max", 0))
+        self.geo_last_policy_inputs["ref_in_cache"] = int(st.get("ref_in_cache_max", 0))
+        self.geo_last_policy_inputs["landmark_in_cache"] = int(st.get("landmark_in_cache_max", 0))
+        self.geo_last_policy_inputs["anchor_in_cache"] = int(st.get("anchor_in_cache_max", 0))
+
     def _allow_repair_existing_voxel(
         self,
         *,
@@ -3405,7 +3458,7 @@ class Aggregator(nn.Module):
                 recovery_landmark_quota = seed_landmark_quota
             else:
                 recovery_landmark_quota = max(int(recovery_landmark_quota), int(seed_landmark_quota))
-            allow_promote_reference = bool(allow_promote_reference or bool(promote_reference_ready))
+            allow_promote_reference = bool(allow_promote_reference)
         if post_bootstrap_growth and (not structure_ready):
             if len(self.geo_reference_bank) < 64:
                 recovery_reference_quota = max(int(recovery_reference_quota or 0), 32)
@@ -3413,7 +3466,7 @@ class Aggregator(nn.Module):
                 recovery_landmark_quota = max(int(recovery_landmark_quota or 0), 96)
         if allow_reference_refresh_only and len(self.geo_reference_bank) < 64:
             allow_reference_refresh_only = False
-            allow_promote_reference = bool(allow_promote_reference or bool(policy.get("allow_reference_growth", False)))
+            allow_promote_reference = bool(allow_promote_reference)
         high_conf_thr = max(float(self.geo_stable_anchor_min_conf), 1.1)
         stable_or_ref_set = set(self.geo_stable_anchor_voxels)
         stable_or_ref_set.update(self.geo_reference_voxels)
@@ -6288,6 +6341,10 @@ class Aggregator(nn.Module):
                 "visible_total": int(visible_total),
             },
         )
+        self.geo_last_policy_inputs["selector_diag_proxy_backfill"] = bool(diag_final.get("diag_proxy_backfill", self.geo_last_policy_inputs.get("selector_diag_proxy_backfill", False)))
+        self.geo_last_policy_inputs["diag_proxy_backfill"] = bool(diag_final.get("diag_proxy_backfill", False))
+        self.geo_last_policy_inputs["diag_extra_keep_count"] = int(diag_final.get("diag_extra_keep_count", self.geo_last_policy_inputs.get("diag_extra_keep_count", 0) or 0))
+        self.geo_last_policy_inputs["diag_extra_keep_skipped"] = int(diag_final.get("diag_extra_keep_skipped", self.geo_last_policy_inputs.get("diag_extra_keep_skipped", 0) or 0))
 
         geo_role_all = meta.get("geo_role", self._compute_primary_geo_role(meta))
         keep_role = geo_role_all.index_select(0, keep.detach().cpu().long()) if keep.numel() > 0 else torch.empty((0,), dtype=torch.long)
@@ -9091,6 +9148,8 @@ class Aggregator(nn.Module):
         enable_stable_logic = True
         enable_reanchor_logic = True
         if use_geo_kv_prune:
+            self._geo_reset_step_cache_stats()
+            self._geo_step_cache_stats["frame_idx"] = int(past_frame_idx)
             geo_policy = self._geo_get_effective_policy_for_forward(
                 frame_idx=int(past_frame_idx),
                 ref_meta=None,
@@ -9732,6 +9791,13 @@ class Aggregator(nn.Module):
                             ref_in_cache = int(merged_meta.get("is_reference", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             landmark_in_cache = int(merged_meta.get("is_landmark", torch.zeros_like(merged_meta["is_special"])).sum().item())
                             anchor_in_cache = int(merged_meta.get("is_anchor", torch.zeros_like(merged_meta["is_special"])).sum().item())
+                            self._geo_accumulate_step_cache_stats(
+                                frame_idx=int(past_frame_idx),
+                                frame0_in_cache=int(frame0_in_cache),
+                                ref_in_cache=int(ref_in_cache),
+                                landmark_in_cache=int(landmark_in_cache),
+                                anchor_in_cache=int(anchor_in_cache),
+                            )
                             debug_frame_idx = int(past_frame_idx)
                             if self._should_log_geo_debug(debug_frame_idx):
                                 logger.info(
@@ -9829,6 +9895,9 @@ class Aggregator(nn.Module):
                 output_list.append(concat_inter)
         if scores: # update scores
             self.last_scores = torch.tensor(scores, device=self.last_scores.device, dtype=self.last_scores.dtype)
+
+        if use_geo_kv_prune:
+            self._geo_commit_step_cache_stats(int(past_frame_idx))
 
         self._flush_geo_console_log(kv_comp_new=None)
 
