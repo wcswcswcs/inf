@@ -5851,6 +5851,9 @@ class Aggregator(nn.Module):
                 "stable_selected_visible": int(stable_selected_visible),
                 "stable_selected_invisible": int(stable_selected_invisible),
                 "visible_total": int(visible_total),
+                "diag_proxy_backfill": bool(True),
+                "diag_extra_keep_count": int(extra_keep_count),
+                "diag_extra_keep_skipped": int(extra_keep_count),
             }
         extra_visible_hashes: List[torch.Tensor] = []
         if extra_keep.numel() > 0:
@@ -5923,6 +5926,9 @@ class Aggregator(nn.Module):
             "stable_selected_visible": int(stable_selected_visible),
             "stable_selected_invisible": int(stable_selected_invisible),
             "visible_total": int(visible_total),
+            "diag_proxy_backfill": bool(False),
+            "diag_extra_keep_count": int(extra_keep_count),
+            "diag_extra_keep_skipped": int(0),
         }
 
     def _select_geo_active_indices_bootstrap(
@@ -6709,6 +6715,10 @@ class Aggregator(nn.Module):
             self.geo_structure_ready_streak = 0
             self.geo_structure_unready_streak = 0
             self.geo_structure_ready_latched = False
+            self.geo_last_policy_inputs["structure_enter_ready"] = bool(False)
+            self.geo_last_policy_inputs["hard_structure_mature"] = bool(False)
+            self.geo_last_policy_inputs["structure_enter_streak_effective"] = int(min(int(thr["ready_streak"]), 3))
+            self.geo_last_policy_inputs["structure_exit_streak_effective"] = int(8)
             return False
 
         if enter_ready:
