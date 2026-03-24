@@ -231,6 +231,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         geo_recent_frames: int = 2,
         geo_near: float = 0.05,
         geo_far: float = 200.0,
+        geo_selector_impl: Optional[str] = None,
         show_progress: bool = True,
         memory_diagnostics: bool = False,
         memory_log_interval: int = 1,
@@ -261,9 +262,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if rolling_state is None:
             prev_world_to_cam_cpu = None
             prev_conf_mean = None
+            last_reliable_frame_idx = -1
+            fallback_exit_healthy_streak = 0
         else:
             prev_world_to_cam_cpu = rolling_state.get("prev_world_to_cam_cpu", None)
             prev_conf_mean = rolling_state.get("prev_conf_mean", None)
+            last_reliable_frame_idx = int(rolling_state.get("last_reliable_frame_idx", -1) or -1)
+            fallback_exit_healthy_streak = int(rolling_state.get("fallback_exit_healthy_streak", 0) or 0)
         model_device = next(self.parameters()).device
 
         all_ress = []
@@ -358,48 +363,70 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 geo_use_view_pruning = bool(policy.get("use_view_pruning", True))
                 prefer_last_reliable_view = bool(policy.get("prefer_last_reliable_view", False))
-                selector_diag = getattr(self.aggregator, "geo_last_selector_diag", None) or {}
-                stable_visible_ratio = float(selector_diag.get("stable_visible_ratio", 1.0))
-                stable_visible_overlap = int(
-                    selector_diag.get(
-                        "stable_visible_overlap",
-                        selector_diag.get("stable_visible_voxel_overlap", 0),
-                    )
-                )
-                policy_runtime_bad = bool(policy.get("use_recovery", False) or policy.get("use_reloc", False))
+                health = self.aggregator._geo_compute_controller_health(frame_idx=int(frame_idx_abs))
+                self.aggregator.geo_last_policy_inputs["inference_selector_health_unknown"] = bool(health.get("selector_health_unknown", False))
+                last_reliable_ttl = 32
+                last_reliable_age = int(frame_idx_abs) - int(last_reliable_frame_idx) if int(last_reliable_frame_idx) >= 0 else (10 ** 9)
+                self.aggregator.geo_last_policy_inputs["last_reliable_age"] = int(last_reliable_age if int(last_reliable_frame_idx) >= 0 else -1)
                 selector_fallback_ready = bool(
                     self.aggregator._geo_structure_ready()
-                    or self.aggregator._geo_prestructure_reference_ready()
+                    and (
+                        bool(getattr(self.aggregator, "geo_frozen_reference_ready", False))
+                        or bool(self.aggregator._geo_current_release_ready())
+                    )
                 )
-                reloc_release_ready = bool(self.aggregator._geo_reloc_release_ready())
+                self.aggregator.geo_last_policy_inputs["selector_fallback_ready"] = bool(selector_fallback_ready)
+                current_release_ready = bool(self.aggregator._geo_current_release_ready())
                 soft_current_ready = bool(self.aggregator._geo_soft_current_ready(int(frame_idx_abs)))
-                healthy_visibility = bool(stable_visible_ratio >= 0.72 and stable_visible_overlap >= 320)
+                healthy_selector = bool(
+                    health["selector_fresh"]
+                    and float(health["controller_stress"]) <= 0.20
+                    and (not bool(health["runtime_bad"]))
+                    and (not bool(health["external_drift_bad"]))
+                )
                 force_current_selector = bool(
                     self.aggregator._geo_structure_ready()
-                    and reloc_release_ready
+                    and current_release_ready
                     and soft_current_ready
-                    and healthy_visibility
+                    and healthy_selector
                 )
-                self.aggregator.geo_last_policy_inputs["current_release_ready"] = bool(force_current_selector)
+                self.aggregator.geo_last_policy_inputs["inference_force_current_selector"] = bool(force_current_selector)
                 allow_last_reliable = bool(
-                    policy_runtime_bad
-                    or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold
-                    or stable_visible_ratio < 0.72
-                    or stable_visible_overlap < 320
-                )
-                if (
-                    (not force_current_selector)
-                    and
                     prefer_last_reliable_view
                     and last_reliable_view is not None
+                    and last_reliable_age <= int(last_reliable_ttl)
+                    and self.aggregator._geo_structure_ready()
+                    and (bool(getattr(self.aggregator, "geo_frozen_reference_ready", False)) or bool(current_release_ready))
+                    and (
+                    bool(health["runtime_bad"])
+                    or float(health["controller_stress"]) >= 0.45
+                    or bool(health["external_drift_bad"])
+                    )
+                )
+                self.aggregator.geo_last_policy_inputs["inference_allow_last_reliable"] = bool(allow_last_reliable)
+                using_last_reliable = False
+                if (
+                    ((not force_current_selector) or self.aggregator.geo_trust_score < self.aggregator.geo_selection_low_trust_threshold)
                     and selector_fallback_ready
                     and allow_last_reliable
                 ):
                     selector_view = last_reliable_view
                     selector_view_source = "last_reliable_view"
+                    using_last_reliable = True
                 else:
                     selector_view = policy_view
                     selector_view_source = "current_view" if selector_view is not None else "none"
+                if using_last_reliable:
+                    if healthy_selector:
+                        fallback_exit_healthy_streak = int(fallback_exit_healthy_streak) + 1
+                    else:
+                        fallback_exit_healthy_streak = 0
+                    if int(fallback_exit_healthy_streak) >= 2:
+                        selector_view = policy_view
+                        selector_view_source = "current_view" if selector_view is not None else "none"
+                        fallback_exit_healthy_streak = 0
+                else:
+                    fallback_exit_healthy_streak = 0
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
@@ -416,6 +443,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 policy_view=policy_view,
                 policy_view_source=policy_view_source,
                 selector_view_source=selector_view_source,
+                geo_selector_impl_override=geo_selector_impl,
             )
 
             
@@ -527,8 +555,25 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     }
                     trust_now = float(geo_meta_stats.get("trust_score", float(self.aggregator.geo_trust_score)))
                     matched_ratio_now = float(geo_meta_stats.get("matched_ratio", 0.0))
-                    if trust_now >= float(self.aggregator.geo_selection_low_trust_threshold) and matched_ratio_now >= 0.05:
+                    health_now = self.aggregator._geo_compute_controller_health(frame_idx=int(frame_idx_abs))
+                    selector_diag_now = self.aggregator._geo_get_last_selector_diag() or {}
+                    strict_reliable = bool(
+                        trust_now >= float(self.aggregator.geo_selection_low_trust_threshold)
+                        and matched_ratio_now >= 0.10
+                        and bool(health_now.get("selector_fresh", False))
+                        and float(health_now.get("controller_stress", 1.0)) <= 0.25
+                        and (not bool(health_now.get("runtime_bad", False)))
+                        and (not bool(health_now.get("external_drift_bad", False)))
+                    )
+                    if selector_diag_now:
+                        strict_reliable = bool(
+                            strict_reliable
+                            and float(selector_diag_now.get("stable_visible_ratio", 0.0) or 0.0) >= 0.72
+                            and float(health_now.get("overlap_health", 0.0) or 0.0) >= 0.70
+                        )
+                    if strict_reliable:
                         last_reliable_view = current_view
+                        last_reliable_frame_idx = int(frame_idx_abs)
                     prev_world_to_cam_cpu = world_to_cam_cpu
                     prev_conf_mean = conf_mean
 
@@ -629,10 +674,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             "geo_state": self.aggregator.export_geo_cache_state() if use_geo_kv_prune else None,
             "current_view": current_view,
             "last_reliable_view": last_reliable_view,
+            "last_reliable_frame_idx": int(last_reliable_frame_idx),
             "next_frame_idx": next_frame_idx,
             "rolling_state": {
                 "prev_world_to_cam_cpu": prev_world_to_cam_cpu,
                 "prev_conf_mean": prev_conf_mean,
+                "last_reliable_frame_idx": int(last_reliable_frame_idx),
+                "fallback_exit_healthy_streak": int(fallback_exit_healthy_streak),
                 "next_frame_idx": next_frame_idx,
                 "base_frame_idx_used": int(base_frame_idx),
             },
