@@ -536,6 +536,7 @@ class Aggregator(nn.Module):
         self._geo_v2_reset_runtime()
 
     def _geo_v2_reset_runtime(self) -> None:
+        self.geo_selector_impl_runtime = str(getattr(self, "geo_selector_impl", "legacy_v1"))
         self.geo_v2_phase = "warmup"
         self.geo_v2_phase_good_streak = 0
         self.geo_v2_phase_bad_streak = 0
@@ -4809,12 +4810,21 @@ class Aggregator(nn.Module):
             f"commit_policy_frame={int(inp.get('commit_policy_frame', self.geo_last_policy_frame))} "
             f"policy_view_source={str(inp.get('policy_view_source', 'none'))} "
             f"selector_view_source={str(inp.get('selector_view_source', 'none'))} "
+            f"geo_selector_impl_requested={str(inp.get('geo_selector_impl_requested', 'none'))} "
+            f"geo_selector_impl_default={str(inp.get('geo_selector_impl_default', self.geo_selector_impl))} "
+            f"geo_selector_impl_effective={str(inp.get('geo_selector_impl_effective', inp.get('geo_selector_impl', self.geo_selector_impl)))} "
             f"geo_selector_impl={str(inp.get('geo_selector_impl', self.geo_selector_impl))} "
             f"geo_v2_phase={str(inp.get('geo_v2_phase', getattr(self, 'geo_v2_phase', 'warmup')))} "
             f"geo_v2_reanchor_added={int(inp.get('geo_v2_reanchor_added', 0) or 0)} "
             f"geo_v2_anchor_visible_coverage={float(inp.get('geo_v2_anchor_visible_coverage', 0.0) or 0.0):.4f} "
+            f"geo_v2_anchor_visible_candidates={int(inp.get('geo_v2_anchor_visible_candidates', 0) or 0)} "
+            f"geo_v2_anchor_visible_hits={int(inp.get('geo_v2_anchor_visible_hits', 0) or 0)} "
             f"geo_v2_stable_visible_coverage={float(inp.get('geo_v2_stable_visible_coverage', 0.0) or 0.0):.4f} "
+            f"geo_v2_stable_visible_candidates={int(inp.get('geo_v2_stable_visible_candidates', 0) or 0)} "
+            f"geo_v2_stable_visible_hits={int(inp.get('geo_v2_stable_visible_hits', 0) or 0)} "
             f"geo_v2_recent_plain_ratio={float(inp.get('geo_v2_recent_plain_ratio', 0.0) or 0.0):.4f} "
+            f"geo_v2_hard_keep_source={str(inp.get('geo_v2_hard_keep_source', 'unknown'))} "
+            f"geo_v2_layer_cap_impl={str(inp.get('geo_v2_layer_cap_impl', 'none'))} "
             f"policy_mode={str(policy.get('mode', 'legacy'))} "
             f"effective_mode={str(inp.get('effective_mode', 'legacy'))} "
             f"selector_exec_mode={str(inp.get('effective_mode', 'legacy'))} "
@@ -6141,30 +6151,30 @@ class Aggregator(nn.Module):
         self,
         *,
         meta: Dict[str, torch.Tensor],
-        hard_keep: Optional[torch.Tensor],
         current_frame_idx: int,
         max_past_tokens: Optional[int],
     ) -> torch.Tensor:
-        keep: List[torch.Tensor] = []
-        special = self._geo_v2_special_idx(meta)
-        if special.numel() > 0:
-            keep.append(special)
+        ordered: List[int] = []
+        seen: set[int] = set()
+
+        def _append_idx(idx: torch.Tensor):
+            for t in idx.detach().cpu().long().tolist():
+                if int(t) in seen:
+                    continue
+                seen.add(int(t))
+                ordered.append(int(t))
+
+        _append_idx(self._geo_v2_special_idx(meta))
         frame0 = self._geo_v2_frame0_idx(meta)
         if frame0.numel() > 0:
-            frame0 = frame0[: int(self.geo_v2_frame0_quota)]
-            keep.append(frame0)
-        current = self._geo_v2_current_frame_idx(meta, current_frame_idx)
-        if current.numel() > 0:
-            keep.append(current)
-        if hard_keep is not None and hard_keep.numel() > 0:
-            keep.append(hard_keep.detach().cpu().long())
-        if keep:
-            out = torch.unique(torch.cat(keep, dim=0), sorted=False)
-        else:
-            out = torch.empty((0,), dtype=torch.long)
+            _append_idx(frame0[: int(self.geo_v2_frame0_quota)])
+        _append_idx(self._geo_v2_current_frame_idx(meta, current_frame_idx))
+
+        out = torch.tensor(ordered, dtype=torch.long) if ordered else torch.empty((0,), dtype=torch.long)
         if max_past_tokens is not None and out.numel() > int(max_past_tokens):
             out = out[: int(max_past_tokens)]
-        return out.long()
+        self.geo_last_policy_inputs["geo_v2_hard_keep_source"] = "v2_only"
+        return out
 
     def _geo_v2_build_voxel_representatives(
         self,
@@ -6413,8 +6423,19 @@ class Aggregator(nn.Module):
         frame_idx = meta["frame_idx"]
         long_horizon = int((frame_idx.index_select(0, keep_cpu) <= int(current_frame_idx) - 4).sum().item()) if keep_cpu.numel() > 0 else 0
         keep_total = int(max(1, keep_cpu.numel()))
-        anchor_visible_cov = min(1.0, float(anchor_backbone_kept) / float(max(1, len(self.geo_anchor_voxel_list))))
-        stable_visible_cov = min(1.0, float(stable_backbone_kept) / float(max(1, len(self.geo_stable_anchor_voxel_list))))
+        keep_hashes = self._geo_v2_keep_hashes(meta=meta, keep_idx=keep_idx)
+        anchor_visible_hashes = self._geo_v2_visible_hashes_for_voxel_list(
+            voxel_list=list(self.geo_anchor_voxel_list),
+            reps=reps,
+        )
+        stable_visible_hashes = self._geo_v2_visible_hashes_for_voxel_list(
+            voxel_list=self._geo_v2_ordered_stable_voxels(),
+            reps=reps,
+        )
+        anchor_visible_hits = int(len(anchor_visible_hashes & keep_hashes))
+        stable_visible_hits = int(len(stable_visible_hashes & keep_hashes))
+        anchor_visible_cov = float(anchor_visible_hits) / float(max(1, len(anchor_visible_hashes)))
+        stable_visible_cov = float(stable_visible_hits) / float(max(1, len(stable_visible_hashes)))
         return {
             "candidate_count": float(reps.get("candidate_count", 0)),
             "visible_total": float(reps.get("visible_total", 0)),
@@ -6425,6 +6446,10 @@ class Aggregator(nn.Module):
             "reference_kept": float(reference_kept),
             "reanchor_added": float(reanchor_added),
             "reanchor_overlap_avg": float(0.0),
+            "anchor_visible_candidates": float(len(anchor_visible_hashes)),
+            "anchor_visible_hits": float(anchor_visible_hits),
+            "stable_visible_candidates": float(len(stable_visible_hashes)),
+            "stable_visible_hits": float(stable_visible_hits),
             "anchor_visible_coverage": float(anchor_visible_cov),
             "stable_visible_coverage": float(stable_visible_cov),
             "recent_plain_ratio": float(recent_plain_kept) / float(keep_total),
@@ -6434,7 +6459,55 @@ class Aggregator(nn.Module):
             "stable_selected_invisible": float(max(0, stable_backbone_kept - int(reps.get("visible_total", 0)))),
         }
 
-    def _geo_v2_commit_metrics(self, current_frame_idx: int, metrics: Dict[str, float], keep_idx: torch.Tensor) -> None:
+    def _geo_v2_keep_hashes(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        keep_idx: torch.Tensor,
+    ) -> set[int]:
+        frame_idx = meta.get("frame_idx", torch.empty((0,), dtype=torch.long))
+        local_idx = meta.get("local_patch_idx", torch.full((frame_idx.numel(),), -1, dtype=torch.long))
+        out: set[int] = set()
+        for tok in keep_idx.detach().cpu().long().tolist():
+            if tok < 0 or tok >= int(frame_idx.numel()):
+                continue
+            fidx = int(frame_idx[tok].item())
+            lidx = int(local_idx[tok].item())
+            fm = self.geo_frame_meta.get(fidx)
+            if fm is None:
+                continue
+            vox_all = fm.get("voxel_ids")
+            if vox_all is None:
+                continue
+            if lidx < 0 or lidx >= int(vox_all.shape[0]):
+                continue
+            vh = int(self._voxel_hash(vox_all[lidx:lidx + 1]).view(-1)[0].item())
+            out.add(vh)
+        return out
+
+    def _geo_v2_visible_hashes_for_voxel_list(
+        self,
+        *,
+        voxel_list: List[Tuple[int, int, int]],
+        reps: Dict[str, Any],
+    ) -> set[int]:
+        visible_map = reps.get("hash_to_best_visible", {})
+        out: set[int] = set()
+        for vox in voxel_list:
+            h = int(self._voxel_hash(torch.tensor([list(vox)], dtype=torch.long)).view(-1)[0].item())
+            if h in visible_map:
+                out.add(h)
+        return out
+
+    def _geo_v2_commit_metrics(
+        self,
+        current_frame_idx: int,
+        metrics: Dict[str, float],
+        keep_idx: torch.Tensor,
+        *,
+        selector_impl_effective: str,
+        phase_to_log: Optional[str] = None,
+    ) -> None:
         self.geo_v2_last_metrics = dict(metrics)
         self.geo_v2_last_keep_idx = keep_idx.detach().cpu().long()
         self.geo_v2_anchor_visible_coverage_ema = self._ema(self.geo_v2_anchor_visible_coverage_ema, float(metrics.get("anchor_visible_coverage", 0.0)))
@@ -6442,10 +6515,15 @@ class Aggregator(nn.Module):
         self.geo_v2_recent_plain_ratio_ema = self._ema(self.geo_v2_recent_plain_ratio_ema, float(metrics.get("recent_plain_ratio", 0.0)))
         self.geo_v2_long_horizon_keep_ratio_ema = self._ema(self.geo_v2_long_horizon_keep_ratio_ema, float(metrics.get("long_horizon_keep_ratio", 0.0)))
         self.geo_v2_reanchor_added_ema = self._ema(self.geo_v2_reanchor_added_ema, float(metrics.get("reanchor_added", 0.0)))
-        self.geo_last_policy_inputs["geo_selector_impl"] = str(self.geo_selector_impl)
-        self.geo_last_policy_inputs["geo_v2_phase"] = str(self.geo_v2_phase)
+        self.geo_last_policy_inputs["geo_selector_impl_effective"] = str(selector_impl_effective)
+        self.geo_last_policy_inputs["geo_selector_impl"] = str(selector_impl_effective)
+        self.geo_last_policy_inputs["geo_v2_phase"] = str(phase_to_log if phase_to_log is not None else self.geo_v2_phase)
         self.geo_last_policy_inputs["geo_v2_anchor_visible_coverage"] = float(metrics.get("anchor_visible_coverage", 0.0))
         self.geo_last_policy_inputs["geo_v2_stable_visible_coverage"] = float(metrics.get("stable_visible_coverage", 0.0))
+        self.geo_last_policy_inputs["geo_v2_anchor_visible_candidates"] = int(metrics.get("anchor_visible_candidates", 0))
+        self.geo_last_policy_inputs["geo_v2_anchor_visible_hits"] = int(metrics.get("anchor_visible_hits", 0))
+        self.geo_last_policy_inputs["geo_v2_stable_visible_candidates"] = int(metrics.get("stable_visible_candidates", 0))
+        self.geo_last_policy_inputs["geo_v2_stable_visible_hits"] = int(metrics.get("stable_visible_hits", 0))
         self.geo_last_policy_inputs["geo_v2_recent_plain_ratio"] = float(metrics.get("recent_plain_ratio", 0.0))
         self.geo_last_policy_inputs["geo_v2_long_horizon_keep_ratio"] = float(metrics.get("long_horizon_keep_ratio", 0.0))
         self.geo_last_policy_inputs["geo_v2_reanchor_added"] = int(metrics.get("reanchor_added", 0))
@@ -6469,22 +6547,88 @@ class Aggregator(nn.Module):
         near: float,
         far: float,
         current_view: Optional[Dict[str, torch.Tensor]],
-        hard_keep: Optional[torch.Tensor],
         use_view_pruning: bool = True,
         max_past_tokens: Optional[int] = None,
         policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
-        _ = int(recent_frames)
+        plan = self._geo_v2_plan_keep(
+            meta=meta,
+            topk_per_voxel=topk_per_voxel,
+            near=near,
+            far=far,
+            current_view=current_view,
+            use_view_pruning=use_view_pruning,
+            max_tokens=max_past_tokens,
+            current_frame_idx=int(meta["frame_idx"].max().item()) if int(meta["frame_idx"].numel()) > 0 else -1,
+            phase=str(getattr(self, "geo_v2_phase", "warmup")),
+        )
+        keep = plan["keep_idx"]
+        hard = plan["hard_idx"]
+        metrics = plan["metrics"]
+        next_phase = self._geo_v2_update_phase(int(plan["current_frame_idx"]), metrics)
+        self._geo_v2_commit_metrics(
+            int(plan["current_frame_idx"]),
+            metrics,
+            keep,
+            selector_impl_effective=str(getattr(self, "geo_selector_impl_runtime", self.geo_selector_impl)),
+            phase_to_log=str(next_phase),
+        )
+        if bool(self.geo_v2_debug_log):
+            self.geo_last_policy_inputs["geo_v2_phase"] = str(next_phase)
+            self.geo_last_policy_inputs["geo_selector_impl_effective"] = str(getattr(self, "geo_selector_impl_runtime", self.geo_selector_impl))
+        return self._finalize_geo_keep(
+            meta=meta,
+            selected=set(int(v) for v in keep.tolist()),
+            selected_order=keep.tolist(),
+            current_frame_idx=int(plan["current_frame_idx"]),
+            recent_frames_eff=4,
+            max_past_tokens=max_past_tokens,
+            candidate_count=int(metrics.get("candidate_count", 0)),
+            visible_total=int(metrics.get("visible_total", 0)),
+            anchor_count=int(metrics.get("anchor_backbone_kept", 0)),
+            stable_count=int(metrics.get("stable_backbone_kept", 0)),
+            tau_bucket=float("nan"),
+            stable_visible_voxel_overlap=int(metrics.get("stable_visible_overlap", 0)),
+            stable_selected_visible=int(metrics.get("stable_selected_visible", 0)),
+            stable_selected_invisible=int(metrics.get("stable_selected_invisible", 0)),
+            fast_path=91,
+            reanchor_added=int(metrics.get("reanchor_added", 0)),
+            reanchor_overlap_avg=float(metrics.get("reanchor_overlap_avg", 0.0)),
+            hard_keep_idx=hard,
+            allow_fill=False,
+            policy=policy,
+            update_selector_diag=False,
+            diag_payload=None,
+            plain_reserved_idx=torch.empty((0,), dtype=torch.long),
+            priority_keep_idx=keep,
+        )
+
+    def _geo_v2_plan_keep(
+        self,
+        *,
+        meta: Dict[str, torch.Tensor],
+        topk_per_voxel: int,
+        near: float,
+        far: float,
+        current_view: Optional[Dict[str, torch.Tensor]],
+        use_view_pruning: bool,
+        max_tokens: Optional[int],
+        current_frame_idx: int,
+        phase: str,
+    ) -> Dict[str, Any]:
+        _ = str(phase)
         total = int(meta.get("frame_idx", torch.empty((0,), dtype=torch.long)).numel())
         if total <= 0:
-            return torch.empty((0,), dtype=torch.long)
-        current_frame_idx = int(meta["frame_idx"].max().item())
-        phase = str(getattr(self, "geo_v2_phase", "warmup"))
+            return {
+                "keep_idx": torch.empty((0,), dtype=torch.long),
+                "hard_idx": torch.empty((0,), dtype=torch.long),
+                "metrics": {"candidate_count": 0.0, "visible_total": 0.0},
+                "current_frame_idx": int(current_frame_idx),
+            }
         hard = self._geo_v2_build_hard_keep(
             meta=meta,
-            hard_keep=hard_keep,
             current_frame_idx=current_frame_idx,
-            max_past_tokens=max_past_tokens,
+            max_past_tokens=max_tokens,
         )
         reps = self._geo_v2_build_voxel_representatives(
             meta=meta,
@@ -6496,7 +6640,7 @@ class Aggregator(nn.Module):
         )
         selected_set = set(int(v) for v in hard.tolist())
         selected_order = [int(v) for v in hard.tolist()]
-        budget = int(max_past_tokens) if max_past_tokens is not None else total
+        budget = int(max_tokens) if max_tokens is not None else total
         anchor_quota = int(max(64, budget * float(self.geo_v2_anchor_budget_ratio)))
         stable_quota = int(max(64, budget * float(self.geo_v2_stable_budget_ratio)))
         keyframe_quota = int(max(32, budget * float(self.geo_v2_keyframe_budget_ratio)))
@@ -6551,7 +6695,7 @@ class Aggregator(nn.Module):
             meta=meta,
             keep_idx=keep,
             hard_keep=hard,
-            budget=max_past_tokens,
+            budget=max_tokens,
             priority_groups={
                 "special": self._geo_v2_special_idx(meta),
                 "frame0": self._geo_v2_frame0_idx(meta),
@@ -6575,37 +6719,18 @@ class Aggregator(nn.Module):
             recent_plain_kept=int(recent_idx.numel()),
             reference_kept=int(reference_idx.numel()),
         )
-        self._geo_v2_commit_metrics(current_frame_idx, metrics, keep)
-        self._geo_v2_update_phase(current_frame_idx, metrics)
-        if bool(self.geo_v2_debug_log):
-            self.geo_last_policy_inputs["geo_v2_phase"] = str(self.geo_v2_phase)
-            self.geo_last_policy_inputs["geo_selector_impl"] = str(self.geo_selector_impl)
-        return self._finalize_geo_keep(
-            meta=meta,
-            selected=set(int(v) for v in keep.tolist()),
-            selected_order=keep.tolist(),
-            current_frame_idx=current_frame_idx,
-            recent_frames_eff=4,
-            max_past_tokens=max_past_tokens,
-            candidate_count=int(metrics.get("candidate_count", 0)),
-            visible_total=int(metrics.get("visible_total", 0)),
-            anchor_count=int(metrics.get("anchor_backbone_kept", 0)),
-            stable_count=int(metrics.get("stable_backbone_kept", 0)),
-            tau_bucket=float("nan"),
-            stable_visible_voxel_overlap=int(metrics.get("stable_visible_overlap", 0)),
-            stable_selected_visible=int(metrics.get("stable_selected_visible", 0)),
-            stable_selected_invisible=int(metrics.get("stable_selected_invisible", 0)),
-            fast_path=91,
-            reanchor_added=int(metrics.get("reanchor_added", 0)),
-            reanchor_overlap_avg=float(metrics.get("reanchor_overlap_avg", 0.0)),
-            hard_keep_idx=hard,
-            allow_fill=False,
-            policy=policy,
-            update_selector_diag=False,
-            diag_payload=None,
-            plain_reserved_idx=torch.empty((0,), dtype=torch.long),
-            priority_keep_idx=keep,
-        )
+        return {
+            "keep_idx": keep,
+            "hard_idx": hard,
+            "anchor_idx": anchor_idx,
+            "stable_idx": stable_idx,
+            "keyframe_idx": keyframe_idx,
+            "recent_idx": recent_idx,
+            "reference_idx": reference_idx,
+            "metrics": metrics,
+            "reps": reps,
+            "current_frame_idx": int(current_frame_idx),
+        }
 
     def _select_geo_active_indices_bootstrap(
         self,
@@ -9722,6 +9847,10 @@ class Aggregator(nn.Module):
         selector_impl_eff = str(geo_selector_impl_override) if geo_selector_impl_override is not None else str(self.geo_selector_impl)
         if selector_impl_eff not in {"legacy_v1", "map_first_v2"}:
             selector_impl_eff = "legacy_v1"
+        self.geo_selector_impl_runtime = str(selector_impl_eff)
+        self.geo_last_policy_inputs["geo_selector_impl_requested"] = str(geo_selector_impl_override) if geo_selector_impl_override is not None else "none"
+        self.geo_last_policy_inputs["geo_selector_impl_default"] = str(self.geo_selector_impl)
+        self.geo_last_policy_inputs["geo_selector_impl_effective"] = str(selector_impl_eff)
         self.geo_last_policy_inputs["geo_selector_impl"] = str(selector_impl_eff)
 
         if use_cache and past_key_values[0] is not None:
@@ -9976,12 +10105,6 @@ class Aggregator(nn.Module):
             if ref_meta is not None:
                 mode_now = str(effective_mode)
                 geo_prune_ready = True
-                hard_keep_for_bootstrap = self._build_hard_backbone_keep(
-                    ref_meta,
-                    current_frame_idx=int(cache_frame_idx),
-                    max_past_tokens=ref_past_budget,
-                    policy=exec_policy,
-                )
                 if mode_now == "legacy":
                     self.geo_last_policy_inputs["recovery_selector"] = bool(False)
                     geo_reloc_active = False
@@ -9993,12 +10116,17 @@ class Aggregator(nn.Module):
                             near=geo_near,
                             far=geo_far,
                             current_view=current_view,
-                            hard_keep=hard_keep_for_bootstrap,
                             use_view_pruning=bool(selector_use_view_pruning),
                             max_past_tokens=ref_past_budget,
                             policy=exec_policy,
                         )
                     else:
+                        hard_keep_for_bootstrap = self._build_hard_backbone_keep(
+                            ref_meta,
+                            current_frame_idx=int(cache_frame_idx),
+                            max_past_tokens=ref_past_budget,
+                            policy=exec_policy,
+                        )
                         geo_shared_keep_idx = self._select_geo_active_indices_bootstrap(
                             meta=ref_meta,
                             topk_per_voxel=geo_topk_per_voxel,
@@ -10295,8 +10423,8 @@ class Aggregator(nn.Module):
                             current_meta = self._build_current_frame_meta(past_frame_idx, P)
                             merged_meta = self._concat_meta(past_meta, current_meta)
                             v2_legacy_active = bool(
-                                str(self.geo_last_policy_inputs.get("geo_selector_impl", "legacy_v1")) == "map_first_v2"
-                                and str((geo_policy or {}).get("mode", "legacy")) == "legacy"
+                                str(getattr(self, "geo_selector_impl_runtime", self.geo_selector_impl)) == "map_first_v2"
+                                and str(effective_mode) == "legacy"
                             )
                             if not v2_legacy_active:
                                 self._decay_persistent_labels(merged_meta, int(past_frame_idx))
@@ -10416,27 +10544,46 @@ class Aggregator(nn.Module):
                             # Keep explicit hard cap in geo mode with hard-backbone-first protection.
                             if new_kv[0].shape[2] > layer_budget:
                                 cap_all = torch.arange(new_kv[0].shape[2], dtype=torch.long)
-                                frame_idx_all = merged_meta["frame_idx"]
-                                current_frame_tokens = cap_all[frame_idx_all == int(past_frame_idx)]
-                                past_tokens = cap_all[frame_idx_all < int(past_frame_idx)]
-                                priority_cap_idx = self._unique_preserve_order_long(
-                                    torch.cat([current_frame_tokens, past_tokens], dim=0)
-                                )
-                                hard_keep_final = self._build_hard_backbone_keep(
-                                    merged_meta,
-                                    current_frame_idx=int(past_frame_idx),
-                                    max_past_tokens=int(layer_budget),
-                                    policy=exec_policy,
-                                )
-                                cap_keep = self._cap_keep_with_hard_protection(
-                                    meta=merged_meta,
-                                    keep_idx=cap_all,
-                                    hard_keep=hard_keep_final,
-                                    budget=int(layer_budget),
-                                    recent_frames=int(geo_recent_frames),
-                                    priority_keep_idx=priority_cap_idx,
-                                    policy=exec_policy,
-                                )
+                                if v2_legacy_active:
+                                    cap_plan = self._geo_v2_plan_keep(
+                                        meta=merged_meta,
+                                        topk_per_voxel=geo_topk_per_voxel,
+                                        near=geo_near,
+                                        far=geo_far,
+                                        current_view=current_view,
+                                        use_view_pruning=bool(selector_use_view_pruning),
+                                        max_tokens=int(layer_budget),
+                                        current_frame_idx=int(past_frame_idx),
+                                        phase=str(getattr(self, "geo_v2_phase", "warmup")),
+                                    )
+                                    cap_keep = cap_plan.get("keep_idx", torch.empty((0,), dtype=torch.long))
+                                    self.geo_last_policy_inputs["geo_v2_layer_cap_impl"] = "map_first_v2"
+                                    cap_metrics = cap_plan.get("metrics", {})
+                                    self.geo_last_policy_inputs["geo_v2_layer_cap_anchor_kept"] = int(cap_metrics.get("anchor_backbone_kept", 0))
+                                    self.geo_last_policy_inputs["geo_v2_layer_cap_stable_kept"] = int(cap_metrics.get("stable_backbone_kept", 0))
+                                else:
+                                    frame_idx_all = merged_meta["frame_idx"]
+                                    current_frame_tokens = cap_all[frame_idx_all == int(past_frame_idx)]
+                                    past_tokens = cap_all[frame_idx_all < int(past_frame_idx)]
+                                    priority_cap_idx = self._unique_preserve_order_long(
+                                        torch.cat([current_frame_tokens, past_tokens], dim=0)
+                                    )
+                                    hard_keep_final = self._build_hard_backbone_keep(
+                                        merged_meta,
+                                        current_frame_idx=int(past_frame_idx),
+                                        max_past_tokens=int(layer_budget),
+                                        policy=exec_policy,
+                                    )
+                                    cap_keep = self._cap_keep_with_hard_protection(
+                                        meta=merged_meta,
+                                        keep_idx=cap_all,
+                                        hard_keep=hard_keep_final,
+                                        budget=int(layer_budget),
+                                        recent_frames=int(geo_recent_frames),
+                                        priority_keep_idx=priority_cap_idx,
+                                        policy=exec_policy,
+                                    )
+                                    self.geo_last_policy_inputs["geo_v2_layer_cap_impl"] = "legacy_hard_backbone"
                                 cap_keep = self._sanitize_keep_idx_preserve_order(
                                     cap_keep,
                                     meta_len=merged_meta["frame_idx"].numel(),
