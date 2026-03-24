@@ -231,6 +231,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         geo_recent_frames: int = 2,
         geo_near: float = 0.05,
         geo_far: float = 200.0,
+        geo_selector_impl: Optional[str] = None,
         show_progress: bool = True,
         memory_diagnostics: bool = False,
         memory_log_interval: int = 1,
@@ -442,6 +443,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 policy_view=policy_view,
                 policy_view_source=policy_view_source,
                 selector_view_source=selector_view_source,
+                geo_selector_impl_override=geo_selector_impl,
             )
 
             
