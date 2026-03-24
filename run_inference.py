@@ -6,21 +6,30 @@ import glob
 import time
 import argparse
 import logging
+import inspect
 from typing import List, Dict, Optional
-
-# Add project source to the Python path
-sys.path.append("src/")
-
-# Import necessary components from the StreamVGGT project
-from streamvggt.models.streamvggt import StreamVGGT
-from streamvggt.utils.load_fn import load_and_preprocess_images
-from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
-from streamvggt.utils.geometry import FrameDiskCache
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
-if SRC_ROOT not in sys.path:
-    sys.path.append(SRC_ROOT)
+if SRC_ROOT in sys.path:
+    sys.path.remove(SRC_ROOT)
+sys.path.insert(0, SRC_ROOT)
+dedup_sys_path = []
+seen_paths = set()
+for p in sys.path:
+    pn = os.path.abspath(p)
+    if pn in seen_paths:
+        continue
+    seen_paths.add(pn)
+    dedup_sys_path.append(p)
+sys.path[:] = dedup_sys_path
+
+# Import necessary components from the StreamVGGT project
+from streamvggt.models.streamvggt import StreamVGGT
+from streamvggt.models.aggregator import Aggregator
+from streamvggt.utils.load_fn import load_and_preprocess_images
+from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+from streamvggt.utils.geometry import FrameDiskCache
 
 def run_inference(args: argparse.Namespace):
     """
@@ -33,6 +42,22 @@ def run_inference(args: argparse.Namespace):
         return
 
     print("Initializing and loading StreamVGGT model ...")
+    streamvggt_file = os.path.abspath(inspect.getfile(StreamVGGT))
+    aggregator_file = os.path.abspath(inspect.getfile(Aggregator))
+    print(f"[source_fingerprint] streamvggt_module={StreamVGGT.__module__}")
+    print(f"[source_fingerprint] streamvggt_module_file={streamvggt_file}")
+    print(f"[source_fingerprint] aggregator_module={Aggregator.__module__}")
+    print(f"[source_fingerprint] aggregator_module_file={aggregator_file}")
+    expected_aggregator_file = os.path.abspath(os.path.join(PROJECT_ROOT, "src", "streamvggt", "models", "aggregator.py"))
+    if os.path.normcase(aggregator_file) != os.path.normcase(expected_aggregator_file):
+        msg = (
+            f"[source_fingerprint] Aggregator source mismatch: expected {expected_aggregator_file}, "
+            f"got {aggregator_file}."
+        )
+        if bool(args.allow_external_streamvggt):
+            print(f"WARNING: {msg}")
+        else:
+            raise RuntimeError(msg)
 
     if not os.path.exists(args.checkpoint_path):
         print(f"Error: Checkpoint file not found at {args.checkpoint_path}")
@@ -346,6 +371,11 @@ if __name__ == "__main__":
         type=int,
         default=50,
         help="Print geo prune console stats every N views; set -1 to disable.",
+    )
+    parser.add_argument(
+        "--allow_external_streamvggt",
+        action="store_true",
+        help="Allow non-local streamvggt/aggregator imports instead of failing fast.",
     )
     
     args = parser.parse_args()
